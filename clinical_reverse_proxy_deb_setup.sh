@@ -61,6 +61,78 @@ SCRIPTS_DIR="$ACTUAL_HOME/traefik_setup_scripts"
 # Helper Functions
 # ==========================================
 
+# Run command on remote host with sudo
+run_remote_sudo() {
+    local ip=$1
+    local cmd=$2
+    
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo -u "$SUDO_USER" -- bash -lc "echo \"$SUDO_PASS\" | ssh $SSH_OPTS '$CURRENT_USER@$ip' 'sudo -S bash -c \"$cmd\"'"
+    else
+        echo "$SUDO_PASS" | ssh $SSH_OPTS "$CURRENT_USER@$ip" "sudo -S bash -c \"$cmd\""
+    fi
+}
+
+# Copy file to remote host
+copy_to_remote() {
+    local file=$1
+    local ip=$2
+    local dest=$3
+
+    local COPYS_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5"
+    local KEY_OPT="-i $ACTUAL_HOME/.ssh/id_rsa"
+
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        if ! sudo -u "$SUDO_USER" scp -q $KEY_OPT $COPYS_OPTS "$file" "$CURRENT_USER@$ip:$dest" 2>/tmp/scp_err.$$; then
+            sudo -u "$SUDO_USER" ssh $KEY_OPT $COPYS_OPTS "$CURRENT_USER@$ip" "cat > '$dest'" < "$file"
+        fi
+    else
+        if ! scp -q $KEY_OPT $COPYS_OPTS "$file" "$CURRENT_USER@$ip:$dest" 2>/tmp/scp_err.$$; then
+            ssh $KEY_OPT $COPYS_OPTS "$CURRENT_USER@$ip" "cat > '$dest'" < "$file"
+        fi
+    fi
+    rm -f /tmp/scp_err.$$
+}
+
+# Ensure remote user's scripts dir exists
+ensure_SCRIPTS_DIR() {
+    local ip=$1
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "mkdir -p $SCRIPTS_DIR && chmod 755 $SCRIPTS_DIR"
+    else
+        ssh $SSH_OPTS "$CURRENT_USER@$ip" "mkdir -p $SCRIPTS_DIR && chmod 755 $SCRIPTS_DIR"
+    fi
+}
+
+# Execute script on remote host
+execute_remote_script() {
+    local ip=$1
+    local script_path=$2
+    
+    PASS_B64="$(printf '%s' "$SUDO_PASS" | base64 -w0 2>/dev/null || printf '%s' "$SUDO_PASS" | base64)"
+    
+    write_local_file "$SCRIPTS_DIR/run_script_wrapper.sh" <<'WRAPPER'
+#!/bin/bash
+set -e
+SUDO_PASS="$(printf %s "$SUDO_PASS_B64" | base64 -d)"
+echo "$SUDO_PASS" | sudo -S bash SCRIPT_PATH 2>&1
+rm -f SCRIPT_PATH
+WRAPPER
+    chmod 644 "$SCRIPTS_DIR/run_script_wrapper.sh"
+    sed -i "s|SCRIPT_PATH|$script_path|g" "$SCRIPTS_DIR/run_script_wrapper.sh"
+
+    ensure_SCRIPTS_DIR "$ip"
+    copy_to_remote "$SCRIPTS_DIR/run_script_wrapper.sh" "$ip" "$SCRIPTS_DIR/run_script.sh"
+
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+    else
+        ssh $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+    fi
+    
+    rm -f "$SCRIPTS_DIR/run_script_wrapper.sh"
+}
+
 # Helper function to run docker commands with proper permissions
 docker_cmd() {
     if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
@@ -898,91 +970,152 @@ prompt_multi_node_deployment() {
         fi
     fi
     
-    # Prompt for multi-node deployment
-    read -p "Configure multi-node HA deployment? (yes/no) [no]: " MULTI_NODE_DEPLOYMENT
-    MULTI_NODE_DEPLOYMENT=$(echo "$MULTI_NODE_DEPLOYMENT" | tr '[:upper:]' '[:lower:]')
-    MULTI_NODE_DEPLOYMENT=${MULTI_NODE_DEPLOYMENT:-no}
-    
-    if [[ "$MULTI_NODE_DEPLOYMENT" != "yes" && "$MULTI_NODE_DEPLOYMENT" != "y" ]]; then
-        MULTI_NODE_DEPLOYMENT="no"
-        return 0
-    fi
-    
-    MULTI_NODE_DEPLOYMENT="yes"
-    
-    echo ""
-    echo "Multi-node deployment will configure:"
-    echo "  - This node as MASTER (priority 110)"
-    echo "  - Additional BACKUP nodes (priority 100, 90, 80...)"
-    echo "  - Automatic deployment to all nodes"
-    echo ""
-    
-    # Get master node information (this node)
-    echo "Master Node Configuration (this server):"
-    read -p "Enter master hostname [$(hostname)]: " MASTER_HOSTNAME
-    MASTER_HOSTNAME=${MASTER_HOSTNAME:-$(hostname)}
-    
-    # Get master IP - try to detect primary interface
-    DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | awk '{print $1}')
-    read -p "Enter master IP address [$DEFAULT_IP]: " MASTER_IP
-    MASTER_IP=${MASTER_IP:-$DEFAULT_IP}
-    
-    # Validate master IP
-    if ! validate_ip "$MASTER_IP"; then
-        echo "ERROR: Invalid IP address: $MASTER_IP"
-        exit 1
-    fi
-    
-    echo ""
-    echo "Backup Nodes Configuration:"
-    read -p "How many backup nodes? [1]: " BACKUP_NODE_COUNT
-    BACKUP_NODE_COUNT=${BACKUP_NODE_COUNT:-1}
-    
-    # Validate backup node count
-    if ! [[ "$BACKUP_NODE_COUNT" =~ ^[0-9]+$ ]] || [ "$BACKUP_NODE_COUNT" -lt 1 ]; then
-        echo "ERROR: Invalid number of backup nodes"
-        exit 1
-    fi
-    
-    # Initialize arrays
-    BACKUP_NODES=()
-    BACKUP_IPS=()
-    
-    # Get backup node information
-    for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
+    # Main loop for configuration (Option A - allow reconfiguration)
+    while true; do
+        # Prompt for number of backup nodes
+        read -p "How many BACKUP nodes? [0]: " BACKUP_NODE_COUNT
+        BACKUP_NODE_COUNT=${BACKUP_NODE_COUNT:-0}
+        
+        # Validate input
+        if ! [[ "$BACKUP_NODE_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Please enter a valid number"
+            continue
+        fi
+        
+        # If 0, single node mode
+        if [ "$BACKUP_NODE_COUNT" -eq 0 ]; then
+            MULTI_NODE_DEPLOYMENT="no"
+            echo "Single-node deployment selected"
+            return 0
+        fi
+        
+        # Multi-node setup
+        MULTI_NODE_DEPLOYMENT="yes"
+        
         echo ""
-        echo "Backup Node #$i:"
-        read -p "  Hostname: " backup_hostname
-        while [[ -z "$backup_hostname" ]]; do
-            echo "  ERROR: Hostname cannot be empty"
-            read -p "  Hostname: " backup_hostname
+        echo "Multi-node HA deployment:"
+        echo "  - This node will be configured as MASTER (priority 110)"
+        echo "  - $BACKUP_NODE_COUNT backup node(s) will be configured automatically"
+        echo "  - Keepalived will manage failover with Virtual IP"
+        echo ""
+        
+        # Get master node information (this node)
+        echo "Master Node Configuration (this server):"
+        
+        # Smart default for hostname
+        DEFAULT_HOSTNAME=$(hostname -s 2>/dev/null || hostname)
+        read -p "  Master hostname [$DEFAULT_HOSTNAME]: " MASTER_HOSTNAME
+        MASTER_HOSTNAME=${MASTER_HOSTNAME:-$DEFAULT_HOSTNAME}
+        
+        # Smart default for IP - get primary interface IP
+        DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | awk '{print $1}')
+        read -p "  Master IP address [$DEFAULT_IP]: " MASTER_IP
+        MASTER_IP=${MASTER_IP:-$DEFAULT_IP}
+        
+        # Validate master IP
+        if ! validate_ip "$MASTER_IP"; then
+            echo "ERROR: Invalid master IP address: $MASTER_IP"
+            echo ""
+            continue
+        fi
+        
+        echo ""
+        
+        # Initialize arrays
+        BACKUP_NODES=()
+        BACKUP_IPS=()
+        
+        # Collect IP addresses for duplicate checking
+        declare -A IP_MAP
+        IP_MAP["$MASTER_IP"]=1
+        
+        # Get backup node information
+        local all_valid=true
+        for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
+            local priority=$((100 - ((i - 1) * 10)))
+            
+            echo "Backup Node #$i (priority $priority):"
+            
+            # Get hostname
+            local backup_hostname=""
+            while [[ -z "$backup_hostname" ]]; do
+                read -p "  Hostname: " backup_hostname
+                if [[ -z "$backup_hostname" ]]; then
+                    echo "  ERROR: Hostname cannot be empty"
+                fi
+            done
+            
+            # Get IP with validation
+            local backup_ip=""
+            local ip_valid=false
+            while [ "$ip_valid" = false ]; do
+                read -p "  IP address: " backup_ip
+                
+                # Validate IP format
+                if ! validate_ip "$backup_ip"; then
+                    echo "  ERROR: Invalid IP address format"
+                    continue
+                fi
+                
+                # Check for duplicates
+                if [[ -n "${IP_MAP[$backup_ip]}" ]]; then
+                    if [[ "$backup_ip" == "$MASTER_IP" ]]; then
+                        echo "  ERROR: IP matches master node ($MASTER_IP)"
+                    else
+                        echo "  ERROR: IP already used by another backup node"
+                    fi
+                    continue
+                fi
+                
+                # IP is valid and unique
+                ip_valid=true
+                IP_MAP["$backup_ip"]=1
+            done
+            
+            BACKUP_NODES+=("$backup_hostname")
+            BACKUP_IPS+=("$backup_ip")
+            echo ""
         done
         
-        read -p "  IP Address: " backup_ip
-        while ! validate_ip "$backup_ip"; do
-            echo "  ERROR: Invalid IP address"
-            read -p "  IP Address: " backup_ip
+        # Display summary
+        echo "=========================================="
+        echo "Multi-Node Configuration Summary"
+        echo "=========================================="
+        echo ""
+        echo "Master Node:"
+        echo "  Hostname: $MASTER_HOSTNAME"
+        echo "  IP: $MASTER_IP"
+        echo "  Priority: 110"
+        echo ""
+        echo "Backup Nodes:"
+        for i in "${!BACKUP_NODES[@]}"; do
+            priority=$((100 - (i * 10)))
+            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]}"
+            echo "    IP: ${BACKUP_IPS[$i]}"
+            echo "    Priority: $priority"
+            echo ""
         done
+        echo "Deployment Process:"
+        echo "  1. Install and configure master node (this server)"
+        echo "  2. Automatically deploy to all backup nodes"
+        echo "  3. Configure Keepalived for automatic failover"
+        echo "  4. Test and verify all nodes"
+        echo ""
+        echo "=========================================="
+        echo ""
         
-        BACKUP_NODES+=("$backup_hostname")
-        BACKUP_IPS+=("$backup_ip")
+        # Confirm configuration (Option A - allow retry)
+        read -p "Is this configuration correct? (yes/no): " CONFIRM
+        if [[ "$CONFIRM" =~ ^[Yy] ]]; then
+            echo "✓ Configuration confirmed"
+            return 0
+        else
+            echo ""
+            echo "Let's reconfigure the nodes..."
+            echo ""
+            # Loop will restart, allowing reconfiguration
+        fi
     done
-    
-    # Display summary
-    echo ""
-    echo "Multi-Node Configuration Summary:"
-    echo "  Master: $MASTER_HOSTNAME ($MASTER_IP) - Priority 110"
-    for i in "${!BACKUP_NODES[@]}"; do
-        priority=$((100 - (i * 10)))
-        echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Priority $priority"
-    done
-    echo ""
-    
-    read -p "Is this configuration correct? (yes/no): " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
-        echo "Please run the script again to reconfigure"
-        exit 0
-    fi
 }
 
 # ==========================================
