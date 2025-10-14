@@ -875,6 +875,116 @@ install_packages() {
     fi
 }
 
+# Prompt for multi-node deployment configuration
+prompt_multi_node_deployment() {
+    echo ""
+    echo "----------------------------------------"
+    echo "High Availability Configuration"
+    echo "----------------------------------------"
+    echo ""
+    
+    # Check if we already have multi-node config loaded
+    if [[ -n "$MULTI_NODE_DEPLOYMENT" && "$MULTI_NODE_DEPLOYMENT" == "yes" ]]; then
+        echo "Existing multi-node configuration detected:"
+        echo "  Master: $MASTER_HOSTNAME ($MASTER_IP)"
+        for i in "${!BACKUP_NODES[@]}"; do
+            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
+        done
+        echo ""
+        read -p "Use existing multi-node configuration? (yes/no) [yes]: " USE_EXISTING
+        USE_EXISTING=${USE_EXISTING:-yes}
+        if [[ "$USE_EXISTING" =~ ^[Yy] ]]; then
+            return 0
+        fi
+    fi
+    
+    # Prompt for multi-node deployment
+    read -p "Configure multi-node HA deployment? (yes/no) [no]: " MULTI_NODE_DEPLOYMENT
+    MULTI_NODE_DEPLOYMENT=$(echo "$MULTI_NODE_DEPLOYMENT" | tr '[:upper:]' '[:lower:]')
+    MULTI_NODE_DEPLOYMENT=${MULTI_NODE_DEPLOYMENT:-no}
+    
+    if [[ "$MULTI_NODE_DEPLOYMENT" != "yes" && "$MULTI_NODE_DEPLOYMENT" != "y" ]]; then
+        MULTI_NODE_DEPLOYMENT="no"
+        return 0
+    fi
+    
+    MULTI_NODE_DEPLOYMENT="yes"
+    
+    echo ""
+    echo "Multi-node deployment will configure:"
+    echo "  - This node as MASTER (priority 110)"
+    echo "  - Additional BACKUP nodes (priority 100, 90, 80...)"
+    echo "  - Automatic deployment to all nodes"
+    echo ""
+    
+    # Get master node information (this node)
+    echo "Master Node Configuration (this server):"
+    read -p "Enter master hostname [$(hostname)]: " MASTER_HOSTNAME
+    MASTER_HOSTNAME=${MASTER_HOSTNAME:-$(hostname)}
+    
+    # Get master IP - try to detect primary interface
+    DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | awk '{print $1}')
+    read -p "Enter master IP address [$DEFAULT_IP]: " MASTER_IP
+    MASTER_IP=${MASTER_IP:-$DEFAULT_IP}
+    
+    # Validate master IP
+    if ! validate_ip "$MASTER_IP"; then
+        echo "ERROR: Invalid IP address: $MASTER_IP"
+        exit 1
+    fi
+    
+    echo ""
+    echo "Backup Nodes Configuration:"
+    read -p "How many backup nodes? [1]: " BACKUP_NODE_COUNT
+    BACKUP_NODE_COUNT=${BACKUP_NODE_COUNT:-1}
+    
+    # Validate backup node count
+    if ! [[ "$BACKUP_NODE_COUNT" =~ ^[0-9]+$ ]] || [ "$BACKUP_NODE_COUNT" -lt 1 ]; then
+        echo "ERROR: Invalid number of backup nodes"
+        exit 1
+    fi
+    
+    # Initialize arrays
+    BACKUP_NODES=()
+    BACKUP_IPS=()
+    
+    # Get backup node information
+    for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
+        echo ""
+        echo "Backup Node #$i:"
+        read -p "  Hostname: " backup_hostname
+        while [[ -z "$backup_hostname" ]]; do
+            echo "  ERROR: Hostname cannot be empty"
+            read -p "  Hostname: " backup_hostname
+        done
+        
+        read -p "  IP Address: " backup_ip
+        while ! validate_ip "$backup_ip"; do
+            echo "  ERROR: Invalid IP address"
+            read -p "  IP Address: " backup_ip
+        done
+        
+        BACKUP_NODES+=("$backup_hostname")
+        BACKUP_IPS+=("$backup_ip")
+    done
+    
+    # Display summary
+    echo ""
+    echo "Multi-Node Configuration Summary:"
+    echo "  Master: $MASTER_HOSTNAME ($MASTER_IP) - Priority 110"
+    for i in "${!BACKUP_NODES[@]}"; do
+        priority=$((100 - (i * 10)))
+        echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Priority $priority"
+    done
+    echo ""
+    
+    read -p "Is this configuration correct? (yes/no): " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
+        echo "Please run the script again to reconfigure"
+        exit 0
+    fi
+}
+
 # ==========================================
 # Service Configuration
 # ==========================================
