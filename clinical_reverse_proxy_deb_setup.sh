@@ -1950,8 +1950,8 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     FAILED_SSH_HOSTS=()
     
     for i in "${!BACKUP_NODES[@]}"; do
-        local node="${BACKUP_NODES[$i]}"
-        local ip="${BACKUP_IPS[$i]}"
+        node="${BACKUP_NODES[$i]}"
+        ip="${BACKUP_IPS[$i]}"
         
         echo -n "Testing SSH to $node ($ip)... "
         
