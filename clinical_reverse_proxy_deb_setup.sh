@@ -833,6 +833,7 @@ prompt_deployment_type() {
         echo "Please choose a deployment type: $default_hint"
         echo "  [1] Full Install"
         echo "  [2] Image Server Only"
+        echo "
         read -p "Enter choice [1 or 2]: " choice
 
         case "$choice" in
