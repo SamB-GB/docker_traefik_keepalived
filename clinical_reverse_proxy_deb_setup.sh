@@ -833,7 +833,7 @@ prompt_deployment_type() {
         echo "Please choose a deployment type: $default_hint"
         echo "  [1] Full Install"
         echo "  [2] Image Server Only"
-        echo "
+        echo ""
         read -p "Enter choice [1 or 2]: " choice
 
         case "$choice" in
@@ -971,7 +971,7 @@ prompt_multi_node_deployment() {
         fi
     fi
     
-# Main loop for configuration (Option A - allow reconfiguration)
+    # Main loop for configuration (Option A - allow reconfiguration)
     while true; do
         # Clear any previous configuration data from previous loop iterations
         BACKUP_NODES=()
@@ -1329,13 +1329,15 @@ EOF
                 echo " Host Configuration - Batch #$((batch_count + 1)) " > /dev/tty
                 echo "========================================" > /dev/tty
 
+                echo "needs description of what its looking for" > /dev/tty
+
                 # Configure app-service
                 current_app_entry=$(prompt_single_entry "app-service" "3000")
                 app_urls+="${app_urls:+,}$current_app_entry"
 
                 # Ask to apply to others
                 printf "\n"
-                read -p "Apply this host/protocol to all other services on their default ports? (yes/no) [default: no]: " apply_all < /dev/tty
+                read -p "Use this HOST and PROTOCOL and apply it to all the other services on their default ports? (yes/no) [default: no]: " apply_all < /dev/tty
                 apply_all=${apply_all:-no}
                 apply_all=$(echo "$apply_all" | tr '[:upper:]' '[:lower:]')
 
