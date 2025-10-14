@@ -971,8 +971,14 @@ prompt_multi_node_deployment() {
         fi
     fi
     
-    # Main loop for configuration (Option A - allow reconfiguration)
+# Main loop for configuration (Option A - allow reconfiguration)
     while true; do
+        # Clear any previous configuration data from previous loop iterations
+        BACKUP_NODES=()
+        BACKUP_IPS=()
+        unset IP_MAP
+        declare -A IP_MAP
+        
         # Prompt for number of backup nodes
         read -p "How many BACKUP nodes? [0]: " BACKUP_NODE_COUNT
         BACKUP_NODE_COUNT=${BACKUP_NODE_COUNT:-0}
@@ -1022,12 +1028,8 @@ prompt_multi_node_deployment() {
         
         echo ""
         
-        # Initialize arrays
-        BACKUP_NODES=()
-        BACKUP_IPS=()
-        
         # Collect IP addresses for duplicate checking
-        declare -A IP_MAP
+        # (Arrays already cleared at top of loop)
         IP_MAP["$MASTER_IP"]=1
         
         # Get backup node information
