@@ -3364,7 +3364,7 @@ vrrp_script check_traefik {
 }
 vrrp_instance $VRRP {
   state BACKUP
-  interface \$DETECTED_INTERFACE
+  interface $DETECTED_INTERFACE
   virtual_router_id $VRID
   priority BACKUP_PRIORITY_PLACEHOLDER
   virtual_ipaddress {
