@@ -104,6 +104,62 @@ ensure_SCRIPTS_DIR() {
     fi
 }
 
+cleanup_remote_scripts_dirs() {
+    echo ""
+    echo "=========================================="
+    echo "Cleaning Up Temporary Files on Remote Nodes"
+    echo "=========================================="
+    
+    local cleanup_failed=0
+    local failed_cleanups=()
+    
+    # For multi-node Traefik setup
+    local hosts_to_clean=()
+    local host_names=()
+    
+    if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
+        hosts_to_clean=("${BACKUP_IPS[@]}")
+        host_names=("${BACKUP_NODES[@]}")
+    fi
+    
+    for i in "${!hosts_to_clean[@]}"; do
+        ip="${hosts_to_clean[$i]}"
+        name="${host_names[$i]}"
+        
+        echo -n "Cleaning up $name ($ip)... "
+        
+        # Try to remove the scripts directory on remote host
+        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+            if sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
+                echo "✓ Done"
+            else
+                echo "⚠️  Warning (cleanup failed, but not critical)"
+                cleanup_failed=1
+                failed_cleanups+=("$name")
+            fi
+        else
+            if ssh $SSH_OPTS "$CURRENT_USER@$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
+                echo "✓ Done"
+            else
+                echo "⚠️  Warning (cleanup failed, but not critical)"
+                cleanup_failed=1
+                failed_cleanups+=("$name")
+            fi
+        fi
+    done
+    
+    if [ $cleanup_failed -eq 1 ]; then
+        echo ""
+        echo "Note: Cleanup warnings are non-critical. Installation completed successfully."
+        echo "You can manually remove the scripts directory if desired:"
+        for failed in "${failed_cleanups[@]}"; do
+            echo "  ssh $failed 'rm -rf $SCRIPTS_DIR'"
+        done
+    fi
+    
+    echo "✓ Remote cleanup complete"
+}
+
 # Execute script on remote host
 execute_remote_script() {
     local ip=$1
@@ -3281,6 +3337,19 @@ HEALTHCHECK
 sudo chmod +x /bin/haloap_service_check.sh
 sudo chown keepalived_script:docker /bin/haloap_service_check.sh
 
+# Auto-detect network interface for this backup node's IP
+echo "Auto-detecting network interface..."
+BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
+DETECTED_INTERFACE=$(ip -o addr show | grep "inet $BACKUP_NODE_IP" | awk '{print $2}' | head -1)
+
+if [ -z "$DETECTED_INTERFACE" ]; then
+    echo "WARNING: Could not auto-detect interface for IP $BACKUP_NODE_IP"
+    echo "Using master's interface: $NETWORK_INTERFACE"
+    DETECTED_INTERFACE="$NETWORK_INTERFACE"
+else
+    echo "✓ Detected interface: $DETECTED_INTERFACE for IP $BACKUP_NODE_IP"
+fi
+
 # Configure Keepalived
 sudo tee /etc/keepalived/keepalived.conf > /dev/null <<KEEPALIVEDCONF
 global_defs {
@@ -3295,7 +3364,7 @@ vrrp_script check_traefik {
 }
 vrrp_instance $VRRP {
   state BACKUP
-  interface $NETWORK_INTERFACE
+  interface \$DETECTED_INTERFACE
   virtual_router_id $VRID
   priority BACKUP_PRIORITY_PLACEHOLDER
   virtual_ipaddress {
@@ -3324,8 +3393,9 @@ echo "✓ Traefik: Running"
 echo "✓ Keepalived: Running (BACKUP, priority BACKUP_PRIORITY_PLACEHOLDER)"
 REMOTEINSTALL
         
-        # Replace priority placeholder
+        # Replace priority placeholder and backup node IP
         sed -i "s/BACKUP_PRIORITY_PLACEHOLDER/$priority/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s/BACKUP_NODE_IP_PLACEHOLDER/$ip/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
         # Also need to copy clinical_conf.yml to remote
