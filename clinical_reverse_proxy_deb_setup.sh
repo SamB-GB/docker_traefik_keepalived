@@ -3157,6 +3157,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
 #!/bin/bash
 set -e
 
+echo ""
 echo "=========================================="
 echo "Installing Traefik on Backup Node"
 echo "=========================================="
