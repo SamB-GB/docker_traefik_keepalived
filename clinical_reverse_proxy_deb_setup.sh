@@ -425,26 +425,118 @@ check_execution_context() {
 }
 
 # Check repository connectivity
+# Check repository connectivity
 check_repository_connectivity() {
+    echo ""
     echo "=========================================="
     echo "Checking Repository Connectivity"
     echo "=========================================="
     
+    # Check local node first
+    local LOCAL_CHECK_FAILED=0
+    
+    echo ""
+    echo "Local Node:"
+    echo "----------"
+    
+    LOCAL_CHECK_FAILED=$(check_single_node "local" "" "")
+    
+    # If multi-node, check backup nodes too
+    if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ] && [ ${#BACKUP_NODES[@]} -gt 0 ]; then
+        echo ""
+        echo "=========================================="
+        echo "Checking Backup Nodes"
+        echo "=========================================="
+        
+        local REMOTE_FAILURES=0
+        
+        for i in "${!BACKUP_NODES[@]}"; do
+            local node="${BACKUP_NODES[$i]}"
+            local ip="${BACKUP_IPS[$i]}"
+            
+            echo ""
+            echo "$node ($ip):"
+            echo "----------"
+            
+            if ! check_single_node "remote" "$node" "$ip"; then
+                REMOTE_FAILURES=$((REMOTE_FAILURES + 1))
+            fi
+        done
+        
+        if [ $REMOTE_FAILURES -gt 0 ]; then
+            echo ""
+            echo "=========================================="
+            echo "⚠️  $REMOTE_FAILURES backup node(s) failed repository checks"
+            echo "=========================================="
+            echo ""
+            echo "Deployment to these nodes may fail during package installation."
+            echo ""
+            read -p "Continue with multi-node deployment? [y/N]: " CONTINUE_MULTI
+            if [[ ! "$CONTINUE_MULTI" =~ ^[Yy]$ ]]; then
+                echo "Installation cancelled."
+                cleanup
+                exit 1
+            fi
+            echo ""
+            echo "⚠️  Continuing despite remote node connectivity warnings..."
+        else
+            echo ""
+            echo "=========================================="
+            echo "✓ All Nodes: Repository Access Verified"
+            echo "=========================================="
+        fi
+    elif [ $LOCAL_CHECK_FAILED -eq 1 ]; then
+        echo ""
+        echo "⚠️  Continuing despite local connectivity warnings..."
+    else
+        echo ""
+        echo "✓ Repository Access Verified"
+    fi
+    
+    echo ""
+}
+
+# Helper function to check a single node (local or remote)
+check_single_node() {
+    local check_type="$1"  # 'local' or 'remote'
+    local node_name="$2"
+    local node_ip="$3"
+    
     local REPO_CHECK_FAILED=0
     local FAILED_REPOS=()
     
-    # Set proxy environment if configured
+    # Set proxy options
+    local PROXY_CURL_OPT=""
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-        export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-        export no_proxy="localhost,127.0.0.1"
-        echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
-        echo ""
+        PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
+        if [ "$check_type" = "local" ]; then
+            export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            export no_proxy="localhost,127.0.0.1"
+            echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
+            echo ""
+        fi
     fi
     
+    # Helper function to run command locally or remotely
+    run_check() {
+        local cmd="$1"
+        if [ "$check_type" = "remote" ]; then
+            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$node_ip" "$cmd" 2>/dev/null
+            else
+                ssh $SSH_OPTS "$CURRENT_USER@$node_ip" "$cmd" 2>/dev/null
+            fi
+        else
+            eval "$cmd"
+        fi
+    }
+    
     # Check Docker repository
-    echo -n "Testing Docker repository (download.docker.com)... "
-    if timeout 10 curl -s -o /dev/null -w "%{http_code}" "https://download.docker.com" 2>/dev/null | grep -q "200\|301\|302\|403"; then
+    echo -n "  Docker repository (download.docker.com)... "
+    DOCKER_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$DOCKER_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
@@ -452,78 +544,132 @@ check_repository_connectivity() {
         FAILED_REPOS+=("Docker repository (download.docker.com)")
     fi
     
-    # Check GitHub Container Registry (for Traefik images)
-    echo -n "Testing GitHub Container Registry (ghcr.io)... "
-    if timeout 10 curl -s -o /dev/null -w "%{http_code}" "https://ghcr.io" 2>/dev/null | grep -q "200\|301\|302\|404"; then
+    # Check GitHub Container Registry
+    echo -n "  GitHub Container Registry (ghcr.io)... "
+    GHCR_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://ghcr.io 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$GHCR_TEST" | grep -q "200\|301\|302\|404"; then
         echo "✓ Reachable"
     else
         echo "⚠️  Warning (will try fallback to docker.io)"
-        echo "   GitHub Container Registry may not be accessible"
     fi
     
-    # Check standard apt/yum repositories
-    echo -n "Testing standard package repositories... "
-    if timeout 10 curl -s -o /dev/null -w "%{http_code}" "http://archive.ubuntu.com/ubuntu/dists/" 2>/dev/null | grep -q "200\|301\|302"; then
-        echo "✓ Reachable (Ubuntu)"
-    elif timeout 10 curl -s -o /dev/null -w "%{http_code}" "http://deb.debian.org/debian/dists/" 2>/dev/null | grep -q "200\|301\|302"; then
-        echo "✓ Reachable (Debian)"
-    elif timeout 10 curl -s -o /dev/null -w "%{http_code}" "http://mirror.centos.org" 2>/dev/null | grep -q "200\|301\|302"; then
-        echo "✓ Reachable (CentOS)"
+    # Check standard package repositories
+    echo -n "  Standard package repositories... "
+    
+    # Detect OS
+    if [ "$check_type" = "remote" ]; then
+        DETECTED_OS=$(run_check "grep -oP '(?<=^ID=).+' /etc/os-release 2>/dev/null | tr -d '\"'")
     else
+        DETECTED_OS="$OS_ID"
+    fi
+    
+    REPO_TEST_PASSED=0
+    
+    case "$DETECTED_OS" in
+        ubuntu)
+            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
+            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            ;;
+        debian)
+            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
+            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            ;;
+        centos|rhel|rocky|almalinux)
+            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
+            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            ;;
+        *)
+            if [ "$check_type" = "remote" ]; then
+                echo "⚠️  Unknown OS ($DETECTED_OS)"
+                REPO_TEST_PASSED=1
+            else
+                echo "❌ FAILED"
+                REPO_CHECK_FAILED=1
+                FAILED_REPOS+=("Standard package repositories")
+            fi
+            ;;
+    esac
+    
+    if [ $REPO_TEST_PASSED -eq 1 ]; then
+        if [ -n "$DETECTED_OS" ]; then
+            echo "✓ Reachable ($DETECTED_OS)"
+        else
+            echo "✓ Reachable"
+        fi
+    elif [ $REPO_TEST_PASSED -eq 0 ]; then
         echo "❌ FAILED"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Standard package repositories")
+        FAILED_REPOS+=("Standard package repositories ($DETECTED_OS)")
     fi
     
-    echo ""
+    # Additional checks for remote nodes
+    if [ "$check_type" = "remote" ]; then
+        # Check DNS resolution
+        echo -n "  DNS resolution... "
+        DNS_TEST=$(run_check "nslookup download.docker.com >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
+        
+        if echo "$DNS_TEST" | grep -q "OK"; then
+            echo "✓ Working"
+        else
+            echo "❌ FAILED"
+            REPO_CHECK_FAILED=1
+            FAILED_REPOS+=("DNS resolution")
+        fi
+        
+        # Check outbound HTTPS
+        echo -n "  Outbound HTTPS (port 443)... "
+        HTTPS_TEST=$(run_check "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/download.docker.com/443' 2>/dev/null && echo 'OK' || echo 'FAILED'")
+        
+        if echo "$HTTPS_TEST" | grep -q "OK"; then
+            echo "✓ Open"
+        else
+            echo "⚠️  May be blocked (non-critical if proxy configured)"
+        fi
+    fi
     
     # Handle failures
     if [ $REPO_CHECK_FAILED -eq 1 ]; then
-        echo "=========================================="
-        echo "⚠️  WARNING: Repository Connectivity Issues"
-        echo "=========================================="
-        echo "The following repositories could not be reached:"
-        for failed in "${FAILED_REPOS[@]}"; do
-            echo "  - $failed"
-        done
         echo ""
-        echo "Possible causes:"
-        echo "  1. Network connectivity issues"
-        echo "  2. Incorrect proxy configuration (check PROXY_HOST and PROXY_PORT)"
-        echo "  3. Firewall blocking outbound connections"
-        echo "  4. DNS resolution problems"
-        echo ""
-        echo "Current proxy settings:"
-        if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-            echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+        if [ "$check_type" = "remote" ]; then
+            echo "  ❌ Failed checks on $node_name:"
         else
-            echo "  Proxy: Not configured"
+            echo ""
+            echo "  ⚠️  Failed checks:"
         fi
-        echo ""
-        echo "To fix:"
-        echo "  1. Verify network connectivity: ping download.docker.com"
-        if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-            echo "  2. Test proxy: curl -x ${PROXY_HOST}:${PROXY_PORT} https://download.docker.com"
-        fi
-        echo "  3. Check DNS: nslookup download.docker.com"
-        echo "  4. Update PROXY_HOST and PROXY_PORT variables at top of script if needed"
-        echo ""
         
-        read -p "Continue anyway? Installation may fail. [y/N]: " CONTINUE_ANYWAY
-        if [[ ! "$CONTINUE_ANYWAY" =~ ^[Yy]$ ]]; then
-            echo "Installation cancelled. Please fix connectivity issues and try again."
-            exit 1
+        for failed in "${FAILED_REPOS[@]}"; do
+            echo "    - $failed"
+        done
+        
+        if [ "$check_type" = "local" ]; then
+            echo ""
+            echo "  Possible causes:"
+            echo "    1. Network connectivity issues"
+            echo "    2. Proxy misconfiguration"
+            echo "    3. Firewall blocking outbound connections"
+            echo "    4. DNS resolution problems"
+            echo ""
+            
+            if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+                echo "  Current proxy: ${PROXY_HOST}:${PROXY_PORT}"
+            else
+                echo "  Proxy: Not configured"
+            fi
+            echo ""
+            
+            read -p "  Continue anyway? Installation may fail. [y/N]: " CONTINUE_ANYWAY
+            if [[ ! "$CONTINUE_ANYWAY" =~ ^[Yy]$ ]]; then
+                echo "  Installation cancelled."
+                cleanup
+                exit 1
+            fi
         fi
-        echo ""
-        echo "⚠️  Continuing despite connectivity warnings..."
-        echo ""
     else
-        echo "✓ All required repositories are reachable"
-        echo ""
+        echo "  ✓ All checks passed"
     fi
     
-    # Keep proxy variables set for package installation
-    # They will be used by apt/yum/curl/wget
+    return $REPO_CHECK_FAILED
 }
 
 # Function to validate IPv4 address
