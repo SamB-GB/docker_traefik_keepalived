@@ -540,15 +540,56 @@ validate_ip() {
 # Script Execution Starts Here
 # ==========================================
 
-# FIRST: Check for cleanup mode before anything else
+# ==========================================
+# Cleanup Mode
+# ==========================================
+
 if [[ "$1" == "--clean" ]]; then
     validate_os
     check_execution_context
     
+    # Check if this was a multi-node deployment
+    CLEAN_BACKUP_NODES=false
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Load config to check for multi-node deployment
+        source "$CONFIG_FILE"
+        
+        if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
+            echo "=========================================="
+            echo "Multi-Node Deployment Detected"
+            echo "=========================================="
+            echo "This system was configured with backup nodes:"
+            for i in "${!BACKUP_NODES[@]}"; do
+                echo "  - ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
+            done
+            echo ""
+            read -p "Do you want to clean backup nodes as well? (yes/no) [yes]: " CLEAN_BACKUPS
+            CLEAN_BACKUPS=${CLEAN_BACKUPS:-yes}
+            if [[ "$CLEAN_BACKUPS" =~ ^[Yy] ]]; then
+                CLEAN_BACKUP_NODES=true
+                
+                # Need sudo password for remote operations
+                read -s -p "Enter YOUR sudo password for remote hosts: " SUDO_PASS
+                echo ""
+                export SUDO_PASS
+                
+                # Set up SSH options
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+            fi
+        fi
+    fi
+    
+    echo ""
     echo "=========================================="
     echo "Traefik/Keepalived Cleanup"
     echo "=========================================="
-    echo "This will completely remove Traefik and Keepalived from this system!"
+    if [[ "$CLEAN_BACKUP_NODES" == "true" ]]; then
+        echo "This will completely remove Traefik and Keepalived from:"
+        echo "  - This system (master node)"
+        echo "  - ${#BACKUP_NODES[@]} backup node(s)"
+    else
+        echo "This will completely remove Traefik and Keepalived from this system!"
+    fi
     echo ""
     echo "Components to be removed:"
     echo "  - Traefik Docker container"
@@ -567,224 +608,378 @@ if [[ "$1" == "--clean" ]]; then
         exit 0
     fi
     
-    echo ""
-    echo "=========================================="
-    echo "Starting Cleanup Process"
-    echo "=========================================="
-    echo ""
-    
-    # Check if we can access docker
-    DOCKER_ACCESSIBLE=true
-    if ! docker ps &>/dev/null; then
-        # Try with docker group
-        if sg docker -c "docker ps" &>/dev/null 2>&1; then
-            DOCKER_ACCESSIBLE="sg"
-        else
-            DOCKER_ACCESSIBLE=false
-        fi
-    fi
-    
-    # Helper function for docker commands in cleanup
-    cleanup_docker_cmd() {
-        if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
-            docker "$@"
-        elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
-            sg docker -c "docker $*"
-        else
-            return 1
-        fi
-    }
-    
-    # Stop and remove Traefik container
-    echo -n "Stopping Traefik container... "
-    if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
-        cleanup_docker_cmd stop traefik 2>/dev/null || true
-        echo "✓ Stopped"
-    else
-        echo "Not running or Docker not accessible"
-    fi
-    
-    echo -n "Removing Traefik container... "
-    if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
-        cleanup_docker_cmd rm traefik 2>/dev/null || true
-        echo "✓ Removed"
-    else
-        echo "Not found or Docker not accessible"
-    fi
-    
-    # Remove Docker network
-    echo -n "Removing Docker network 'proxynet'... "
-    if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
-        cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-        echo "✓ Removed"
-    else
-        echo "Not found or Docker not accessible"
-    fi
-    
-    # Remove Traefik image (optional - ask user)
-    if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd images 2>/dev/null | grep -q traefik; then
-        echo ""
-        read -p "Remove Traefik Docker image? (yes/no) [no]: " REMOVE_IMAGE
-        if [[ "$REMOVE_IMAGE" == "yes" || "$REMOVE_IMAGE" == "y" ]]; then
-            echo -n "Removing Traefik images... "
-            IMAGE_IDS=$(cleanup_docker_cmd images | grep traefik | awk '{print $3}')
-            if [ -n "$IMAGE_IDS" ]; then
-                for img_id in $IMAGE_IDS; do
-                    cleanup_docker_cmd rmi -f "$img_id" 2>/dev/null || true
-                done
-            fi
-            echo "✓ Removed"
-        fi
-    fi
-    
-    # Remove Traefik directories
-    echo -n "Removing Traefik directories... "
-    if [ -d "/home/haloap/traefik" ]; then
-        sudo rm -rf /home/haloap/traefik || exit_on_error "Failed to remove Traefik directory"
-        echo "✓ Removed"
-    else
-        echo "Not found"
-    fi
-    
-    if [ -d "/home/haloap" ]; then
-        # Check if directory is empty, if so remove it
-        if [ -z "$(ls -A /home/haloap 2>/dev/null)" ]; then
-            sudo rm -rf /home/haloap 2>/dev/null || true
-            echo "✓ Removed empty /home/haloap directory"
-        fi
-    fi
-    
-    # Stop and remove Keepalived
-    echo -n "Stopping Keepalived service... "
-    if systemctl is-active --quiet keepalived 2>/dev/null; then
-        sudo systemctl stop keepalived 2>/dev/null || true
-        echo "✓ Stopped"
-    else
-        echo "Not running"
-    fi
-    
-    echo -n "Disabling Keepalived service... "
-    if systemctl is-enabled --quiet keepalived 2>/dev/null; then
-        sudo systemctl disable keepalived 2>/dev/null || true
-        echo "✓ Disabled"
-    else
-        echo "Not enabled"
-    fi
-    
-    # Ask if user wants to uninstall Keepalived package
-    if command -v keepalived &> /dev/null; then
-        echo ""
-        read -p "Uninstall Keepalived package? (yes/no) [no]: " UNINSTALL_KEEPALIVED
-        if [[ "$UNINSTALL_KEEPALIVED" == "yes" || "$UNINSTALL_KEEPALIVED" == "y" ]]; then
-            echo -n "Uninstalling Keepalived... "
-            if [[ -f /etc/os-release ]]; then
-                source /etc/os-release
-                if command -v apt-get &>/dev/null; then
-                    sudo apt-get -y purge keepalived 2>/dev/null || true
-                    sudo apt-get -y autoremove 2>/dev/null || true
-                elif command -v yum &>/dev/null; then
-                    sudo yum -y remove keepalived 2>/dev/null || true
-                fi
-            fi
-            echo "✓ Uninstalled"
-        fi
-    fi
-    
-    # Remove Keepalived configuration
-    echo -n "Removing Keepalived configuration... "
-    if [ -f "/etc/keepalived/keepalived.conf" ]; then
-        sudo rm -f /etc/keepalived/keepalived.conf || true
-        sudo rm -f /etc/keepalived/keepalived.conf.bak* || true
-        echo "✓ Removed"
-    else
-        echo "Not found"
-    fi
-    
-    # Remove health check script
-    echo -n "Removing health check script... "
-    if [ -f "/bin/haloap_service_check.sh" ]; then
-        sudo rm -f /bin/haloap_service_check.sh || true
-        echo "✓ Removed"
-    else
-        echo "Not found"
-    fi
-    
-    # Remove keepalived_script user and group
-    echo -n "Removing keepalived_script user and group... "
-    if id "keepalived_script" &>/dev/null; then
-        sudo userdel keepalived_script 2>/dev/null || true
-    fi
-    if getent group keepalived_script > /dev/null 2>&1; then
-        sudo groupdel keepalived_script 2>/dev/null || true
-    fi
-    echo "✓ Removed"
-    
-    # Remove Docker proxy configuration
-    echo -n "Removing Docker proxy configuration... "
-    if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
-        sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
-        sudo systemctl daemon-reload 2>/dev/null || true
-        echo "✓ Removed"
-    else
-        echo "Not found"
-    fi
-    
-    # Remove configuration file
-    echo -n "Removing configuration file... "
-    if [ -f "$CONFIG_FILE" ]; then
-        rm -f "$CONFIG_FILE" || true
-        rm -f "$CONFIG_FILE".bak* || true
-        echo "✓ Removed"
-    else
-        echo "Not found"
-    fi
-    
-    # Ask about Docker
-    echo ""
-    if command -v docker &> /dev/null; then
-        read -p "Uninstall Docker? (yes/no) [no]: " UNINSTALL_DOCKER
-        if [[ "$UNINSTALL_DOCKER" == "yes" || "$UNINSTALL_DOCKER" == "y" ]]; then
+    # Function to perform cleanup on a node (local or remote)
+    perform_cleanup() {
+        local is_remote=$1
+        local node_name=${2:-"local"}
+        local node_ip=${3:-""}
+        
+        if [[ "$is_remote" == "true" ]]; then
             echo ""
-            echo "⚠️  WARNING: This will remove Docker and ALL containers/images!"
-            read -p "Are you absolutely sure? Type 'yes' to continue: " CONFIRM_DOCKER
+            echo "=========================================="
+            echo "Cleaning $node_name ($node_ip)"
+            echo "=========================================="
             
-            if [[ "$CONFIRM_DOCKER" == "yes" ]]; then
-                echo -n "Stopping Docker... "
-                sudo systemctl stop docker 2>/dev/null || true
-                sudo systemctl disable docker 2>/dev/null || true
-                echo "✓ Stopped"
-                
-                echo -n "Uninstalling Docker... "
-                if command -v apt-get &>/dev/null; then
-                    sudo apt-get -y purge docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
-                    sudo apt-get -y autoremove 2>/dev/null || true
-                    sudo rm -f /etc/apt/sources.list.d/docker.list
-                    sudo rm -f /etc/apt/keyrings/docker.gpg
-                elif command -v yum &>/dev/null; then
-                    sudo yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+            # Create cleanup script for remote execution
+            write_local_file "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh" <<'REMOTECLEANUP'
+#!/bin/bash
+set -e
+
+echo "Starting cleanup on $(hostname)..."
+
+# Check if we can access docker
+DOCKER_ACCESSIBLE=true
+if ! docker ps &>/dev/null 2>&1; then
+    if sg docker -c "docker ps" &>/dev/null 2>&1; then
+        DOCKER_ACCESSIBLE="sg"
+    else
+        DOCKER_ACCESSIBLE=false
+    fi
+fi
+
+cleanup_docker_cmd() {
+    if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
+        docker "$@"
+    elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
+        sg docker -c "docker $*"
+    else
+        return 1
+    fi
+}
+
+# Stop and remove Traefik
+echo -n "Stopping Traefik... "
+if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
+    cleanup_docker_cmd stop traefik 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not running"
+fi
+
+echo -n "Removing Traefik container... "
+if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
+    cleanup_docker_cmd rm traefik 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not found"
+fi
+
+# Remove Docker network
+echo -n "Removing Docker network 'proxynet'... "
+if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
+    cleanup_docker_cmd network rm proxynet 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not found"
+fi
+
+# Remove Traefik directories
+echo -n "Removing Traefik directories... "
+if [ -d "/home/haloap/traefik" ]; then
+    rm -rf /home/haloap/traefik
+    echo "✓"
+else
+    echo "Not found"
+fi
+
+if [ -d "/home/haloap" ] && [ -z "$(ls -A /home/haloap 2>/dev/null)" ]; then
+    rm -rf /home/haloap 2>/dev/null || true
+fi
+
+# Stop and remove Keepalived
+echo -n "Stopping Keepalived... "
+if systemctl is-active --quiet keepalived 2>/dev/null; then
+    systemctl stop keepalived 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not running"
+fi
+
+echo -n "Disabling Keepalived... "
+if systemctl is-enabled --quiet keepalived 2>/dev/null; then
+    systemctl disable keepalived 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not enabled"
+fi
+
+# Remove Keepalived configuration
+echo -n "Removing Keepalived config... "
+if [ -f "/etc/keepalived/keepalived.conf" ]; then
+    rm -f /etc/keepalived/keepalived.conf
+    rm -f /etc/keepalived/keepalived.conf.bak*
+    echo "✓"
+else
+    echo "Not found"
+fi
+
+# Remove health check script
+echo -n "Removing health check script... "
+if [ -f "/bin/haloap_service_check.sh" ]; then
+    rm -f /bin/haloap_service_check.sh
+    echo "✓"
+else
+    echo "Not found"
+fi
+
+# Remove keepalived_script user and group
+if id "keepalived_script" &>/dev/null; then
+    userdel keepalived_script 2>/dev/null || true
+fi
+if getent group keepalived_script > /dev/null 2>&1; then
+    groupdel keepalived_script 2>/dev/null || true
+fi
+
+echo "✓ Cleanup complete on $(hostname)"
+REMOTECLEANUP
+            chmod 644 "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
+            
+            # Copy and execute
+            ensure_SCRIPTS_DIR "$node_ip"
+            copy_to_remote "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh" "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh"
+            execute_remote_script "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh"
+            
+            # Cleanup temp files
+            rm -f "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
+            
+            echo "✓ Cleanup completed on $node_name"
+        else
+            # Local cleanup
+            echo ""
+            echo "=========================================="
+            echo "Starting Cleanup Process"
+            echo "=========================================="
+            echo ""
+            
+            # Check if we can access docker
+            DOCKER_ACCESSIBLE=true
+            if ! docker ps &>/dev/null; then
+                if sg docker -c "docker ps" &>/dev/null 2>&1; then
+                    DOCKER_ACCESSIBLE="sg"
+                else
+                    DOCKER_ACCESSIBLE=false
                 fi
-                echo "✓ Uninstalled"
-                
-                echo -n "Removing Docker data... "
-                sudo rm -rf /var/lib/docker 2>/dev/null || true
-                sudo rm -rf /var/lib/containerd 2>/dev/null || true
+            fi
+            
+            cleanup_docker_cmd() {
+                if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
+                    docker "$@"
+                elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
+                    sg docker -c "docker $*"
+                else
+                    return 1
+                fi
+            }
+            
+            # Stop and remove Traefik container
+            echo -n "Stopping Traefik container... "
+            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
+                cleanup_docker_cmd stop traefik 2>/dev/null || true
+                echo "✓ Stopped"
+            else
+                echo "Not running or Docker not accessible"
+            fi
+            
+            echo -n "Removing Traefik container... "
+            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
+                cleanup_docker_cmd rm traefik 2>/dev/null || true
                 echo "✓ Removed"
-                
-                # Remove user from docker group
-                if groups "$CURRENT_USER" | grep -q docker; then
-                    echo -n "Removing $CURRENT_USER from docker group... "
-                    sudo gpasswd -d "$CURRENT_USER" docker 2>/dev/null || true
+            else
+                echo "Not found or Docker not accessible"
+            fi
+            
+            # Remove Docker network
+            echo -n "Removing Docker network 'proxynet'... "
+            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
+                cleanup_docker_cmd network rm proxynet 2>/dev/null || true
+                echo "✓ Removed"
+            else
+                echo "Not found or Docker not accessible"
+            fi
+            
+            # Remove Traefik image (optional)
+            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd images 2>/dev/null | grep -q traefik; then
+                echo ""
+                read -p "Remove Traefik Docker image? (yes/no) [no]: " REMOVE_IMAGE
+                if [[ "$REMOVE_IMAGE" == "yes" || "$REMOVE_IMAGE" == "y" ]]; then
+                    echo -n "Removing Traefik images... "
+                    IMAGE_IDS=$(cleanup_docker_cmd images | grep traefik | awk '{print $3}')
+                    if [ -n "$IMAGE_IDS" ]; then
+                        for img_id in $IMAGE_IDS; do
+                            cleanup_docker_cmd rmi -f "$img_id" 2>/dev/null || true
+                        done
+                    fi
                     echo "✓ Removed"
                 fi
             fi
+            
+            # Remove Traefik directories
+            echo -n "Removing Traefik directories... "
+            if [ -d "/home/haloap/traefik" ]; then
+                sudo rm -rf /home/haloap/traefik || exit_on_error "Failed to remove Traefik directory"
+                echo "✓ Removed"
+            else
+                echo "Not found"
+            fi
+            
+            if [ -d "/home/haloap" ]; then
+                if [ -z "$(ls -A /home/haloap 2>/dev/null)" ]; then
+                    sudo rm -rf /home/haloap 2>/dev/null || true
+                    echo "✓ Removed empty /home/haloap directory"
+                fi
+            fi
+            
+            # Stop and remove Keepalived
+            echo -n "Stopping Keepalived service... "
+            if systemctl is-active --quiet keepalived 2>/dev/null; then
+                sudo systemctl stop keepalived 2>/dev/null || true
+                echo "✓ Stopped"
+            else
+                echo "Not running"
+            fi
+            
+            echo -n "Disabling Keepalived service... "
+            if systemctl is-enabled --quiet keepalived 2>/dev/null; then
+                sudo systemctl disable keepalived 2>/dev/null || true
+                echo "✓ Disabled"
+            else
+                echo "Not enabled"
+            fi
+            
+            # Ask if user wants to uninstall Keepalived package
+            if command -v keepalived &> /dev/null; then
+                echo ""
+                read -p "Uninstall Keepalived package? (yes/no) [no]: " UNINSTALL_KEEPALIVED
+                if [[ "$UNINSTALL_KEEPALIVED" == "yes" || "$UNINSTALL_KEEPALIVED" == "y" ]]; then
+                    echo -n "Uninstalling Keepalived... "
+                    if [[ -f /etc/os-release ]]; then
+                        source /etc/os-release
+                        if command -v apt-get &>/dev/null; then
+                            sudo apt-get -y purge keepalived 2>/dev/null || true
+                            sudo apt-get -y autoremove 2>/dev/null || true
+                        elif command -v yum &>/dev/null; then
+                            sudo yum -y remove keepalived 2>/dev/null || true
+                        fi
+                    fi
+                    echo "✓ Uninstalled"
+                fi
+            fi
+            
+            # Remove Keepalived configuration
+            echo -n "Removing Keepalived configuration... "
+            if [ -f "/etc/keepalived/keepalived.conf" ]; then
+                sudo rm -f /etc/keepalived/keepalived.conf || true
+                sudo rm -f /etc/keepalived/keepalived.conf.bak* || true
+                echo "✓ Removed"
+            else
+                echo "Not found"
+            fi
+            
+            # Remove health check script
+            echo -n "Removing health check script... "
+            if [ -f "/bin/haloap_service_check.sh" ]; then
+                sudo rm -f /bin/haloap_service_check.sh || true
+                echo "✓ Removed"
+            else
+                echo "Not found"
+            fi
+            
+            # Remove keepalived_script user and group
+            echo -n "Removing keepalived_script user and group... "
+            if id "keepalived_script" &>/dev/null; then
+                sudo userdel keepalived_script 2>/dev/null || true
+            fi
+            if getent group keepalived_script > /dev/null 2>&1; then
+                sudo groupdel keepalived_script 2>/dev/null || true
+            fi
+            echo "✓ Removed"
+            
+            # Remove Docker proxy configuration
+            echo -n "Removing Docker proxy configuration... "
+            if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
+                sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
+                sudo systemctl daemon-reload 2>/dev/null || true
+                echo "✓ Removed"
+            else
+                echo "Not found"
+            fi
+            
+            # Remove configuration file
+            echo -n "Removing configuration file... "
+            if [ -f "$CONFIG_FILE" ]; then
+                rm -f "$CONFIG_FILE" || true
+                rm -f "$CONFIG_FILE".bak* || true
+                echo "✓ Removed"
+            else
+                echo "Not found"
+            fi
+            
+            # Ask about Docker
+            echo ""
+            if command -v docker &> /dev/null; then
+                read -p "Uninstall Docker? (yes/no) [no]: " UNINSTALL_DOCKER
+                if [[ "$UNINSTALL_DOCKER" == "yes" || "$UNINSTALL_DOCKER" == "y" ]]; then
+                    echo ""
+                    echo "⚠️  WARNING: This will remove Docker and ALL containers/images!"
+                    read -p "Are you absolutely sure? Type 'yes' to continue: " CONFIRM_DOCKER
+                    
+                    if [[ "$CONFIRM_DOCKER" == "yes" ]]; then
+                        echo -n "Stopping Docker... "
+                        sudo systemctl stop docker 2>/dev/null || true
+                        sudo systemctl disable docker 2>/dev/null || true
+                        echo "✓ Stopped"
+                        
+                        echo -n "Uninstalling Docker... "
+                        if command -v apt-get &>/dev/null; then
+                            sudo apt-get -y purge docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
+                            sudo apt-get -y autoremove 2>/dev/null || true
+                            sudo rm -f /etc/apt/sources.list.d/docker.list
+                            sudo rm -f /etc/apt/keyrings/docker.gpg
+                        elif command -v yum &>/dev/null; then
+                            sudo yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+                        fi
+                        echo "✓ Uninstalled"
+                        
+                        echo -n "Removing Docker data... "
+                        sudo rm -rf /var/lib/docker 2>/dev/null || true
+                        sudo rm -rf /var/lib/containerd 2>/dev/null || true
+                        echo "✓ Removed"
+                        
+                        if groups "$CURRENT_USER" | grep -q docker; then
+                            echo -n "Removing $CURRENT_USER from docker group... "
+                            sudo gpasswd -d "$CURRENT_USER" docker 2>/dev/null || true
+                            echo "✓ Removed"
+                        fi
+                    fi
+                fi
+            fi
         fi
+    }
+    
+    # Clean backup nodes first (if applicable)
+    if [[ "$CLEAN_BACKUP_NODES" == "true" ]]; then
+        for i in "${!BACKUP_NODES[@]}"; do
+            perform_cleanup true "${BACKUP_NODES[$i]}" "${BACKUP_IPS[$i]}"
+        done
+        
+        # Cleanup remote scripts
+        cleanup_remote_scripts_dirs
     fi
+    
+    # Clean local (master) node
+    perform_cleanup false
     
     echo ""
     echo "=========================================="
     echo "✓✓✓ CLEANUP COMPLETE ✓✓✓"
     echo "=========================================="
-    echo "Traefik and Keepalived have been removed from this system."
+    if [[ "$CLEAN_BACKUP_NODES" == "true" ]]; then
+        echo "Traefik and Keepalived have been removed from:"
+        echo "  - Master node (this system)"
+        echo "  - ${#BACKUP_NODES[@]} backup node(s)"
+    else
+        echo "Traefik and Keepalived have been removed from this system."
+    fi
     echo ""
     echo "Note: You may want to manually check/remove:"
     echo "  - Firewall rules (if any were added manually)"
