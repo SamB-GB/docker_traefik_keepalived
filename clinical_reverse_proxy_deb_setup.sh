@@ -384,7 +384,7 @@ check_execution_context() {
     
     # Check 2: Verify user has sudo privileges
     echo -n "Checking if $CURRENT_USER has sudo privileges... "
-    
+    echo ""
     # Test sudo access without prompting for password yet
     if sudo -n true 2>/dev/null; then
         echo "✓ (cached/passwordless)"
