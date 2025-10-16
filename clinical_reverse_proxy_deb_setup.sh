@@ -548,10 +548,16 @@ if [[ "$1" == "--clean" ]]; then
     validate_os
     check_execution_context
     
-    # Check if this was a multi-node deployment
+    # ===== LOAD CONFIG FIRST (before any cleanup) =====
     CLEAN_BACKUP_NODES=false
+    UNINSTALL_DOCKER_REMOTE=false
+    UNINSTALL_KEEPALIVED_REMOTE=false
+    declare -a BACKUP_NODES
+    declare -a BACKUP_IPS
+    
+    # Preserve config data before we start deleting anything
     if [[ -f "$CONFIG_FILE" ]]; then
-        # Load config to check for multi-node deployment
+        echo "Loading configuration..."
         source "$CONFIG_FILE"
         
         if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
@@ -565,10 +571,33 @@ if [[ "$1" == "--clean" ]]; then
             echo ""
             read -p "Do you want to clean backup nodes as well? (yes/no) [yes]: " CLEAN_BACKUPS
             CLEAN_BACKUPS=${CLEAN_BACKUPS:-yes}
+            
             if [[ "$CLEAN_BACKUPS" =~ ^[Yy] ]]; then
                 CLEAN_BACKUP_NODES=true
                 
-                # Need sudo password for remote operations
+                # Ask about package removal
+                echo ""
+                echo "Package Removal Options for Backup Nodes:"
+                echo ""
+                read -p "Uninstall Keepalived package on backup nodes? (yes/no) [yes]: " UNINSTALL_KA_REMOTE
+                UNINSTALL_KA_REMOTE=${UNINSTALL_KA_REMOTE:-yes}
+                if [[ "$UNINSTALL_KA_REMOTE" =~ ^[Yy] ]]; then
+                    UNINSTALL_KEEPALIVED_REMOTE=true
+                fi
+                
+                read -p "Uninstall Docker on backup nodes? (yes/no) [no]: " UNINSTALL_DOCKER_REMOTE_INPUT
+                UNINSTALL_DOCKER_REMOTE_INPUT=${UNINSTALL_DOCKER_REMOTE_INPUT:-no}
+                if [[ "$UNINSTALL_DOCKER_REMOTE_INPUT" =~ ^[Yy] ]]; then
+                    echo ""
+                    echo "⚠️  WARNING: This will remove Docker and ALL containers/images on backup nodes!"
+                    read -p "Are you absolutely sure? Type 'yes' to continue: " CONFIRM_DOCKER_REMOTE
+                    if [[ "$CONFIRM_DOCKER_REMOTE" == "yes" ]]; then
+                        UNINSTALL_DOCKER_REMOTE=true
+                    fi
+                fi
+                
+                # Get sudo password for remote operations
+                echo ""
                 read -s -p "Enter YOUR sudo password for remote hosts: " SUDO_PASS
                 echo ""
                 export SUDO_PASS
@@ -579,6 +608,7 @@ if [[ "$1" == "--clean" ]]; then
         fi
     fi
     
+    # ===== CONFIRM CLEANUP =====
     echo ""
     echo "=========================================="
     echo "Traefik/Keepalived Cleanup"
@@ -587,6 +617,12 @@ if [[ "$1" == "--clean" ]]; then
         echo "This will completely remove Traefik and Keepalived from:"
         echo "  - This system (master node)"
         echo "  - ${#BACKUP_NODES[@]} backup node(s)"
+        if [[ "$UNINSTALL_KEEPALIVED_REMOTE" == "true" ]]; then
+            echo "  - Keepalived package will be UNINSTALLED from backup nodes"
+        fi
+        if [[ "$UNINSTALL_DOCKER_REMOTE" == "true" ]]; then
+            echo "  - Docker will be UNINSTALLED from backup nodes"
+        fi
     else
         echo "This will completely remove Traefik and Keepalived from this system!"
     fi
@@ -608,13 +644,17 @@ if [[ "$1" == "--clean" ]]; then
         exit 0
     fi
     
+    # ===== PERFORM CLEANUP =====
+    
     # Function to perform cleanup on a node (local or remote)
     perform_cleanup() {
         local is_remote=$1
         local node_name=${2:-"local"}
         local node_ip=${3:-""}
+        local is_local_final=${4:-"false"}  # Flag to know if this is the final local cleanup
         
         if [[ "$is_remote" == "true" ]]; then
+            # ... (remote cleanup code - same as before)
             echo ""
             echo "=========================================="
             echo "Cleaning $node_name ($node_ip)"
@@ -686,7 +726,7 @@ if [ -d "/home/haloap" ] && [ -z "$(ls -A /home/haloap 2>/dev/null)" ]; then
     rm -rf /home/haloap 2>/dev/null || true
 fi
 
-# Stop and remove Keepalived
+# Stop and disable Keepalived
 echo -n "Stopping Keepalived... "
 if systemctl is-active --quiet keepalived 2>/dev/null; then
     systemctl stop keepalived 2>/dev/null || true
@@ -701,6 +741,22 @@ if systemctl is-enabled --quiet keepalived 2>/dev/null; then
     echo "✓"
 else
     echo "Not enabled"
+fi
+
+# Uninstall Keepalived if requested
+if [[ "UNINSTALL_KEEPALIVED_FLAG" == "true" ]]; then
+    echo -n "Uninstalling Keepalived package... "
+    if command -v keepalived &> /dev/null; then
+        if command -v apt-get &>/dev/null; then
+            apt-get -y purge keepalived 2>/dev/null || true
+            apt-get -y autoremove 2>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum -y remove keepalived 2>/dev/null || true
+        fi
+        echo "✓"
+    else
+        echo "Not installed"
+    fi
 fi
 
 # Remove Keepalived configuration
@@ -723,16 +779,56 @@ else
 fi
 
 # Remove keepalived_script user and group
+echo -n "Removing keepalived_script user/group... "
 if id "keepalived_script" &>/dev/null; then
     userdel keepalived_script 2>/dev/null || true
 fi
 if getent group keepalived_script > /dev/null 2>&1; then
     groupdel keepalived_script 2>/dev/null || true
 fi
+echo "✓"
+
+# Uninstall Docker if requested
+if [[ "UNINSTALL_DOCKER_FLAG" == "true" ]]; then
+    echo -n "Stopping Docker... "
+    systemctl stop docker 2>/dev/null || true
+    systemctl disable docker 2>/dev/null || true
+    echo "✓"
+    
+    echo -n "Uninstalling Docker... "
+    if command -v apt-get &>/dev/null; then
+        apt-get -y purge docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
+        apt-get -y autoremove 2>/dev/null || true
+        rm -f /etc/apt/sources.list.d/docker.list
+        rm -f /etc/apt/keyrings/docker.gpg
+    elif command -v yum &>/dev/null; then
+        yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+    fi
+    echo "✓"
+    
+    echo -n "Removing Docker data... "
+    rm -rf /var/lib/docker 2>/dev/null || true
+    rm -rf /var/lib/containerd 2>/dev/null || true
+    echo "✓"
+fi
+
+# Remove Docker proxy configuration
+echo -n "Removing Docker proxy config... "
+if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
+    rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
+    systemctl daemon-reload 2>/dev/null || true
+    echo "✓"
+else
+    echo "Not found"
+fi
 
 echo "✓ Cleanup complete on $(hostname)"
 REMOTECLEANUP
             chmod 644 "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
+            
+            # Replace flags in the script
+            sed -i "s/UNINSTALL_KEEPALIVED_FLAG/$UNINSTALL_KEEPALIVED_REMOTE/g" "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
+            sed -i "s/UNINSTALL_DOCKER_FLAG/$UNINSTALL_DOCKER_REMOTE/g" "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
             
             # Copy and execute
             ensure_SCRIPTS_DIR "$node_ip"
@@ -743,11 +839,12 @@ REMOTECLEANUP
             rm -f "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
             
             echo "✓ Cleanup completed on $node_name"
+            
         else
             # Local cleanup
             echo ""
             echo "=========================================="
-            echo "Starting Cleanup Process"
+            echo "Starting Cleanup Process (Local)"
             echo "=========================================="
             echo ""
             
@@ -904,14 +1001,17 @@ REMOTECLEANUP
                 echo "Not found"
             fi
             
-            # Remove configuration file
-            echo -n "Removing configuration file... "
-            if [ -f "$CONFIG_FILE" ]; then
-                rm -f "$CONFIG_FILE" || true
-                rm -f "$CONFIG_FILE".bak* || true
-                echo "✓ Removed"
-            else
-                echo "Not found"
+            # Only remove config file if this is the final cleanup
+            # (after backup nodes have been cleaned)
+            if [[ "$is_local_final" == "true" ]]; then
+                echo -n "Removing configuration file... "
+                if [ -f "$CONFIG_FILE" ]; then
+                    rm -f "$CONFIG_FILE" || true
+                    rm -f "$CONFIG_FILE".bak* || true
+                    echo "✓ Removed"
+                else
+                    echo "Not found"
+                fi
             fi
             
             # Ask about Docker
@@ -956,7 +1056,8 @@ REMOTECLEANUP
         fi
     }
     
-    # Clean backup nodes first (if applicable)
+    # ===== EXECUTION ORDER =====
+    # 1. Clean backup nodes first (if applicable)
     if [[ "$CLEAN_BACKUP_NODES" == "true" ]]; then
         for i in "${!BACKUP_NODES[@]}"; do
             perform_cleanup true "${BACKUP_NODES[$i]}" "${BACKUP_IPS[$i]}"
@@ -966,9 +1067,10 @@ REMOTECLEANUP
         cleanup_remote_scripts_dirs
     fi
     
-    # Clean local (master) node
-    perform_cleanup false
+    # 2. Clean local (master) node LAST (so config file is available until the end)
+    perform_cleanup false "local" "" "true"
     
+    # ===== FINAL MESSAGE =====
     echo ""
     echo "=========================================="
     echo "✓✓✓ CLEANUP COMPLETE ✓✓✓"
@@ -977,6 +1079,12 @@ REMOTECLEANUP
         echo "Traefik and Keepalived have been removed from:"
         echo "  - Master node (this system)"
         echo "  - ${#BACKUP_NODES[@]} backup node(s)"
+        if [[ "$UNINSTALL_KEEPALIVED_REMOTE" == "true" ]]; then
+            echo "  - Keepalived was uninstalled from backup nodes"
+        fi
+        if [[ "$UNINSTALL_DOCKER_REMOTE" == "true" ]]; then
+            echo "  - Docker was uninstalled from backup nodes"
+        fi
     else
         echo "Traefik and Keepalived have been removed from this system."
     fi
@@ -2033,71 +2141,6 @@ check_key_cert_match() {
         exit_on_error "The certificate and private key do not match!"
     else
         log "The certificate and private key match!"
-    fi
-}
-
-# ==========================================
-# Remote Copy Function
-# ==========================================
-
-# Function to prompt user to copy script and config to another server
-prompt_copy_to_remote() {
-    
-    # Unset proxy variables for SSH operations
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-    
-    printf "\n"
-    read -p "Do you want to copy this script and configuration to another server? (yes/no): " COPY_CHOICE
-    COPY_CHOICE=$(echo "$COPY_CHOICE" | tr '[:upper:]' '[:lower:]')
-    if [[ "$COPY_CHOICE" != "yes" && "$COPY_CHOICE" != "y" ]]; then
-        return 0
-    fi
-
-    echo ""
-    echo "----------------------------------------"
-    echo "Copy to Remote Server"
-    echo "----------------------------------------"
-    echo ""
-
-    # Get remote server details
-    read -p "Enter remote server IP/hostname: " REMOTE_IP
-    while [[ -z "$REMOTE_IP" ]]; do
-        read -p "Remote IP/hostname cannot be empty. Please enter: " REMOTE_IP
-    done
-
-    read -p "Enter SSH username [default: root]: " REMOTE_USER
-    REMOTE_USER=${REMOTE_USER:-root}
-
-    read -p "Enter SSH port [default: 22]: " REMOTE_PORT
-    REMOTE_PORT=${REMOTE_PORT:-22}
-
-    # Validate files exist
-    SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
-    if [[ ! -f "$SCRIPT_PATH" ]]; then
-        log "Error: Script file not found at $SCRIPT_PATH"
-        return 1
-    fi
-
-    FILES_TO_COPY=("$SCRIPT_PATH")
-
-    # Get config file path relative to script
-    CONFIG_PATH="$SCRIPT_DIR/clinical_traefik.env"
-    if [[ -f "$CONFIG_PATH" ]]; then
-        FILES_TO_COPY+=("$CONFIG_PATH")
-    else
-        log "Warning: Configuration file $CONFIG_PATH not found"
-    fi
-
-    # Perform SCP
-    log "Copying files to $REMOTE_USER@$REMOTE_IP:$REMOTE_PORT..."
-    scp -o StrictHostKeyChecking=no -P "$REMOTE_PORT" "${FILES_TO_COPY[@]}" "$REMOTE_USER@$REMOTE_IP:/usr/local/src/"
-
-    # Check if SCP succeeded
-    if [[ $? -eq 0 ]]; then
-        log "Files copied successfully to $REMOTE_IP."
-        log "You can now SSH into the remote server and run the script from /usr/local/src/"
-    else
-        log "Error: Failed to copy files to $REMOTE_IP. Check network connectivity and SSH access. Please copy files manually to /usr/local/src/"
     fi
 }
 
@@ -3857,11 +3900,6 @@ fi
 
 echo "=========================================="
 echo ""
-
-# Prompt to copy files to another server (only in single-node mode)
-if [ "$MULTI_NODE_DEPLOYMENT" != "yes" ]; then
-    prompt_copy_to_remote
-fi
 
 # Cleanup temporary scripts directory
 cleanup
