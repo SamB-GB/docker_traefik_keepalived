@@ -1178,9 +1178,9 @@ prompt_use_existing_config() {
 # Prompt for deployment type
 prompt_deployment_type() {
     echo ""
-    echo "----------------------------------------"
+    echo "=========================================="
     echo "Select Traefik Deployment Type"
-    echo "----------------------------------------"
+    echo "=========================================="
     echo ""
 
     local default_hint=""
@@ -1310,9 +1310,9 @@ install_packages() {
 # Prompt for multi-node deployment configuration
 prompt_multi_node_deployment() {
     echo ""
-    echo "----------------------------------------"
+    echo "=========================================="
     echo "High Availability Configuration"
-    echo "----------------------------------------"
+    echo "=========================================="
     echo ""
     
     # Check if we already have multi-node config loaded
