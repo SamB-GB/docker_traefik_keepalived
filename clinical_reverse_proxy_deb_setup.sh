@@ -3387,6 +3387,7 @@ sudo chmod 640 /etc/keepalived/keepalived.conf
 echo "Starting Keepalived..."
 sudo systemctl enable keepalived
 sudo systemctl start keepalived
+sudo systemctl restart keepalived
 
 echo ""
 echo "✓ Installation complete on backup node"
