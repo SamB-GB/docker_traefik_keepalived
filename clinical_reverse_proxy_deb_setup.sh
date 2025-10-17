@@ -425,7 +425,6 @@ check_execution_context() {
 }
 
 # Check repository connectivity
-# Check repository connectivity
 check_repository_connectivity() {
     echo ""
     echo "=========================================="
@@ -439,58 +438,75 @@ check_repository_connectivity() {
     echo "Local Node:"
     echo "----------"
     
-    LOCAL_CHECK_FAILED=$(check_single_node "local" "" "")
+    check_single_node "local" "" ""
+    LOCAL_CHECK_FAILED=$?
     
-    # If multi-node, check backup nodes too
-    if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
-        echo ""
-        echo "=========================================="
-        echo "Checking Backup Nodes"
-        echo "=========================================="
+    # Check if we should test backup nodes
+    # Safe check: verify variable is set and equals "yes"
+    if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ]; then
+        # Safe array check: verify array is declared and has elements
+        local backup_count=0
+        if [ -n "${BACKUP_NODES+x}" ]; then
+            # Array is declared, get length
+            backup_count=${#BACKUP_NODES[@]}
+        fi
         
-        local REMOTE_FAILURES=0
-        
-        for i in "${!BACKUP_NODES[@]}"; do
-            local node="${BACKUP_NODES[$i]}"
-            local ip="${BACKUP_IPS[$i]}"
-            
-            echo ""
-            echo "$node ($ip):"
-            echo "----------"
-            
-            if ! check_single_node "remote" "$node" "$ip"; then
-                REMOTE_FAILURES=$((REMOTE_FAILURES + 1))
-            fi
-        done
-        
-        if [ $REMOTE_FAILURES -gt 0 ]; then
+        if [ "$backup_count" -gt 0 ]; then
             echo ""
             echo "=========================================="
-            echo "⚠️  $REMOTE_FAILURES backup node(s) failed repository checks"
+            echo "Checking Backup Nodes"
             echo "=========================================="
-            echo ""
-            echo "Deployment to these nodes may fail during package installation."
-            echo ""
-            read -p "Continue with multi-node deployment? [y/N]: " CONTINUE_MULTI
-            if [[ ! "$CONTINUE_MULTI" =~ ^[Yy]$ ]]; then
-                echo "Installation cancelled."
-                cleanup
-                exit 1
+            
+            local REMOTE_FAILURES=0
+            
+            for i in "${!BACKUP_NODES[@]}"; do
+                local node="${BACKUP_NODES[$i]}"
+                local ip="${BACKUP_IPS[$i]}"
+                
+                echo ""
+                echo "$node ($ip):"
+                echo "----------"
+                
+                check_single_node "remote" "$node" "$ip"
+                if [ $? -ne 0 ]; then
+                    REMOTE_FAILURES=$((REMOTE_FAILURES + 1))
+                fi
+            done
+            
+            if [ $REMOTE_FAILURES -gt 0 ]; then
+                echo ""
+                echo "=========================================="
+                echo "⚠️  $REMOTE_FAILURES backup node(s) failed repository checks"
+                echo "=========================================="
+                echo ""
+                echo "Deployment to these nodes may fail during package installation."
+                echo ""
+                read -p "Continue with multi-node deployment? [y/N]: " CONTINUE_MULTI
+                if [[ ! "$CONTINUE_MULTI" =~ ^[Yy]$ ]]; then
+                    echo "Installation cancelled."
+                    cleanup
+                    exit 1
+                fi
+                echo ""
+                echo "⚠️  Continuing despite remote node connectivity warnings..."
+            else
+                echo ""
+                echo "=========================================="
+                echo "✓ All Nodes: Repository Access Verified"
+                echo "=========================================="
             fi
+        fi
+    fi
+    
+    # Final status message for single-node or after multi-node checks
+    if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "no" ] || [ "${backup_count:-0}" -eq 0 ]; then
+        if [ $LOCAL_CHECK_FAILED -eq 1 ]; then
             echo ""
-            echo "⚠️  Continuing despite remote node connectivity warnings..."
+            echo "⚠️  Continuing despite local connectivity warnings..."
         else
             echo ""
-            echo "=========================================="
-            echo "✓ All Nodes: Repository Access Verified"
-            echo "=========================================="
+            echo "✓ Repository Access Verified"
         fi
-    elif [ $LOCAL_CHECK_FAILED -eq 1 ]; then
-        echo ""
-        echo "⚠️  Continuing despite local connectivity warnings..."
-    else
-        echo ""
-        echo "✓ Repository Access Verified"
     fi
     
     echo ""
@@ -561,7 +577,7 @@ check_single_node() {
     if [ "$check_type" = "remote" ]; then
         DETECTED_OS=$(run_check "grep -oP '(?<=^ID=).+' /etc/os-release 2>/dev/null | tr -d '\"'")
     else
-        DETECTED_OS="$OS_ID"
+        DETECTED_OS="${OS_ID:-unknown}"
     fi
     
     REPO_TEST_PASSED=0
@@ -569,22 +585,28 @@ check_single_node() {
     case "$DETECTED_OS" in
         ubuntu)
             REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
-            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
+                REPO_TEST_PASSED=1
+            fi
             ;;
         debian)
             REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
-            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
+                REPO_TEST_PASSED=1
+            fi
             ;;
         centos|rhel|rocky|almalinux)
             REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
-            echo "$REPO_TEST" | grep -q "200\|301\|302" && REPO_TEST_PASSED=1
+            if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
+                REPO_TEST_PASSED=1
+            fi
             ;;
         *)
             if [ "$check_type" = "remote" ]; then
                 echo "⚠️  Unknown OS ($DETECTED_OS)"
                 REPO_TEST_PASSED=1
             else
-                echo "❌ FAILED"
+                echo "❌ FAILED (unknown OS: $DETECTED_OS)"
                 REPO_CHECK_FAILED=1
                 FAILED_REPOS+=("Standard package repositories")
             fi
@@ -592,7 +614,7 @@ check_single_node() {
     esac
     
     if [ $REPO_TEST_PASSED -eq 1 ]; then
-        if [ -n "$DETECTED_OS" ]; then
+        if [ -n "$DETECTED_OS" ] && [ "$DETECTED_OS" != "unknown" ]; then
             echo "✓ Reachable ($DETECTED_OS)"
         else
             echo "✓ Reachable"
