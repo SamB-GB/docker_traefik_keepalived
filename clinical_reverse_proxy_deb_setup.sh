@@ -442,7 +442,7 @@ check_repository_connectivity() {
     LOCAL_CHECK_FAILED=$(check_single_node "local" "" "")
     
     # If multi-node, check backup nodes too
-    if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ] && [ ${#BACKUP_NODES[@]} -gt 0 ]; then
+    if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
         echo ""
         echo "=========================================="
         echo "Checking Backup Nodes"
