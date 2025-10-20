@@ -79,11 +79,14 @@ copy_to_remote() {
     local ip=$2
     local dest=$3
 
-    local COPYS_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5"
+    # Use legacy SCP protocol (-O) to avoid SFTP subsystem requirement
+    local COPYS_OPTS="-O -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5"
     local KEY_OPT="-i $ACTUAL_HOME/.ssh/id_rsa"
 
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        # Try scp first with legacy protocol
         if ! sudo -u "$SUDO_USER" scp -q $KEY_OPT $COPYS_OPTS "$file" "$CURRENT_USER@$ip:$dest" 2>/tmp/scp_err.$$; then
+            # Fallback: stream over ssh without SFTP/SCP
             sudo -u "$SUDO_USER" ssh $KEY_OPT $COPYS_OPTS "$CURRENT_USER@$ip" "cat > '$dest'" < "$file"
         fi
     else
