@@ -702,11 +702,28 @@ check_single_node() {
 # Function to validate IPv4 address
 validate_ip() {
     local ip=$1
-    if ipcalc -s "$ip" >/dev/null 2>&1; then
-        return 0
-    else
+    
+    # Regex pattern for valid IPv4 address
+    local ip_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    
+    # Check if IP matches the pattern
+    if [[ ! $ip =~ $ip_regex ]]; then
         return 1
     fi
+    
+    # Check each octet is between 0-255
+    local IFS='.'
+    local -a octets=($ip)
+    
+    for octet in "${octets[@]}"; do
+        # Remove leading zeros to avoid octal interpretation
+        octet=$((10#$octet))
+        if ((octet < 0 || octet > 255)); then
+            return 1
+        fi
+    done
+    
+    return 0
 }
 
 # ==========================================
