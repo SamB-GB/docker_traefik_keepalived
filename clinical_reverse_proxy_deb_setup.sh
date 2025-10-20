@@ -3259,8 +3259,8 @@ try_pull() {
     fi
 }
 
-if ! try_pull "ghcr.io/traefik/traefik:latest"; then
-    if ! try_pull "docker.io/traefik/traefik:latest"; then
+if ! try_pull "docker.io/library/traefik:latest"; then
+    if ! try_pull "ghcr.io/traefik/traefik:latest"; then
         exit_on_error "Failed to pull Traefik from all known sources."
     fi
 fi
