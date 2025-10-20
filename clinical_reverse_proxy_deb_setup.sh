@@ -539,28 +539,6 @@ check_single_node() {
         fi
     fi
     
-# Helper function to check a single node (local or remote)
-check_single_node() {
-    local check_type="$1"  # 'local' or 'remote'
-    local node_name="$2"
-    local node_ip="$3"
-    
-    local REPO_CHECK_FAILED=0
-    local FAILED_REPOS=()
-    
-    # Set proxy options
-    local PROXY_CURL_OPT=""
-    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
-        if [ "$check_type" = "local" ]; then
-            export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-            export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-            export no_proxy="localhost,127.0.0.1"
-            echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
-            echo ""
-        fi
-    fi
-    
     # Helper function to run command locally or remotely
     run_check() {
         local cmd="$1"
