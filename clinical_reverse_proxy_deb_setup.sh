@@ -518,6 +518,7 @@ check_repository_connectivity() {
 }
 
 # Helper function to check a single node (local or remote)
+# Helper function to check a single node (local or remote)
 check_single_node() {
     local check_type="$1"  # 'local' or 'remote'
     local node_name="$2"
@@ -553,29 +554,87 @@ check_single_node() {
         fi
     }
     
-    # Check Docker repository
-    echo -n "  Docker repository (download.docker.com)... "
-    DOCKER_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
+    # Check 1: Docker Package Repository (for installing Docker)
+    echo -n "  Docker packages (download.docker.com)... "
+    DOCKER_PKG_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
     
-    if echo "$DOCKER_TEST" | grep -q "200\|301\|302\|403"; then
+    if echo "$DOCKER_PKG_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker repository (download.docker.com)")
+        FAILED_REPOS+=("Docker packages (download.docker.com)")
     fi
     
-    # Check GitHub Container Registry
+    # Check 2: Docker Hub Registry (for pulling images - CRITICAL)
+    echo -n "  Docker Hub registry (registry-1.docker.io)... "
+    REGISTRY_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$REGISTRY_TEST" | grep -q "200\|301\|401"; then
+        echo "✓ Reachable"
+    else
+        echo "❌ FAILED"
+        REPO_CHECK_FAILED=1
+        FAILED_REPOS+=("Docker Hub registry (registry-1.docker.io)")
+    fi
+    
+    # Check 3: Docker Authentication (needed for pulls)
+    echo -n "  Docker auth (auth.docker.io)... "
+    AUTH_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://auth.docker.io/token 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$AUTH_TEST" | grep -q "200\|400\|401"; then
+        echo "✓ Reachable"
+    else
+        echo "❌ FAILED"
+        REPO_CHECK_FAILED=1
+        FAILED_REPOS+=("Docker authentication (auth.docker.io)")
+    fi
+    
+    # Check 4: Cloudflare CDN (where Docker actually downloads layers - CRITICAL)
+    echo -n "  Cloudflare CDN (production.cloudflare.docker.com)... "
+    CDN_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://production.cloudflare.docker.com 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$CDN_TEST" | grep -q "200\|301\|302\|403\|404"; then
+        echo "✓ Reachable"
+    else
+        echo "❌ FAILED (CRITICAL - image layer downloads will fail)"
+        REPO_CHECK_FAILED=1
+        FAILED_REPOS+=("Cloudflare CDN (production.cloudflare.docker.com)")
+    fi
+    
+    # Check 5: Test Cloudflare IP ranges directly (where the timeouts actually happen)
+    echo -n "  Cloudflare IPs (104.16.x.x range)... "
+    CF_IP_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://104.16.98.215 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$CF_IP_TEST" | grep -q "200\|301\|302\|403\|404\|526"; then
+        echo "✓ Reachable"
+    else
+        echo "❌ BLOCKED (Docker layer downloads will timeout)"
+        REPO_CHECK_FAILED=1
+        FAILED_REPOS+=("Cloudflare CDN IPs (104.16.0.0/13, 172.64.0.0/13)")
+    fi
+    
+    # Check 6: GitHub Container Registry
     echo -n "  GitHub Container Registry (ghcr.io)... "
     GHCR_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://ghcr.io 2>/dev/null || echo 'FAILED'")
     
-    if echo "$GHCR_TEST" | grep -q "200\|301\|302\|404"; then
+    if echo "$GHCR_TEST" | grep -q "200\|301\|302\|401\|404"; then
         echo "✓ Reachable"
     else
-        echo "⚠️  Warning (will try fallback to docker.io)"
+        echo "⚠️  Warning (ghcr.io unavailable - will use Docker Hub)"
     fi
     
-    # Check standard package repositories
+    # Check 7: GitHub CDN IPs (where ghcr.io actually downloads from)
+    echo -n "  GitHub CDN (185.199.108.0/22)... "
+    GITHUB_IP_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://185.199.111.154 2>/dev/null || echo 'FAILED'")
+    
+    if echo "$GITHUB_IP_TEST" | grep -q "200\|301\|302\|403\|404"; then
+        echo "✓ Reachable"
+    else
+        echo "⚠️  Warning (ghcr.io layer downloads may fail)"
+    fi
+    
+    # Check 8: Standard package repositories
     echo -n "  Standard package repositories... "
     
     # Detect OS
@@ -634,7 +693,7 @@ check_single_node() {
     if [ "$check_type" = "remote" ]; then
         # Check DNS resolution
         echo -n "  DNS resolution... "
-        DNS_TEST=$(run_check "nslookup download.docker.com >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
+        DNS_TEST=$(run_check "nslookup registry-1.docker.io >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
         
         if echo "$DNS_TEST" | grep -q "OK"; then
             echo "✓ Working"
@@ -646,7 +705,7 @@ check_single_node() {
         
         # Check outbound HTTPS
         echo -n "  Outbound HTTPS (port 443)... "
-        HTTPS_TEST=$(run_check "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/download.docker.com/443' 2>/dev/null && echo 'OK' || echo 'FAILED'")
+        HTTPS_TEST=$(run_check "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/registry-1.docker.io/443' 2>/dev/null && echo 'OK' || echo 'FAILED'")
         
         if echo "$HTTPS_TEST" | grep -q "OK"; then
             echo "✓ Open"
@@ -672,10 +731,10 @@ check_single_node() {
         if [ "$check_type" = "local" ]; then
             echo ""
             echo "  Possible causes:"
-            echo "    1. Network connectivity issues"
-            echo "    2. Proxy misconfiguration"
-            echo "    3. Firewall blocking outbound connections"
-            echo "    4. DNS resolution problems"
+            echo "    1. Cloudflare CDN IPs blocked (104.16.0.0/13, 172.64.0.0/13)"
+            echo "    2. GitHub CDN IPs blocked (185.199.108.0/22)"
+            echo "    3. Firewall/iptables blocking Docker daemon"
+            echo "    4. Proxy misconfiguration"
             echo ""
             
             if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
@@ -685,7 +744,13 @@ check_single_node() {
             fi
             echo ""
             
-            read -p "  Continue anyway? Installation may fail. [y/N]: " CONTINUE_ANYWAY
+            echo "  Critical for Docker image pulls:"
+            echo "    - registry-1.docker.io (registry API)"
+            echo "    - production.cloudflare.docker.com (layer downloads)"
+            echo "    - Cloudflare IP ranges: 104.16.0.0/13, 172.64.0.0/13"
+            echo ""
+            
+            read -p "  Continue anyway? Docker pulls will likely fail. [y/N]: " CONTINUE_ANYWAY
             if [[ ! "$CONTINUE_ANYWAY" =~ ^[Yy]$ ]]; then
                 echo "  Installation cancelled."
                 cleanup
