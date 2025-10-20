@@ -36,6 +36,7 @@ MASTER_HOSTNAME=""
 MASTER_IP=""
 BACKUP_NODES=()
 BACKUP_IPS=()
+BACKUP_INTERFACES=()
 
 # Logging setup
 LOGFILE="/var/log/installation.log"
@@ -733,13 +734,18 @@ if [[ "$1" == "--clean" ]]; then
         source "$CONFIG_FILE"
         
         if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
-            echo "=========================================="
-            echo "Multi-Node Deployment Detected"
-            echo "=========================================="
-            echo "This system was configured with backup nodes:"
+        echo "=========================================="
+        echo "Multi-Node Deployment Detected"
+        echo "=========================================="
+        echo "This system was configured with backup nodes:"
             for i in "${!BACKUP_NODES[@]}"; do
+            # Check if interface info is available
+            if [ -n "${BACKUP_INTERFACES[$i]:-}" ]; then
+                echo "  - ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Interface: ${BACKUP_INTERFACES[$i]}"
+            else
                 echo "  - ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
-            done
+            fi
+        done
             echo ""
             read -p "Do you want to clean backup nodes as well? (yes/no) [yes]: " CLEAN_BACKUPS
             CLEAN_BACKUPS=${CLEAN_BACKUPS:-yes}
@@ -2964,7 +2970,7 @@ fi
 
 # Add current user to docker group
 log "Adding user $CURRENT_USER to docker group..."
-if ! groups "$CURRENT_USER" | grep -q docker; then
+if ! id -nG "$CURRENT_USER" | grep -qw docker; then
     sudo usermod -aG docker "$CURRENT_USER" || exit_on_error "Failed to add user to docker group"
     log "✓ User added to docker group"
     echo ""
@@ -3871,7 +3877,7 @@ vrrp_script check_traefik {
 }
 vrrp_instance $VRRP {
   state BACKUP
-  interface $DETECTED_INTERFACE
+  interface $BACKUP_NODE_INTERFACE
   virtual_router_id $VRID
   priority BACKUP_PRIORITY_PLACEHOLDER
   virtual_ipaddress {
