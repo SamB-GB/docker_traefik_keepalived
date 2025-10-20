@@ -388,6 +388,7 @@ check_execution_context() {
     # Check 2: Verify user has sudo privileges
     echo -n "Checking if $CURRENT_USER has sudo privileges... "
     echo ""
+    echo ""
     # Test sudo access without prompting for password yet
     if sudo -n true 2>/dev/null; then
         echo "✓ (cached/passwordless)"
@@ -1481,9 +1482,9 @@ install_packages() {
 # Prompt for multi-node deployment configuration
 prompt_multi_node_deployment() {
     echo ""
-    echo "=========================================="
+    echo "----------------------------------------"
     echo "High Availability Configuration"
-    echo "=========================================="
+    echo "----------------------------------------"
     echo ""
     
     # Check if we already have multi-node config loaded
@@ -1491,7 +1492,7 @@ prompt_multi_node_deployment() {
         echo "Existing multi-node configuration detected:"
         echo "  Master: $MASTER_HOSTNAME ($MASTER_IP)"
         for i in "${!BACKUP_NODES[@]}"; do
-            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
+            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Interface: ${BACKUP_INTERFACES[$i]:-auto}"
         done
         echo ""
         read -p "Use existing multi-node configuration? (yes/no) [yes]: " USE_EXISTING
@@ -1501,11 +1502,12 @@ prompt_multi_node_deployment() {
         fi
     fi
     
-    # Main loop for configuration (Option A - allow reconfiguration)
+    # Main loop for configuration
     while true; do
         # Clear any previous configuration data from previous loop iterations
         BACKUP_NODES=()
         BACKUP_IPS=()
+        BACKUP_INTERFACES=()
         unset IP_MAP
         declare -A IP_MAP
         
@@ -1559,10 +1561,9 @@ prompt_multi_node_deployment() {
         echo ""
         
         # Collect IP addresses for duplicate checking
-        # (Arrays already cleared at top of loop)
         IP_MAP["$MASTER_IP"]=1
         
-        # Get backup node information
+        # Get backup node information with interface detection
         local all_valid=true
         for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
             local priority=$((100 - ((i - 1) * 10)))
@@ -1605,12 +1606,81 @@ prompt_multi_node_deployment() {
                 IP_MAP["$backup_ip"]=1
             done
             
+            # Auto-detect network interface for this backup node
+            local detected_interface=""
+            local interface_confirmed=false
+            
+            echo -n "  Detecting network interface for $backup_ip... "
+            
+            # Try SSH-based detection if we have credentials
+            # First check if we can reach the node at all
+            if timeout 3 ping -c 1 -W 1 "$backup_ip" &>/dev/null; then
+                # Try to detect interface via SSH
+                if command -v ssh &>/dev/null; then
+                    # Attempt passwordless SSH first (keys might already be set up)
+                    detected_interface=$(timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 \
+                        -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
+                        "$CURRENT_USER@$backup_ip" \
+                        "ip -o addr show | grep 'inet $backup_ip' | awk '{print \$2}' | head -1" 2>/dev/null || echo "")
+                    
+                    if [ -n "$detected_interface" ]; then
+                        echo "✓ Detected: $detected_interface"
+                    else
+                        echo "⚠️  Could not auto-detect (SSH not available yet)"
+                        detected_interface=""
+                    fi
+                else
+                    echo "⚠️  SSH not available for detection"
+                fi
+            else
+                echo "⚠️  Node not reachable (will detect later)"
+            fi
+            
+            # Prompt for interface with detected value as default
+            local backup_interface=""
+            if [ -n "$detected_interface" ]; then
+                echo "  Network interface detected: $detected_interface"
+                read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
+                use_detected=${use_detected:-yes}
+                
+                case "${use_detected,,}" in
+                    yes|y)
+                        backup_interface="$detected_interface"
+                        interface_confirmed=true
+                        ;;
+                    no|n)
+                        read -p "  Enter interface name: " backup_interface
+                        ;;
+                    custom|c)
+                        read -p "  Enter interface name: " backup_interface
+                        ;;
+                    *)
+                        # Treat any other input as a direct interface name
+                        backup_interface="$use_detected"
+                        ;;
+                esac
+            else
+                # No detection possible, prompt directly
+                echo "  Network interface (e.g., eth0, ens33, enp0s3):"
+                echo "    Note: This is the interface with IP $backup_ip"
+                echo "    We'll verify this later during deployment"
+                read -p "  Interface name: " backup_interface
+            fi
+            
+            # Validate interface name format (basic check)
+            while [[ -z "$backup_interface" ]]; do
+                echo "  ERROR: Interface name cannot be empty"
+                read -p "  Interface name: " backup_interface
+            done
+            
+            # Store the values
             BACKUP_NODES+=("$backup_hostname")
             BACKUP_IPS+=("$backup_ip")
+            BACKUP_INTERFACES+=("$backup_interface")
             echo ""
         done
         
-        # Display summary
+        # Display summary with interfaces
         echo "=========================================="
         echo "Multi-Node Configuration Summary"
         echo "=========================================="
@@ -1619,12 +1689,14 @@ prompt_multi_node_deployment() {
         echo "  Hostname: $MASTER_HOSTNAME"
         echo "  IP: $MASTER_IP"
         echo "  Priority: 110"
+        echo "  Interface: (will be selected during installation)"
         echo ""
         echo "Backup Nodes:"
         for i in "${!BACKUP_NODES[@]}"; do
             priority=$((100 - (i * 10)))
             echo "  Backup $((i+1)): ${BACKUP_NODES[$i]}"
             echo "    IP: ${BACKUP_IPS[$i]}"
+            echo "    Interface: ${BACKUP_INTERFACES[$i]}"
             echo "    Priority: $priority"
             echo ""
         done
@@ -1634,10 +1706,11 @@ prompt_multi_node_deployment() {
         echo "  3. Configure Keepalived for automatic failover"
         echo "  4. Test and verify all nodes"
         echo ""
+        echo "Note: Interfaces will be verified during deployment"
         echo "=========================================="
         echo ""
         
-        # Confirm configuration (Option A - allow retry)
+        # Confirm configuration
         read -p "Is this configuration correct? (yes/no): " CONFIRM
         if [[ "$CONFIRM" =~ ^[Yy] ]]; then
             echo "✓ Configuration confirmed"
@@ -2348,10 +2421,11 @@ MASTER_HOSTNAME="$MASTER_HOSTNAME"
 MASTER_IP="$MASTER_IP"
 BACKUP_NODE_COUNT="${#BACKUP_NODES[@]}"
 EOF
-        # Save backup nodes as array
+        # Save backup nodes with interfaces
         for i in "${!BACKUP_NODES[@]}"; do
             echo "BACKUP_NODES[$i]=\"${BACKUP_NODES[$i]}\"" >> "$CONFIG_FILE"
             echo "BACKUP_IPS[$i]=\"${BACKUP_IPS[$i]}\"" >> "$CONFIG_FILE"
+            echo "BACKUP_INTERFACES[$i]=\"${BACKUP_INTERFACES[$i]}\"" >> "$CONFIG_FILE"
         done
     fi
 
@@ -3750,7 +3824,30 @@ sudo chown keepalived_script:docker /bin/haloap_service_check.sh
 # Auto-detect network interface for this backup node's IP
 echo "Auto-detecting network interface..."
 BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
-DETECTED_INTERFACE=$(ip -o addr show | grep "inet $BACKUP_NODE_IP" | awk '{print $2}' | head -1)
+# Use the interface specified during configuration
+BACKUP_NODE_INTERFACE="BACKUP_INTERFACE_PLACEHOLDER"
+
+echo "Using configured interface: $BACKUP_NODE_INTERFACE"
+
+# Verify the interface exists on this node
+if ! ip link show "$BACKUP_NODE_INTERFACE" &>/dev/null; then
+    echo "⚠️  WARNING: Interface $BACKUP_NODE_INTERFACE does not exist on this node!"
+    echo "Available interfaces:"
+    ip -o link show | awk '{print "  - " $2}' | sed 's/:$//'
+    echo ""
+    echo "Attempting auto-detection as fallback..."
+    
+    BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
+    DETECTED_INTERFACE=$(ip -o addr show | grep "inet $BACKUP_NODE_IP" | awk '{print $2}' | head -1)
+    
+    if [ -n "$DETECTED_INTERFACE" ]; then
+        echo "✓ Auto-detected: $DETECTED_INTERFACE"
+        BACKUP_NODE_INTERFACE="$DETECTED_INTERFACE"
+    else
+        echo "❌ Auto-detection failed. Using configured interface anyway."
+        echo "   Keepalived may not work correctly!"
+    fi
+fi
 
 if [ -z "$DETECTED_INTERFACE" ]; then
     echo "WARNING: Could not auto-detect interface for IP $BACKUP_NODE_IP"
@@ -3807,6 +3904,7 @@ REMOTEINSTALL
         # Replace priority placeholder and backup node IP
         sed -i "s/BACKUP_PRIORITY_PLACEHOLDER/$priority/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s/BACKUP_NODE_IP_PLACEHOLDER/$ip/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s/BACKUP_INTERFACE_PLACEHOLDER/${BACKUP_INTERFACES[$i]}/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
         # Also need to copy clinical_conf.yml to remote
