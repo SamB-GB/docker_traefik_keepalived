@@ -1695,7 +1695,7 @@ prompt_multi_node_deployment() {
         echo "  Hostname: $MASTER_HOSTNAME"
         echo "  IP: $MASTER_IP"
         echo "  Priority: 110"
-        echo "  Interface: (will be selected during installation)"
+        echo "  Interface: (Will be prompted for during installation)"
         echo ""
         echo "Backup Nodes:"
         for i in "${!BACKUP_NODES[@]}"; do
@@ -1946,7 +1946,7 @@ EOF
 
                 # Ask to apply to others
                 printf "\n"
-                read -p "Use this HOST and PROTOCOL and apply it to all the other services on their default ports? (yes/no) [default: no]: " apply_all < /dev/tty
+                read -p "Use the same HOST and PROTOCOL and apply it to all the other services on their default ports (API, FM, iDP & Image Service)? (yes/no) [default: no]: " apply_all < /dev/tty
                 apply_all=${apply_all:-no}
                 apply_all=$(echo "$apply_all" | tr '[:upper:]' '[:lower:]')
 
