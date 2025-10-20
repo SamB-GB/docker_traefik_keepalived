@@ -3855,14 +3855,6 @@ if ! ip link show "$BACKUP_NODE_INTERFACE" &>/dev/null; then
     fi
 fi
 
-if [ -z "$DETECTED_INTERFACE" ]; then
-    echo "WARNING: Could not auto-detect interface for IP $BACKUP_NODE_IP"
-    echo "Using master's interface: $NETWORK_INTERFACE"
-    DETECTED_INTERFACE="$NETWORK_INTERFACE"
-else
-    echo "✓ Detected interface: $DETECTED_INTERFACE for IP $BACKUP_NODE_IP"
-fi
-
 # Configure Keepalived
 sudo tee /etc/keepalived/keepalived.conf > /dev/null <<KEEPALIVEDCONF
 global_defs {
