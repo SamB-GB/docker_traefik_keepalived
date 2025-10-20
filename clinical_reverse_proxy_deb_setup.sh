@@ -518,6 +518,27 @@ check_repository_connectivity() {
 }
 
 # Helper function to check a single node (local or remote)
+check_single_node() {
+    local check_type="$1"  # 'local' or 'remote'
+    local node_name="$2"
+    local node_ip="$3"
+    
+    local REPO_CHECK_FAILED=0
+    local FAILED_REPOS=()
+    
+    # Set proxy options
+    local PROXY_CURL_OPT=""
+    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+        PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
+        if [ "$check_type" = "local" ]; then
+            export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            export no_proxy="localhost,127.0.0.1"
+            echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
+            echo ""
+        fi
+    fi
+    
 # Helper function to check a single node (local or remote)
 check_single_node() {
     local check_type="$1"  # 'local' or 'remote'
@@ -579,7 +600,7 @@ check_single_node() {
     fi
     
     # Check 3: Docker Authentication (needed for pulls)
-    echo -n "  Docker auth (auth.docker.io)... "
+    echo -n "  Docker authentication (auth.docker.io)... "
     AUTH_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://auth.docker.io/token 2>/dev/null || echo 'FAILED'")
     
     if echo "$AUTH_TEST" | grep -q "200\|400\|401"; then
@@ -590,33 +611,21 @@ check_single_node() {
         FAILED_REPOS+=("Docker authentication (auth.docker.io)")
     fi
     
-    # Check 4: Cloudflare CDN (where Docker actually downloads layers - CRITICAL)
-    echo -n "  Cloudflare CDN (production.cloudflare.docker.com)... "
+    # Check 4: Cloudflare CDN (where Docker downloads image layers - CRITICAL)
+    echo -n "  Docker CDN (production.cloudflare.docker.com)... "
     CDN_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://production.cloudflare.docker.com 2>/dev/null || echo 'FAILED'")
     
     if echo "$CDN_TEST" | grep -q "200\|301\|302\|403\|404"; then
         echo "✓ Reachable"
     else
-        echo "❌ FAILED (CRITICAL - image layer downloads will fail)"
+        echo "❌ FAILED (image layer downloads will fail)"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Cloudflare CDN (production.cloudflare.docker.com)")
+        FAILED_REPOS+=("Docker CDN (production.cloudflare.docker.com)")
     fi
     
-    # Check 5: Test Cloudflare IP ranges directly (where the timeouts actually happen)
-    echo -n "  Cloudflare IPs (104.16.x.x range)... "
-    CF_IP_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://104.16.98.215 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$CF_IP_TEST" | grep -q "200\|301\|302\|403\|404\|526"; then
-        echo "✓ Reachable"
-    else
-        echo "❌ BLOCKED (Docker layer downloads will timeout)"
-        REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Cloudflare CDN IPs (104.16.0.0/13, 172.64.0.0/13)")
-    fi
-    
-    # Check 6: GitHub Container Registry
+    # Check 5: GitHub Container Registry
     echo -n "  GitHub Container Registry (ghcr.io)... "
-    GHCR_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://ghcr.io 2>/dev/null || echo 'FAILED'")
+    GHCR_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://ghcr.io/v2/ 2>/dev/null || echo 'FAILED'")
     
     if echo "$GHCR_TEST" | grep -q "200\|301\|302\|401\|404"; then
         echo "✓ Reachable"
@@ -624,17 +633,17 @@ check_single_node() {
         echo "⚠️  Warning (ghcr.io unavailable - will use Docker Hub)"
     fi
     
-    # Check 7: GitHub CDN IPs (where ghcr.io actually downloads from)
-    echo -n "  GitHub CDN (185.199.108.0/22)... "
-    GITHUB_IP_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://185.199.111.154 2>/dev/null || echo 'FAILED'")
+    # Check 6: GitHub Packages CDN (supporting infrastructure for ghcr.io)
+    echo -n "  GitHub Packages (pkg-containers.githubusercontent.com)... "
+    GHCR_PKG_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://pkg-containers.githubusercontent.com 2>/dev/null || echo 'FAILED'")
     
-    if echo "$GITHUB_IP_TEST" | grep -q "200\|301\|302\|403\|404"; then
+    if echo "$GHCR_PKG_TEST" | grep -q "200\|301\|302\|403\|404"; then
         echo "✓ Reachable"
     else
-        echo "⚠️  Warning (ghcr.io layer downloads may fail)"
+        echo "⚠️  Warning (GitHub image layers may fail to download)"
     fi
     
-    # Check 8: Standard package repositories
+    # Check 7: Standard package repositories
     echo -n "  Standard package repositories... "
     
     # Detect OS
@@ -731,10 +740,10 @@ check_single_node() {
         if [ "$check_type" = "local" ]; then
             echo ""
             echo "  Possible causes:"
-            echo "    1. Cloudflare CDN IPs blocked (104.16.0.0/13, 172.64.0.0/13)"
-            echo "    2. GitHub CDN IPs blocked (185.199.108.0/22)"
-            echo "    3. Firewall/iptables blocking Docker daemon"
-            echo "    4. Proxy misconfiguration"
+            echo "    1. Firewall blocking container registries"
+            echo "    2. Network connectivity issues"
+            echo "    3. Proxy misconfiguration"
+            echo "    4. DNS resolution problems"
             echo ""
             
             if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
@@ -744,10 +753,14 @@ check_single_node() {
             fi
             echo ""
             
-            echo "  Critical for Docker image pulls:"
+            echo "  Required endpoints for Docker image pulls:"
             echo "    - registry-1.docker.io (registry API)"
-            echo "    - production.cloudflare.docker.com (layer downloads)"
-            echo "    - Cloudflare IP ranges: 104.16.0.0/13, 172.64.0.0/13"
+            echo "    - auth.docker.io (authentication)"
+            echo "    - production.cloudflare.docker.com (image layer downloads)"
+            echo ""
+            echo "  Required endpoints for GitHub Container Registry:"
+            echo "    - ghcr.io (registry API)"
+            echo "    - pkg-containers.githubusercontent.com (image layer downloads)"
             echo ""
             
             read -p "  Continue anyway? Docker pulls will likely fail. [y/N]: " CONTINUE_ANYWAY
