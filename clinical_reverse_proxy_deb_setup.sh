@@ -601,27 +601,7 @@ check_single_node() {
         FAILED_REPOS+=("Docker CDN (production.cloudflare.docker.com)")
     fi
     
-    # Check 5: GitHub Container Registry
-    echo -n "  GitHub Container Registry (ghcr.io)... "
-    GHCR_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://ghcr.io/v2/ 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$GHCR_TEST" | grep -q "200\|301\|302\|401\|404"; then
-        echo "✓ Reachable"
-    else
-        echo "⚠️  Warning (ghcr.io unavailable - will use Docker Hub)"
-    fi
-    
-    # Check 6: GitHub Packages CDN (supporting infrastructure for ghcr.io)
-    echo -n "  GitHub Packages (pkg-containers.githubusercontent.com)... "
-    GHCR_PKG_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://pkg-containers.githubusercontent.com 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$GHCR_PKG_TEST" | grep -q "200\|301\|302\|403\|404"; then
-        echo "✓ Reachable"
-    else
-        echo "⚠️  Warning (GitHub image layers may fail to download)"
-    fi
-    
-    # Check 7: Standard package repositories
+    # Check 5: Standard package repositories
     echo -n "  Standard package repositories... "
     
     # Detect OS
@@ -718,7 +698,7 @@ check_single_node() {
         if [ "$check_type" = "local" ]; then
             echo ""
             echo "  Possible causes:"
-            echo "    1. Firewall blocking container registries"
+            echo "    1. Firewall blocking Docker Hub"
             echo "    2. Network connectivity issues"
             echo "    3. Proxy misconfiguration"
             echo "    4. DNS resolution problems"
@@ -731,14 +711,11 @@ check_single_node() {
             fi
             echo ""
             
-            echo "  Required endpoints for Docker image pulls:"
-            echo "    - registry-1.docker.io (registry API)"
-            echo "    - auth.docker.io (authentication)"
-            echo "    - production.cloudflare.docker.com (image layer downloads)"
-            echo ""
-            echo "  Required endpoints for GitHub Container Registry:"
-            echo "    - ghcr.io (registry API)"
-            echo "    - pkg-containers.githubusercontent.com (image layer downloads)"
+            echo "  Required Docker Hub endpoints:"
+            echo "    - download.docker.com (Docker installation packages)"
+            echo "    - registry-1.docker.io (Docker image registry)"
+            echo "    - auth.docker.io (Authentication service)"
+            echo "    - production.cloudflare.docker.com (Image layer CDN)"
             echo ""
             
             read -p "  Continue anyway? Docker pulls will likely fail. [y/N]: " CONTINUE_ANYWAY
@@ -3315,10 +3292,34 @@ try_pull() {
     fi
 }
 
-if ! try_pull "docker.io/library/traefik:latest"; then
-    if ! try_pull "ghcr.io/traefik/traefik:latest"; then
-        exit_on_error "Failed to pull Traefik from all known sources."
-    fi
+# Pull Traefik from Docker Hub
+log "Pulling Traefik image from Docker Hub..."
+if ! try_pull "docker.io/traefik/traefik:latest"; then
+    echo ""
+    echo "=========================================="
+    echo "ERROR: Cannot Pull Traefik Image"
+    echo "=========================================="
+    echo "Docker Hub is not accessible from this server."
+    echo ""
+    echo "This typically means the firewall is blocking one or more of these endpoints:"
+    echo "  - registry-1.docker.io (registry API)"
+    echo "  - auth.docker.io (authentication)"
+    echo "  - production.cloudflare.docker.com (image layer downloads)"
+    echo ""
+    echo "Solutions:"
+    echo "  1. Contact your network admin to whitelist Docker Hub endpoints"
+    echo "  2. Manually transfer the image from an internet-connected machine:"
+    echo ""
+    echo "     On internet-connected machine:"
+    echo "       docker pull traefik/traefik:latest"
+    echo "       docker save traefik/traefik:latest | gzip > traefik.tar.gz"
+    echo ""
+    echo "     Transfer traefik.tar.gz to this server, then:"
+    echo "       gunzip -c traefik.tar.gz | docker load"
+    echo ""
+    echo "     Re-run this script after loading the image"
+    echo "=========================================="
+    exit_on_error "Failed to pull Traefik from Docker Hub"
 fi
 
 # Navigate to the Traefik directory and start the Docker Compose setup
@@ -3804,7 +3805,8 @@ fi
 cat > /home/haloap/traefik/docker-compose.yaml <<'DOCKERCOMPOSE'
 services:
   traefik:
-    image: ghcr.io/traefik/traefik:latest
+    image: traefik/traefik:latest
+    # Using official Docker Hub image: docker.io/traefik/traefik:latest
     container_name: traefik
     restart: unless-stopped
     security_opt:
