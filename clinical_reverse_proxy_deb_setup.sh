@@ -593,7 +593,7 @@ check_single_node() {
     echo -n "  Docker image storage (docker-images-prod...cloudflarestorage.com)... "
     R2_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
     
-    if echo "$R2_TEST" | grep -q "200\|301\|302\|403\|404"; then
+    if echo "$R2_TEST" | grep -q "200\|301\|302\|400\|403\|404"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED (image downloads will fail)"
@@ -3180,9 +3180,7 @@ backup_file "$DOCKER_COMPOSE_FILE"
 tee "$DOCKER_COMPOSE_FILE" > /dev/null <<EOF
 services:
   traefik:
-    image: ghcr.io/traefik/traefik:latest
-    # Fallback if pull fails
-    # Alternative image: traefik:latest
+    image: docker.io/library/traefik:latest
     container_name: traefik
     restart: unless-stopped
     security_opt:
@@ -3294,7 +3292,7 @@ try_pull() {
 
 # Pull Traefik from Docker Hub
 log "Pulling Traefik image from Docker Hub..."
-if ! try_pull "docker.io/traefik/traefik:latest"; then
+if ! try_pull "docker.io/library/traefik:latest"; then
     echo ""
     echo "=========================================="
     echo "ERROR: Cannot Pull Traefik Image"
