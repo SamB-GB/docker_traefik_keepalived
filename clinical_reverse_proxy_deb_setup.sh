@@ -1665,9 +1665,9 @@ prompt_multi_node_deployment() {
             # Auto-detect network interface for this backup node
             local detected_interface=""
             local interface_confirmed=false
-            
+
             echo -n "  Detecting network interface for $backup_ip... "
-            
+
             # Try SSH-based detection if we have credentials
             # First check if we can reach the node at all
             if timeout 3 ping -c 1 -W 1 "$backup_ip" &>/dev/null; then
@@ -1678,7 +1678,7 @@ prompt_multi_node_deployment() {
                         -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
                         "$CURRENT_USER@$backup_ip" \
                         "ip -o addr show | grep 'inet $backup_ip' | awk '{print \$2}' | head -1" 2>/dev/null || echo "")
-                    
+        
                     if [ -n "$detected_interface" ]; then
                         echo "✓ Detected: $detected_interface"
                     else
@@ -1691,30 +1691,36 @@ prompt_multi_node_deployment() {
             else
                 echo "⚠️  Node not reachable (will detect later)"
             fi
-            
+
             # Prompt for interface with detected value as default
             local backup_interface=""
             if [ -n "$detected_interface" ]; then
                 echo "  Network interface detected: $detected_interface"
-                read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
-                use_detected=${use_detected:-yes}
-                
-                case "${use_detected,,}" in
-                    yes|y)
-                        backup_interface="$detected_interface"
-                        interface_confirmed=true
-                        ;;
-                    no|n)
-                        read -p "  Enter interface name: " backup_interface
-                        ;;
-                    custom|c)
-                        read -p "  Enter interface name: " backup_interface
-                        ;;
-                    *)
-                        # Treat any other input as a direct interface name
-                        backup_interface="$use_detected"
-                        ;;
-                esac
+    
+                # Loop until valid input
+                while true; do
+                    read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
+                    use_detected=${use_detected:-yes}
+        
+                    case "${use_detected,,}" in
+                        yes|y)
+                            backup_interface="$detected_interface"
+                            break
+                            ;;
+                        no|n)
+                            read -p "  Enter interface name: " backup_interface
+                            break
+                            ;;
+                        custom|c)
+                            read -p "  Enter interface name: " backup_interface
+                            break
+                            ;;
+                        *)
+                            echo "  ERROR: Invalid input. Please enter 'yes', 'no', or 'custom'"
+                            continue
+                            ;;
+                    esac
+                done
             else
                 # No detection possible, prompt directly
                 echo "  Network interface (e.g., eth0, ens33, enp0s3):"
@@ -1722,7 +1728,7 @@ prompt_multi_node_deployment() {
                 echo "    We'll verify this later during deployment"
                 read -p "  Interface name: " backup_interface
             fi
-            
+
             # Validate interface name format (basic check)
             while [[ -z "$backup_interface" ]]; do
                 echo "  ERROR: Interface name cannot be empty"
