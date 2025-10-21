@@ -3309,8 +3309,8 @@ if ! try_pull "docker.io/library/traefik:latest"; then
     echo "  2. Manually transfer the image from an internet-connected machine:"
     echo ""
     echo "     On internet-connected machine:"
-    echo "       docker pull traefik/traefik:latest"
-    echo "       docker save traefik/traefik:latest | gzip > traefik.tar.gz"
+    echo "       docker pull docker.io/library/traefik:latest"
+    echo "       docker save docker.io/library/traefik:latest | gzip > traefik.tar.gz"
     echo ""
     echo "     Transfer traefik.tar.gz to this server, then:"
     echo "       gunzip -c traefik.tar.gz | docker load"
@@ -3803,7 +3803,7 @@ fi
 cat > /home/haloap/traefik/docker-compose.yaml <<'DOCKERCOMPOSE'
 services:
   traefik:
-    image: traefik/traefik:latest
+    image: docker.io/library/traefik:latest
     # Using official Docker Hub image: docker.io/traefik/traefik:latest
     container_name: traefik
     restart: unless-stopped
