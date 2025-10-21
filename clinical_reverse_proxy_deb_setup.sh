@@ -553,11 +553,11 @@ check_single_node() {
         fi
     }
     
-    # Check 1: Docker Package Repository (for installing Docker)
+    # Check 1: Docker Package Repository
     echo -n "  Docker packages (download.docker.com)... "
-    DOCKER_PKG_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
+    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
     
-    if echo "$DOCKER_PKG_TEST" | grep -q "200\|301\|302\|403"; then
+    if echo "$DOWNLOAD_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
@@ -565,7 +565,7 @@ check_single_node() {
         FAILED_REPOS+=("Docker packages (download.docker.com)")
     fi
     
-    # Check 2: Docker Hub Registry (for pulling images - CRITICAL)
+    # Check 2: Docker Hub Registry API
     echo -n "  Docker Hub registry (registry-1.docker.io)... "
     REGISTRY_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
     
@@ -577,28 +577,28 @@ check_single_node() {
         FAILED_REPOS+=("Docker Hub registry (registry-1.docker.io)")
     fi
     
-    # Check 3: Docker Authentication (needed for pulls)
-    echo -n "  Docker authentication (auth.docker.io)... "
-    AUTH_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://auth.docker.io/token 2>/dev/null || echo 'FAILED'")
+    # Check 3: Docker Hub Main Domain
+    echo -n "  Docker Hub (docker.io)... "
+    DOCKERIO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker.io 2>/dev/null || echo 'FAILED'")
     
-    if echo "$AUTH_TEST" | grep -q "200\|400\|401"; then
+    if echo "$DOCKERIO_TEST" | grep -q "200\|301\|302"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker authentication (auth.docker.io)")
+        FAILED_REPOS+=("Docker Hub (docker.io)")
     fi
     
-    # Check 4: Cloudflare CDN (where Docker downloads image layers - CRITICAL)
-    echo -n "  Docker CDN (production.cloudflare.docker.com)... "
-    CDN_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://production.cloudflare.docker.com 2>/dev/null || echo 'FAILED'")
+    # Check 4: Docker Image Storage (Cloudflare R2)
+    echo -n "  Docker image storage (docker-images-prod...cloudflarestorage.com)... "
+    R2_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
     
-    if echo "$CDN_TEST" | grep -q "200\|301\|302\|403\|404"; then
+    if echo "$R2_TEST" | grep -q "200\|301\|302\|403\|404"; then
         echo "✓ Reachable"
     else
-        echo "❌ FAILED (image layer downloads will fail)"
+        echo "❌ FAILED (image downloads will fail)"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker CDN (production.cloudflare.docker.com)")
+        FAILED_REPOS+=("Docker image storage (docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com)")
     fi
     
     # Check 5: Standard package repositories
@@ -711,11 +711,11 @@ check_single_node() {
             fi
             echo ""
             
-            echo "  Required Docker Hub endpoints:"
-            echo "    - download.docker.com (Docker installation packages)"
-            echo "    - registry-1.docker.io (Docker image registry)"
-            echo "    - auth.docker.io (Authentication service)"
-            echo "    - production.cloudflare.docker.com (Image layer CDN)"
+            echo "  Required Docker endpoints:"
+            echo "    - download.docker.com"
+            echo "    - registry-1.docker.io"
+            echo "    - docker.io"
+            echo "    - docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
             echo ""
             
             read -p "  Continue anyway? Docker pulls will likely fail. [y/N]: " CONTINUE_ANYWAY
