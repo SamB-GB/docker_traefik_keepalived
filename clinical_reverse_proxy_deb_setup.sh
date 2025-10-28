@@ -2893,6 +2893,11 @@ else
     echo "  Proxy: Not configured"
 fi
 
+if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+    echo "⚠️  WARNING: SSL verification is disabled!"
+    echo "   This is insecure and should only be used temporarily."
+fi
+
 echo ""
 echo "Deployment Configuration:"
 echo "  - Deployment Type: $DEPLOYMENT_TYPE"
