@@ -31,7 +31,7 @@ PROXY_HOST=""  # Example: "proxy.company.com"
 PROXY_PORT=""  # Example: "8080"
 PROXY_USER=""
 PROXY_PASSWORD="" # Special characters will be handled automatically
-SKIP_SSL_VERIFY=true
+SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
