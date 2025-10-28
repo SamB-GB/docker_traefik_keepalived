@@ -531,13 +531,25 @@ check_single_node() {
     # Set proxy options
     local PROXY_CURL_OPT=""
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
-        if [ "$check_type" = "local" ]; then
-            export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-            export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-            export no_proxy="localhost,127.0.0.1"
-            echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
-            echo ""
+        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+            ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
+            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT} --proxy-user ${PROXY_USER}:${PROXY_PASSWORD}"
+            if [ "$check_type" = "local" ]; then
+                export http_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+                export https_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+                export no_proxy="localhost,127.0.0.1"
+                echo "Using authenticated proxy: ${PROXY_HOST}:${PROXY_PORT}"
+                echo ""
+            fi
+        else
+            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
+            if [ "$check_type" = "local" ]; then
+                export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+                export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+                export no_proxy="localhost,127.0.0.1"
+                echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
+                echo ""
+            fi
         fi
     fi
     
@@ -1526,8 +1538,14 @@ install_packages() {
     local yum_proxy_opts=""
     
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        yum_proxy_opts="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+            ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
+            APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        else
+            APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        fi
     fi
     
     if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -2928,8 +2946,14 @@ echo ""
 APT_PROXY_OPT=""
 YUM_PROXY_OPT=""
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-    YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
+        APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+    else
+        APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+    fi
 fi
 
 # Define prerequisites based on package manager
@@ -2973,7 +2997,11 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     sudo install -m 0755 -d /etc/apt/keyrings
     
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+            curl -x "http://${PROXY_HOST}:${PROXY_PORT}" --proxy-user "${PROXY_USER}:${PROXY_PASSWORD}" -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        else
+            curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        fi
     else
         curl -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     fi
@@ -3003,12 +3031,22 @@ log "✓ Docker installed successfully: $(docker --version)"
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     log "Configuring Docker daemon to use proxy..."
     sudo mkdir -p /etc/systemd/system/docker.service.d
-    sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
+        sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
+[Service]
+Environment="HTTP_PROXY=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+Environment="HTTPS_PROXY=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+Environment="NO_PROXY=localhost,127.0.0.1"
+EOF
+    else
+        sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
 [Service]
 Environment="HTTP_PROXY=http://${PROXY_HOST}:${PROXY_PORT}"
 Environment="HTTPS_PROXY=http://${PROXY_HOST}:${PROXY_PORT}"
 Environment="NO_PROXY=localhost,127.0.0.1"
 EOF
+    fi
     log "✓ Docker proxy configuration created"
 fi
 
