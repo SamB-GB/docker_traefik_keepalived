@@ -26,10 +26,11 @@ set -e
 
 # HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/yum)
 # Leave blank if no proxy is needed
+# Note: Passwords with special characters will be automatically URL-encoded
 PROXY_HOST=""  # Example: "proxy.company.com"
 PROXY_PORT=""  # Example: "8080"
 PROXY_USER=""
-PROXY_PASSWORD=""
+PROXY_PASSWORD="" # Special characters will be handled automatically
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
