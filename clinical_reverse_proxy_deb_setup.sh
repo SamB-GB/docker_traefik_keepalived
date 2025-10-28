@@ -717,9 +717,13 @@ check_single_node() {
             echo "    3. Proxy misconfiguration"
             echo "    4. DNS resolution problems"
             echo ""
-            
+            echo "Current proxy settings:"
             if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-                echo "  Current proxy: ${PROXY_HOST}:${PROXY_PORT}"
+                if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+                    echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated as ${PROXY_USER})"
+                else
+                    echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+                fi
             else
                 echo "  Proxy: Not configured"
             fi
@@ -2869,10 +2873,15 @@ echo "✓ Package Manager: $PKG_MANAGER"
 echo "✓ Sudo Access: Verified"
 echo "✓ Repository Access: Verified"
 
+echo "Current proxy settings:"
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    echo "✓ Proxy Configuration: ${PROXY_HOST}:${PROXY_PORT}"
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated as ${PROXY_USER})"
+    else
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+    fi
 else
-    echo "✓ Proxy Configuration: None (direct connection)"
+    echo "  Proxy: Not configured"
 fi
 
 echo ""
@@ -4155,8 +4164,14 @@ if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
 fi
 
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        echo "  - Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated as ${PROXY_USER})"
+    else
+        echo "  - Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+    fi
     echo "  - Docker Proxy Config: /etc/systemd/system/docker.service.d/http-proxy.conf"
 fi
+
 
 echo ""
 echo "Services Status:"
