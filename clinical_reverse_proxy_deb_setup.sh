@@ -31,6 +31,7 @@ PROXY_HOST=""  # Example: "proxy.company.com"
 PROXY_PORT=""  # Example: "8080"
 PROXY_USER=""
 PROXY_PASSWORD="" # Special characters will be handled automatically
+SKIP_SSL_VERIFY=true
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
@@ -60,6 +61,13 @@ CONFIG_FILE="$SCRIPT_DIR/clinical_traefik.env"
 
 # Directory for temporary scripts
 SCRIPTS_DIR="$ACTUAL_HOME/traefik_setup_scripts"
+
+# Curl SSL options
+if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+       CURL_SSL_OPT="--insecure"
+    else
+       CURL_SSL_OPT=""
+fi
 
 # ==========================================
 # Helper Functions
@@ -534,7 +542,7 @@ check_single_node() {
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
             ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
-            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
+            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT} ${CURL_SSL_OPT}"
             if [ "$check_type" = "local" ]; then
                 export http_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
                 export https_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
