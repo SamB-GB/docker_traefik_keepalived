@@ -28,6 +28,8 @@ set -e
 # Leave blank if no proxy is needed
 PROXY_HOST=""  # Example: "proxy.company.com"
 PROXY_PORT=""  # Example: "8080"
+PROXY_USER=""
+PROXY_PASSWORD=""
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
