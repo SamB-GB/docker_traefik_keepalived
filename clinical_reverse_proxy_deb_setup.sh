@@ -578,7 +578,7 @@ check_single_node() {
     
     # Check 1: Docker Package Repository
     echo -n "  Docker packages (download.docker.com)... "
-    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
+    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
     
     if echo "$DOWNLOAD_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
@@ -590,7 +590,7 @@ check_single_node() {
     
     # Check 2: Docker Hub Registry API
     echo -n "  Docker Hub registry (registry-1.docker.io)... "
-    REGISTRY_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
+    REGISTRY_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
     
     if echo "$REGISTRY_TEST" | grep -q "200\|301\|401"; then
         echo "✓ Reachable"
@@ -602,7 +602,7 @@ check_single_node() {
     
     # Check 3: Docker Hub Main Domain
     echo -n "  Docker Hub (docker.io)... "
-    DOCKERIO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker.io 2>/dev/null || echo 'FAILED'")
+    DOCKERIO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker.io 2>/dev/null || echo 'FAILED'")
     
     if echo "$DOCKERIO_TEST" | grep -q "200\|301\|302"; then
         echo "✓ Reachable"
@@ -614,7 +614,7 @@ check_single_node() {
     
     # Check 4: Docker Image Storage (Cloudflare R2)
     echo -n "  Docker image storage (docker-images-prod...cloudflarestorage.com)... "
-    R2_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
+    R2_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
     
     if echo "$R2_TEST" | grep -q "200\|301\|302\|400\|403\|404"; then
         echo "✓ Reachable"
@@ -638,19 +638,19 @@ check_single_node() {
     
     case "$DETECTED_OS" in
         ubuntu)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
             ;;
         debian)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
             ;;
         centos|rhel|rocky|almalinux)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
@@ -719,7 +719,7 @@ check_single_node() {
         done
         
         if [ "$check_type" = "local" ]; then
-            echo ""
+            echo ""if [ "$SKIP_SSL_VERIFY" = "true" ]; then
             echo "  Possible causes:"
             echo "    1. Firewall blocking Docker Hub"
             echo "    2. Network connectivity issues"
