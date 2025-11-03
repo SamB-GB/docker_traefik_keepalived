@@ -1483,9 +1483,9 @@ load_config() {
 prompt_use_existing_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         echo ""
-        echo "----------------------------------------"
+        echo "=========================================="
         echo "Existing configuration file detected!"
-        echo "----------------------------------------"
+        echo "=========================================="
         echo ""
         read -p "Do you want to use the existing configuration? (yes/no): " USE_EXISTING_CONFIG
         USE_EXISTING_CONFIG=$(echo "$USE_EXISTING_CONFIG" | tr '[:upper:]' '[:lower:]')
@@ -1741,9 +1741,9 @@ install_packages() {
 # Prompt for multi-node deployment configuration
 prompt_multi_node_deployment() {
     echo ""
-    echo "----------------------------------------"
+    echo "=========================================="
     echo "High Availability Configuration"
-    echo "----------------------------------------"
+    echo "=========================================="
     echo ""
     
     # Check if we already have multi-node config loaded
@@ -3131,9 +3131,9 @@ log "User confirmed proceeding with installation"
 ### START installing Prerequisites
 
 echo ""
-echo "----------------------------------------"
+echo "=========================================="
 echo "Install Prerequisites"
-echo "----------------------------------------"
+echo "=========================================="
 echo ""
 
 # Set proxy options for package managers
@@ -3179,9 +3179,9 @@ sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_passwor
 ### START Docker Installation
 
 echo ""
-echo "----------------------------------------"
+echo "=========================================="
 echo "Installing Docker"
-echo "----------------------------------------"
+echo "=========================================="
 echo ""
 
 # OS-specific Docker installation
@@ -3388,9 +3388,9 @@ check_key_cert_match "$CERT_FILE" "$KEY_FILE"
 ### START TRAEFIK Docker Container Configuration
 
 echo ""
-echo "----------------------------------------"
+echo "=========================================="
 echo "Deploying Traefik Docker Container"
-echo "----------------------------------------"
+echo "=========================================="
 echo ""
 
 # Create Docker & Traefik directories with proper ownership
@@ -3492,9 +3492,9 @@ TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
 backup_file "$TRAEFIK_DYNAMIC_FILE"
 
 echo ""
-echo "----------------------------------------"
+echo "=========================================="
 echo "Configure Traefik"
-echo "----------------------------------------"
+echo "=========================================="
 echo ""
 
 # Call the function to generate the clinical_conf.yml services section
@@ -3628,9 +3628,9 @@ fi
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
 
 echo ""
-echo "----------------------------------------"
+echo "=========================================="
 echo "Installing KeepAlived"
-echo "----------------------------------------"
+echo "=========================================="
 echo ""
 
 # Install Keepalived
