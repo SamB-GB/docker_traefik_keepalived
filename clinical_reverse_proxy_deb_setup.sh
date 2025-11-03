@@ -516,7 +516,6 @@ check_execution_context() {
     fi
     
     echo "✓ Execution context validated"
-    echo ""
 }
 
 # Check repository connectivity
@@ -791,7 +790,7 @@ check_single_node() {
         done
         
         if [ "$check_type" = "local" ]; then
-            echo ""if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+            echo ""
             echo "  Possible causes:"
             echo "    1. Firewall blocking Docker Hub"
             echo "    2. Network connectivity issues"
