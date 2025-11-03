@@ -4529,14 +4529,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     for node in "${BACKUP_NODES[@]}"; do
         echo "    ssh $node 'ip addr show | grep $VIRTUAL_IP'"
     done
-elif [[ "$NODE_ROLE" == "MASTER" ]] || [[ "$INSTALL_KEEPALIVED" != "yes" && "$INSTALL_KEEPALIVED" != "y" ]]; then
-    echo "  1. Copy the config file to backup nodes:"
-    echo "     scp $CONFIG_FILE user@backup-node:/path/to/clinicalrp.sh_directory/"
-    echo ""
-    echo "  2. Run this script on backup nodes with the config file present"
-    echo ""
 fi
-
 echo "  - Test your services through Traefik"
 echo "  - Monitor logs for any issues"
 echo "  - Configure any additional backend services"
@@ -4545,26 +4538,6 @@ echo "Troubleshooting:"
 echo "  View installation log:"
 echo "    cat $LOGFILE"
 echo ""
-
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    echo "  Check Docker proxy configuration:"
-    echo "    sudo systemctl show docker --property Environment"
-    echo ""
-    echo "  Test Docker proxy (pull test image):"
-    echo "    docker pull hello-world"
-    echo ""
-fi
-
-echo "  Restart services if needed:"
-echo "    sudo systemctl restart docker"
-
-if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
-    echo "    sudo systemctl restart keepalived"
-fi
-
-echo "    cd /home/haloap/traefik && docker compose restart"
-echo ""
-
 echo "Cleanup:"
 echo "  To completely remove Traefik/Keepalived:"
 echo "    ./$(basename "$0") --clean"
