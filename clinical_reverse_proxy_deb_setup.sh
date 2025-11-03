@@ -1035,7 +1035,7 @@ cleanup_docker_cmd() {
 echo -n "Stopping Traefik... "
 if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
     cleanup_docker_cmd stop traefik 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not running"
 fi
@@ -1043,7 +1043,7 @@ fi
 echo -n "Removing Traefik container... "
 if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
     cleanup_docker_cmd rm traefik 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
@@ -1052,7 +1052,7 @@ fi
 echo -n "Removing Docker network 'proxynet'... "
 if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
     cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
@@ -1061,7 +1061,7 @@ fi
 echo -n "Removing Traefik directories... "
 if [ -d "/home/haloap/traefik" ]; then
     rm -rf /home/haloap/traefik
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
@@ -1074,7 +1074,7 @@ fi
 echo -n "Stopping Keepalived... "
 if systemctl is-active --quiet keepalived 2>/dev/null; then
     systemctl stop keepalived 2>/dev/null || true
-    echo "✓"
+    echo "✓ Stopped"
 else
     echo "Not running"
 fi
@@ -1082,7 +1082,7 @@ fi
 echo -n "Disabling Keepalived... "
 if systemctl is-enabled --quiet keepalived 2>/dev/null; then
     systemctl disable keepalived 2>/dev/null || true
-    echo "✓"
+    echo "✓ disabled"
 else
     echo "Not enabled"
 fi
@@ -1097,7 +1097,7 @@ if [[ "UNINSTALL_KEEPALIVED_FLAG" == "true" ]]; then
         elif command -v yum &>/dev/null; then
             yum -y remove keepalived 2>/dev/null || true
         fi
-        echo "✓"
+        echo "✓ Removed"
     else
         echo "Not installed"
     fi
@@ -1108,7 +1108,7 @@ echo -n "Removing Keepalived config... "
 if [ -f "/etc/keepalived/keepalived.conf" ]; then
     rm -f /etc/keepalived/keepalived.conf
     rm -f /etc/keepalived/keepalived.conf.bak*
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
@@ -1117,7 +1117,7 @@ fi
 echo -n "Removing health check script... "
 if [ -f "/bin/haloap_service_check.sh" ]; then
     rm -f /bin/haloap_service_check.sh
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
@@ -1130,14 +1130,14 @@ fi
 if getent group keepalived_script > /dev/null 2>&1; then
     groupdel keepalived_script 2>/dev/null || true
 fi
-echo "✓"
+echo "✓ Removed"
 
 # Uninstall Docker if requested
 if [[ "UNINSTALL_DOCKER_FLAG" == "true" ]]; then
     echo -n "Stopping Docker... "
     systemctl stop docker 2>/dev/null || true
     systemctl disable docker 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
     
     echo -n "Uninstalling Docker... "
     if command -v apt-get &>/dev/null; then
@@ -1148,13 +1148,13 @@ if [[ "UNINSTALL_DOCKER_FLAG" == "true" ]]; then
     elif command -v yum &>/dev/null; then
         yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
     fi
-    echo "✓"
+    echo "✓ Removed"
     
     echo -n "Removing Docker data... "
     rm -rf /var/lib/docker 2>/dev/null || true
     rm -rf /var/lib/containerd 2>/dev/null || true
     rm -rf /etc/docker/daemon.json 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
 fi
 
 # Remove Docker proxy configuration
@@ -1162,7 +1162,7 @@ echo -n "Removing Docker proxy config... "
 if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
     rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
     systemctl daemon-reload 2>/dev/null || true
-    echo "✓"
+    echo "✓ Removed"
 else
     echo "Not found"
 fi
