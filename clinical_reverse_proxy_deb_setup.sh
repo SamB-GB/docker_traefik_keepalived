@@ -293,21 +293,28 @@ docker_cmd() {
 }
 
 ensure_log_file() {
-    # Try /var/log first, then fall back to user's home directory
+    # DON'T use SCRIPTS_DIR for the log file!
+    # Use /var/log or user's home directory instead
+    
     if [ ! -f "$LOGFILE" ]; then
-        sudo touch "$LOGFILE" 2>/dev/null || LOGFILE="$SCRIPTS_DIR/traefik_installation.log"
+        sudo touch "$LOGFILE" 2>/dev/null || LOGFILE="$ACTUAL_HOME/traefik_installation.log"
     fi
     
     if [ ! -w "$LOGFILE" ]; then
-        LOGFILE="$SCRIPTS_DIR/traefik_installation.log"
+        LOGFILE="$ACTUAL_HOME/traefik_installation.log"
+        # Create directory if it doesn't exist
+        mkdir -p "$(dirname "$LOGFILE")"
         touch "$LOGFILE"
         chmod 644 "$LOGFILE"
     fi
     
+    # Ensure log file is always writable
+    if [ ! -w "$LOGFILE" ]; then
+        sudo chmod 666 "$LOGFILE" 2>/dev/null || true
+    fi
+    
     echo "Log file: $LOGFILE"
 }
-
-ensure_log_file
 
 # Function to log messages
 log() {
@@ -864,6 +871,13 @@ validate_ip() {
 # ==========================================
 # Script Execution Starts Here
 # ==========================================
+
+ensure_log_file
+
+# Now log can be used safely
+log "=== Clinical Traefik Setup Started ==="
+log "User: $CURRENT_USER"
+log "Home: $ACTUAL_HOME"
 
 # ==========================================
 # Cleanup Mode
@@ -3223,8 +3237,9 @@ log "✓ Docker installed successfully: $(docker --version)"
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     log "Configuring Docker daemon to use proxy..."
     sudo mkdir -p /etc/systemd/system/docker.service.d
+    
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-        ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
+        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
         sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
 [Service]
 Environment="HTTP_PROXY=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
@@ -3239,14 +3254,18 @@ Environment="HTTPS_PROXY=http://${PROXY_HOST}:${PROXY_PORT}"
 Environment="NO_PROXY=localhost,127.0.0.1"
 EOF
     fi
+    
     log "✓ Docker proxy configuration created"
+    
+    # ✅ RELOAD SYSTEMD FIRST (to read the new proxy config)
+    sudo systemctl daemon-reload
+    log "✓ Systemd daemon reloaded"
 fi
 
-# Start and enable Docker
+# ✅ NOW START DOCKER (with proxy config already loaded)
 log "Starting and enabling Docker..."
-sudo systemctl start docker || exit_on_error "Failed to start Docker"
 sudo systemctl enable docker || exit_on_error "Failed to enable Docker"
-sudo systemctl daemon-reload
+sudo systemctl restart docker || exit_on_error "Failed to restart Docker"  # Use restart instead of start
 
 # Verify Docker is running
 echo -n "Verifying Docker service... "
@@ -3254,6 +3273,12 @@ if systemctl is-active --quiet docker; then
     echo "✓ Running"
 else
     exit_on_error "Docker service is not running"
+fi
+
+# Verify Docker proxy config is active
+if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+    log "Verifying Docker proxy configuration..."
+    sudo systemctl show --property=Environment docker | grep -q "HTTP_PROXY" && log "✓ Docker proxy configured" || log "⚠️  Warning: Docker proxy may not be active"
 fi
 
 # Add current user to docker group
