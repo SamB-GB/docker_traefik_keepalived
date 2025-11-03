@@ -3166,7 +3166,7 @@ fi
 
 # Install prerequisites using install_packages function
 log "Installing base packages..."
-sudo bash -c "$(declare -f install_packages exit_on_error log); PKG_MANAGER=$PKG_MANAGER install_packages ${PREREQ_PACKAGES[*]}"
+sudo bash -c "$(declare -f install_packages exit_on_error log); PKG_MANAGER=$PKG_MANAGER LOGFILE='$LOGFILE' install_packages ${PREREQ_PACKAGES[*]}"
 
 ### END installing Prerequisites 
 ######################################################
