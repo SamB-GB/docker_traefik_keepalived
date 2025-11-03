@@ -3988,22 +3988,6 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         
         # Create remote installation script
         log "Creating installation script for $node..."
-    
-generate_remote_install_script() {
-    local node=$1
-    local ip=$2
-    
-    # Compute proxy placeholder and replace it
-    local PROXY_VAL=""
-    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then 
-        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            # URL-encode the password to handle special characters
-            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-            PROXY_VAL="${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        else
-            PROXY_VAL="${PROXY_HOST}:${PROXY_PORT}"
-        fi
-    fi
         
         write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
 #!/bin/bash
