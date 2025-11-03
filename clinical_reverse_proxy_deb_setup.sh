@@ -3989,12 +3989,46 @@ generate_remote_install_script() {
         write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
 #!/bin/bash
 set -e
+set -x
 
 echo ""
 echo "=========================================="
 echo "Installing Traefik on Backup Node"
 echo "=========================================="
 echo ""
+
+# Proxy support
+PROXY="__PROXY__"
+APT_SSL_OPT="__APT_SSL_OPT__"
+WGET_SSL_OPT="__WGET_SSL_OPT__"
+
+if [ -n "$PROXY" ]; then
+    if echo "$PROXY" | grep -q '@'; then
+        # Authenticated proxy
+        PROXY_DISPLAY="${PROXY#*@}"
+        PROXY_USER="${PROXY%@*}"
+        PROXY_USER="${PROXY_USER%%:*}"
+        echo "Using authenticated proxy: $PROXY_DISPLAY (user: $PROXY_USER)"
+    else
+        # No authentication
+        PROXY_DISPLAY="$PROXY"
+        echo "Using proxy: $PROXY_DISPLAY"
+    fi
+    
+    export http_proxy="http://$PROXY"
+    export https_proxy="http://$PROXY"
+    export no_proxy="localhost,127.0.0.1"
+    APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
+else
+    APT_PROXY_OPT=""
+fi
+
+# Add SSL options if configured
+if [ -n "$APT_SSL_OPT" ]; then
+    APT_PROXY_OPT="$APT_PROXY_OPT $APT_SSL_OPT"
+fi
+
+echo "=== Installing on $(hostname) ==="
 
 CONFIG_FILE="/tmp/clinical_traefik.env"
 
@@ -4036,18 +4070,33 @@ elif command -v yum &>/dev/null; then
 fi
 
 # Install Docker
-echo "Installing Docker..."
 if command -v apt-get &>/dev/null; then
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         sudo install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        
+        # Use proxy and SSL options if configured
+        CURL_DOWNLOAD_OPTS="$CURL_SSL_OPT"
+        if [ -n "$PROXY" ]; then
+            if echo "$PROXY" | grep -q '@'; then
+                # Authenticated proxy - extract components
+                PROXY_AUTH="${PROXY%@*}"
+                PROXY_HOST="${PROXY#*@}"
+                PROXY_USER="${PROXY_AUTH%%:*}"
+                PROXY_PASS="${PROXY_AUTH#*:}"
+                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://${PROXY_HOST} -U ${PROXY_USER}:${PROXY_PASS}"
+            else
+                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://$PROXY"
+            fi
+        fi
+        
+        curl $CURL_DOWNLOAD_OPTS -fsSL https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
         
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         
-        sudo apt-get update -qq
+        sudo apt-get $APT_PROXY_OPT update -qq
     fi
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+    sudo apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
 fi
 
 # Start Docker
@@ -4243,11 +4292,25 @@ echo "✓ Installation complete on backup node"
 echo "✓ Traefik: Running"
 echo "✓ Keepalived: Running (BACKUP, priority BACKUP_PRIORITY_PLACEHOLDER)"
 REMOTEINSTALL
+
+# Compute proxy value
+PROXY_VAL=""
+if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then 
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+        PROXY_VAL="${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+    else
+        PROXY_VAL="${PROXY_HOST}:${PROXY_PORT}"
+    fi
+fi
         
         # Replace priority placeholder and backup node IP
         sed -i "s/BACKUP_PRIORITY_PLACEHOLDER/$priority/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s/BACKUP_NODE_IP_PLACEHOLDER/$ip/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s/BACKUP_INTERFACE_PLACEHOLDER/${BACKUP_INTERFACES[$i]}/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__PROXY__|${PROXY_VAL}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__APT_SSL_OPT__|${APT_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
         # Also need to copy clinical_conf.yml to remote
