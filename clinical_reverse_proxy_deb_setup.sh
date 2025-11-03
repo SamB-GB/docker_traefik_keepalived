@@ -3234,38 +3234,45 @@ docker --version || exit_on_error "Docker installation failed"
 log "✓ Docker installed successfully: $(docker --version)"
 
 # Configure Docker daemon to use proxy (if configured)
+
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     log "Configuring Docker daemon to use proxy..."
-    sudo mkdir -p /etc/systemd/system/docker.service.d
+    sudo mkdir -p /etc/docker
+    
+    # Backup existing daemon.json if it exists
+    if [ -f "/etc/docker/daemon.json" ]; then
+        sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+        log "Backed up existing daemon.json"
+    fi
     
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
         ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-        sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
-[Service]
-Environment="HTTP_PROXY=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-Environment="HTTPS_PROXY=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-Environment="NO_PROXY=localhost,127.0.0.1"
-EOF
+        PROXY_URL="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
     else
-        sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf > /dev/null <<EOF
-[Service]
-Environment="HTTP_PROXY=http://${PROXY_HOST}:${PROXY_PORT}"
-Environment="HTTPS_PROXY=http://${PROXY_HOST}:${PROXY_PORT}"
-Environment="NO_PROXY=localhost,127.0.0.1"
-EOF
+        PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
     fi
     
-    log "✓ Docker proxy configuration created"
+    # Create daemon.json with proxy configuration
+    sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+{
+  "proxies": {
+    "http-proxy": "${PROXY_URL}",
+    "https-proxy": "${PROXY_URL}",
+    "no-proxy": "localhost,127.0.0.1"
+  }
+}
+EOF
     
-    # ✅ RELOAD SYSTEMD FIRST (to read the new proxy config)
-    sudo systemctl daemon-reload
-    log "✓ Systemd daemon reloaded"
+    log "✓ Docker proxy configuration created in daemon.json"
 fi
 
-# ✅ NOW START DOCKER (with proxy config already loaded)
+# Start Docker (no need for daemon-reload with daemon.json)
 log "Starting and enabling Docker..."
 sudo systemctl enable docker || exit_on_error "Failed to enable Docker"
-sudo systemctl restart docker || exit_on_error "Failed to restart Docker"  # Use restart instead of start
+sudo systemctl stop docker 2>/dev/null || true
+sleep 2
+sudo systemctl start docker || exit_on_error "Failed to start Docker"
+sleep 3
 
 # Verify Docker is running
 echo -n "Verifying Docker service... "
@@ -3275,10 +3282,14 @@ else
     exit_on_error "Docker service is not running"
 fi
 
-# Verify Docker proxy config is active
+# Verify proxy is working
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     log "Verifying Docker proxy configuration..."
-    sudo systemctl show --property=Environment docker | grep -q "HTTP_PROXY" && log "✓ Docker proxy configured" || log "⚠️  Warning: Docker proxy may not be active"
+    if docker info 2>/dev/null | grep -qi proxy; then
+        log "✓ Docker proxy configured"
+    else
+        log "⚠️  Warning: Docker proxy may not be active"
+    fi
 fi
 
 # Add current user to docker group
