@@ -628,29 +628,22 @@ check_single_node() {
     local REPO_CHECK_FAILED=0
     local FAILED_REPOS=()
     
-    # Set proxy options
-    local PROXY_CURL_OPT=""
+    # Configure proxy for connectivity checks
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
-            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT} ${CURL_SSL_OPT}"
-            if [ "$check_type" = "local" ]; then
-                export http_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-                export https_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-                export no_proxy="localhost,127.0.0.1"
-                echo "Using authenticated proxy: ${PROXY_HOST}:${PROXY_PORT}"
-                echo ""
-            fi
+            # URL-encode password for environment variables and curl
+            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+            export http_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            export https_proxy="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            PROXY_CURL_OPT="-x ${PROXY_HOST}:${PROXY_PORT} -U ${PROXY_USER}:${PROXY_PASSWORD} ${CURL_SSL_OPT}"
         else
-            PROXY_CURL_OPT="-x http://${PROXY_HOST}:${PROXY_PORT}"
-            if [ "$check_type" = "local" ]; then
-                export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-                export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
-                export no_proxy="localhost,127.0.0.1"
-                echo "Using proxy: ${PROXY_HOST}:${PROXY_PORT}"
-                echo ""
-            fi
+            export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+            PROXY_CURL_OPT="-x ${PROXY_HOST}:${PROXY_PORT} ${CURL_SSL_OPT}"
         fi
+        export no_proxy="localhost,127.0.0.1"
+    else
+        PROXY_CURL_OPT="${CURL_SSL_OPT}"
     fi
     
     # Helper function to run command locally or remotely
@@ -669,7 +662,7 @@ check_single_node() {
     
     # Check 1: Docker Package Repository
     echo -n "  Docker packages (download.docker.com)... "
-    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://download.docker.com 2>/dev/null || echo 'FAILED'")
+    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://download.docker.com 2>/dev/null || echo 'FAILED'")
     
     if echo "$DOWNLOAD_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
@@ -681,7 +674,7 @@ check_single_node() {
     
     # Check 2: Docker Hub Registry API
     echo -n "  Docker Hub registry (registry-1.docker.io)... "
-    REGISTRY_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
+    REGISTRY_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
     
     if echo "$REGISTRY_TEST" | grep -q "200\|301\|401"; then
         echo "✓ Reachable"
@@ -693,7 +686,7 @@ check_single_node() {
     
     # Check 3: Docker Hub Main Domain
     echo -n "  Docker Hub (docker.io)... "
-    DOCKERIO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker.io 2>/dev/null || echo 'FAILED'")
+    DOCKERIO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://docker.io 2>/dev/null || echo 'FAILED'")
     
     if echo "$DOCKERIO_TEST" | grep -q "200\|301\|302"; then
         echo "✓ Reachable"
@@ -705,7 +698,7 @@ check_single_node() {
     
     # Check 4: Docker Image Storage (Cloudflare R2)
     echo -n "  Docker image storage (docker-images-prod...cloudflarestorage.com)... "
-    R2_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
+    R2_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
     
     if echo "$R2_TEST" | grep -q "200\|301\|302\|400\|403\|404"; then
         echo "✓ Reachable"
@@ -729,19 +722,19 @@ check_single_node() {
     
     case "$DETECTED_OS" in
         ubuntu)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
             ;;
         debian)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} http://deb.debian.org/debian/dists/ 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
             ;;
         centos|rhel|rocky|almalinux)
-            REPO_TEST=$(run_check "timeout 10 curl -s -o ${CURL_SSL_OPT} /dev/null -w '%{http_code}' $PROXY_CURL_OPT http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
+            REPO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
             if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
                 REPO_TEST_PASSED=1
             fi
@@ -4023,6 +4016,21 @@ else
     APT_PROXY_OPT=""
 fi
 
+# Use proxy and SSL options if configured
+        CURL_DOWNLOAD_OPTS="$CURL_SSL_OPT"
+        if [ -n "$PROXY" ]; then
+            if echo "$PROXY" | grep -q '@'; then
+                # Authenticated proxy - extract components
+                PROXY_AUTH="${PROXY%@*}"
+                PROXY_HOST="${PROXY#*@}"
+                PROXY_USER="${PROXY_AUTH%%:*}"
+                PROXY_PASS="${PROXY_AUTH#*:}"
+                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://${PROXY_HOST} -U ${PROXY_USER}:${PROXY_PASS}"
+            else
+                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://$PROXY"
+            fi
+        fi
+
 # Add SSL options if configured
 if [ -n "$APT_SSL_OPT" ]; then
     APT_PROXY_OPT="$APT_PROXY_OPT $APT_SSL_OPT"
@@ -4073,22 +4081,6 @@ fi
 if command -v apt-get &>/dev/null; then
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         sudo install -m 0755 -d /etc/apt/keyrings
-        
-        # Use proxy and SSL options if configured
-        CURL_DOWNLOAD_OPTS="$CURL_SSL_OPT"
-        if [ -n "$PROXY" ]; then
-            if echo "$PROXY" | grep -q '@'; then
-                # Authenticated proxy - extract components
-                PROXY_AUTH="${PROXY%@*}"
-                PROXY_HOST="${PROXY#*@}"
-                PROXY_USER="${PROXY_AUTH%%:*}"
-                PROXY_PASS="${PROXY_AUTH#*:}"
-                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://${PROXY_HOST} -U ${PROXY_USER}:${PROXY_PASS}"
-            else
-                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://$PROXY"
-            fi
-        fi
-        
         curl $CURL_DOWNLOAD_OPTS -fsSL https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
         
