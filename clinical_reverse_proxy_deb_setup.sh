@@ -2735,6 +2735,7 @@ EOF
 # Validate execution context and OS
 validate_os
 check_execution_context
+validate_proxy_config
 
 # Create scripts directory with correct ownership
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
