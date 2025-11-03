@@ -292,15 +292,19 @@ docker_cmd() {
     fi
 }
 
-# Ensure log file exists and is writable
 ensure_log_file() {
+    # Try /var/log first, then fall back to user's home directory
     if [ ! -f "$LOGFILE" ]; then
-        touch "$LOGFILE" 2>/dev/null || LOGFILE="/tmp/installation.log"
+        sudo touch "$LOGFILE" 2>/dev/null || LOGFILE="$SCRIPTS_DIR/traefik_installation.log"
     fi
+    
     if [ ! -w "$LOGFILE" ]; then
-        LOGFILE="/tmp/installation.log"
+        LOGFILE="$SCRIPTS_DIR/traefik_installation.log"
         touch "$LOGFILE"
+        chmod 644 "$LOGFILE"
     fi
+    
+    echo "Log file: $LOGFILE"
 }
 
 ensure_log_file
