@@ -1,18 +1,6 @@
 #!/bin/bash
 
 # Enhanced Clinical Traefik Reverse Proxy Setup
-# Incorporates best practices from MySQL cluster scripts
-#
-# PROXY CONFIGURATION:
-# If you need to use a proxy for internet access, edit the variables below:
-#   PROXY_HOST="proxy.company.com"
-#   PROXY_PORT="8080"
-#
-# The script will automatically use the proxy for:
-#   - Package downloads (apt/yum)
-#   - Docker repository access
-#   - Docker image pulls
-#   - Repository connectivity checks
 #
 # USAGE:
 #   ./clinicalrp.sh           # Normal installation
@@ -27,10 +15,10 @@ set -e
 # HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/yum)
 # Leave blank if no proxy is needed
 # Note: Passwords with special characters will be automatically URL-encoded
-PROXY_HOST=""  # Example: "proxy.company.com"
-PROXY_PORT=""  # Example: "8080"
-PROXY_USER=""
-PROXY_PASSWORD="" # Special characters will be handled automatically
+PROXY_HOST="10.0.60.61"  # Example: "proxy.company.com"
+PROXY_PORT="3128"  # Example: "8080"
+PROXY_USER="sbarr"
+PROXY_PASSWORD="98lrxfn0a!" # Special characters will be handled automatically
 SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
 
 # Multi-node deployment variables
