@@ -3207,14 +3207,12 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
     sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
-    sudo bash -c "$(declare -f install_packages exit_on_error log); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' install_packages docker-ce docker-ce-cli containerd.io"
-
+    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages ..."
 elif [[ "$PKG_MANAGER" == "yum" ]]; then
     log "Installing Docker via yum..."
     # Add Docker repo
     sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-    sudo bash -c "$(declare -f install_packages exit_on_error log); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' install_packages docker-ce docker-ce-cli containerd.io"
-  
+    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages ..."
 fi
 
 # Verify Docker installation
