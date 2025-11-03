@@ -1388,6 +1388,7 @@ REMOTECLEANUP
                         echo -n "Removing Docker data... "
                         sudo rm -rf /var/lib/docker 2>/dev/null || true
                         sudo rm -rf /var/lib/containerd 2>/dev/null || true
+                        sudo rm -rf /etc/docker/daemon.json 2>/dev/null || true
                         echo "✓ Removed"
                         
                         if groups "$CURRENT_USER" | grep -q docker; then
