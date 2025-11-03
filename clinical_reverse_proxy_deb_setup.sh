@@ -62,16 +62,107 @@ CONFIG_FILE="$SCRIPT_DIR/clinical_traefik.env"
 # Directory for temporary scripts
 SCRIPTS_DIR="$ACTUAL_HOME/traefik_setup_scripts"
 
+# ==========================================
+# SSL and Proxy Options
+# ==========================================
+
 # Curl SSL options
 if [ "$SKIP_SSL_VERIFY" = "true" ]; then
-       CURL_SSL_OPT="--insecure"
-    else
-       CURL_SSL_OPT=""
+    CURL_SSL_OPT="--insecure"
+else
+    CURL_SSL_OPT=""
+fi
+
+# APT SSL options
+APT_SSL_OPT=""
+if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+    APT_SSL_OPT="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
+fi
+
+# DNF SSL options
+DNF_SSL_OPT=""
+if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+    DNF_SSL_OPT="--setopt=sslverify=false"
+fi
+
+# Wget SSL options
+WGET_SSL_OPT=""
+if [ "$SKIP_SSL_VERIFY" = "true" ]; then
+    WGET_SSL_OPT="--no-check-certificate"
 fi
 
 # ==========================================
 # Helper Functions
 # ==========================================
+
+# Enhanced URL encoding function with better error handling
+url_encode_password() {
+    local password="$1"
+    local encoded=""
+    
+    # Method 1: Try Python3 (most reliable)
+    if command -v python3 &>/dev/null; then
+        encoded=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$password" 2>/dev/null)
+        if [ -n "$encoded" ] && [ "$encoded" != "$password" ]; then
+            echo "$encoded"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Try jq
+    if command -v jq &>/dev/null; then
+        encoded=$(printf '%s' "$password" | jq -sRr @uri 2>/dev/null)
+        if [ -n "$encoded" ] && [ "$encoded" != "$password" ]; then
+            echo "$encoded"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Manual encoding (fallback for common special characters)
+    # This is a basic implementation - not comprehensive but handles most cases
+    encoded="$password"
+    encoded="${encoded//\%/%25}"  # % must be first
+    encoded="${encoded//!/%21}"
+    encoded="${encoded//:/%3A}"
+    encoded="${encoded//@/%40}"
+    encoded="${encoded//\#/%23}"
+    encoded="${encoded//\$/%24}"
+    encoded="${encoded//\&/%26}"
+    encoded="${encoded//\'/%27}"
+    encoded="${encoded//\(/%28}"
+    encoded="${encoded//)/%29}"
+    encoded="${encoded//\*/%2A}"
+    encoded="${encoded//+/%2B}"
+    encoded="${encoded//,/%2C}"
+    encoded="${encoded//\//%2F}"
+    encoded="${encoded//;/%3B}"
+    encoded="${encoded//=/%3D}"
+    encoded="${encoded//\?/%3F}"
+    encoded="${encoded//\[/%5B}"
+    encoded="${encoded//]/%5D}"
+    encoded="${encoded// /%20}"
+    
+    echo "$encoded"
+}
+
+# Verify URL encoding worked for special characters
+verify_password_encoding() {
+    local original="$1"
+    local encoded="$2"
+    local has_special_chars=false
+    
+    # Check if password contains special characters that need encoding
+    if echo "$original" | grep -q '[!@#$%^&*()+=:;<>?/`~\\ ]'; then
+        has_special_chars=true
+    fi
+    
+    # If we have special characters but encoding didn't change the string, encoding failed
+    if [ "$has_special_chars" = true ] && [ "$encoded" = "$original" ]; then
+        return 1  # Encoding failed
+    fi
+    
+    return 0  # Encoding succeeded or not needed
+}
 
 # Run command on remote host with sudo
 run_remote_sudo() {
@@ -1501,6 +1592,80 @@ clear_previous_configuration() {
     fi
 }
 
+# Validate proxy configuration
+validate_proxy_config() {
+    if [ -z "${PROXY_HOST}" ] || [ -z "${PROXY_PORT}" ]; then
+        echo "  Proxy: Not configured"
+        return 0
+    fi
+    
+    echo ""
+    echo "=========================================="
+    echo "Validating Proxy Configuration"
+    echo "=========================================="
+    
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated)"
+        echo "  User: ${PROXY_USER}"
+        
+        # Encode password and verify encoding
+        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+        
+        if ! verify_password_encoding "${PROXY_PASSWORD}" "$ENCODED_PASS"; then
+            echo ""
+            echo "⚠️  WARNING: Proxy Password Encoding"
+            echo ""
+            echo "Your password contains special characters but URL encoding did not work."
+            echo ""
+            echo "Solutions:"
+            echo "  1. Install python3: sudo apt-get install -y python3 (Debian/Ubuntu)"
+            echo "  2. Install python3: sudo yum install -y python3 (RHEL/CentOS)"
+            echo "  3. Install jq: sudo apt-get install -y jq"
+            echo "  4. Or the script will use fallback encoding (less reliable)"
+            echo ""
+            read -p "Continue anyway with potentially broken encoding? [y/N]: " CONTINUE
+            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+                echo "Installation cancelled."
+                exit 1
+            fi
+        else
+            echo "✓ Password encoding successful"
+        fi
+        
+        # Check for tools
+        echo ""
+        echo "Checking encoding tools availability:"
+        if command -v python3 &>/dev/null; then
+            echo "  ✓ python3: $(python3 --version 2>&1)"
+        else
+            echo "  ✗ python3: not installed (recommended for reliable encoding)"
+        fi
+        
+        if command -v jq &>/dev/null; then
+            echo "  ✓ jq: $(jq --version 2>&1)"
+        else
+            echo "  ✗ jq: not installed (alternative encoding method)"
+        fi
+        
+        # Warn if neither python3 nor jq is available
+        if ! command -v python3 &>/dev/null && ! command -v jq &>/dev/null; then
+            echo ""
+            echo "⚠️  WARNING: Neither python3 nor jq is installed."
+            echo "   Using fallback manual encoding which may not handle all special characters."
+            echo "   Recommend: sudo $PKG_MANAGER install -y python3"
+            echo ""
+        fi
+        
+    else
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+        echo "  Authentication: None"
+    fi
+    
+    echo ""
+    echo "✓ Proxy configuration validated"
+    echo ""
+}
+
 # Function to backup existing configuration files limit to two with most recent named .bak.mostrecent
 backup_file() {
     local file="$1"
@@ -1552,20 +1717,41 @@ install_packages() {
     
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
-            APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-            YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            # URL-encode the password to handle special characters
+            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+            apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            yum_proxy_opts="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
         else
-            APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            yum_proxy_opts="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
         fi
     fi
     
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        apt-get $apt_proxy_opts install -y "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
-    elif [[ "$PKG_MANAGER" == "yum" ]]; then
-        yum $yum_proxy_opts install -y "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    # Add SSL options if configured
+    if [ -n "$APT_SSL_OPT" ]; then
+        apt_proxy_opts="$apt_proxy_opts $APT_SSL_OPT"
     fi
+    
+    if [ -n "$DNF_SSL_OPT" ]; then
+        yum_proxy_opts="$yum_proxy_opts $DNF_SSL_OPT"
+    fi
+    
+    # Detect package manager and install
+    if command -v apt-get &>/dev/null; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get $apt_proxy_opts update > /tmp/apt_update.log 2>&1 || {
+            log "Warning: Some repositories failed, continuing with available ones..."
+        }
+        apt-get $apt_proxy_opts -yq install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    elif command -v yum &>/dev/null; then
+        yum $yum_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    elif command -v dnf &>/dev/null; then
+        dnf $yum_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    else
+        exit_on_error "No supported package manager found (apt-get, yum, or dnf)"
+    fi
+    
+    log "✓ Packages installed successfully"
 }
 
 # Prompt for multi-node deployment configuration
@@ -3782,6 +3968,22 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         
         # Create remote installation script
         log "Creating installation script for $node..."
+    
+generate_remote_install_script() {
+    local node=$1
+    local ip=$2
+    
+    # Compute proxy placeholder and replace it
+    local PROXY_VAL=""
+    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then 
+        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+            # URL-encode the password to handle special characters
+            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+            PROXY_VAL="${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        else
+            PROXY_VAL="${PROXY_HOST}:${PROXY_PORT}"
+        fi
+    fi
         
         write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
 #!/bin/bash
