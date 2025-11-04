@@ -4102,9 +4102,44 @@ if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
 fi
 
+# Configure Docker proxy if needed
+if [ -n "$PROXY" ]; then
+    echo "Configuring Docker daemon to use proxy..."
+    sudo mkdir -p /etc/docker
+    
+    # Backup existing daemon.json if it exists
+    if [ -f "/etc/docker/daemon.json" ]; then
+        sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+    fi
+    
+    # Create daemon.json with proxy configuration
+    sudo tee /etc/docker/daemon.json > /dev/null <<DOCKEREOF
+{
+  "proxies": {
+    "http-proxy": "http://$PROXY",
+    "https-proxy": "http://$PROXY",
+    "no-proxy": "localhost,127.0.0.1"
+  }
+}
+DOCKEREOF
+    
+    echo "✓ Docker proxy configured in daemon.json"
+fi
+
 # Start Docker
-sudo systemctl start docker
+echo "Starting Docker..."
 sudo systemctl enable docker
+sudo systemctl stop docker 2>/dev/null || true
+sleep 2
+sudo systemctl start docker
+sleep 3
+
+# Verify Docker is running
+if ! systemctl is-active --quiet docker; then
+    echo "ERROR: Docker failed to start"
+    exit 1
+fi
+echo "✓ Docker is running"
 
 # Add user to docker group
 if ! groups "$CURRENT_USER" | grep -q docker; then
