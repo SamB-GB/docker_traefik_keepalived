@@ -1159,8 +1159,8 @@ fi
 
 # Remove Docker proxy configuration
 echo -n "Removing Docker proxy config... "
-if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
-    rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
+if [ -f "/etc/docker/daemon.json" ]; then
+    rm -f /etc/docker/daemon.json
     systemctl daemon-reload 2>/dev/null || true
     echo "✓ Removed"
 else
@@ -1338,8 +1338,8 @@ REMOTECLEANUP
             
             # Remove Docker proxy configuration
             echo -n "Removing Docker proxy configuration... "
-            if [ -f "/etc/systemd/system/docker.service.d/http-proxy.conf" ]; then
-                sudo rm -f /etc/systemd/system/docker.service.d/http-proxy.conf || true
+            if [ -f "/etc/docker/daemon.json" ]; then
+                sudo rm -f /etc/docker/daemon.json || true
                 sudo systemctl daemon-reload 2>/dev/null || true
                 echo "✓ Removed"
             else
@@ -4452,7 +4452,7 @@ if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     else
         echo "  - Proxy: ${PROXY_HOST}:${PROXY_PORT}"
     fi
-    echo "  - Docker Proxy Config: /etc/systemd/system/docker.service.d/http-proxy.conf"
+    echo "  - Docker Proxy Config: /etc/docker/daemon.json"
 fi
 
 
@@ -4537,10 +4537,6 @@ echo ""
 echo "Troubleshooting:"
 echo "  View installation log:"
 echo "    cat $LOGFILE"
-echo ""
-echo "Cleanup:"
-echo "  To completely remove Traefik/Keepalived:"
-echo "    ./$(basename "$0") --clean"
 echo ""
 
 if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
