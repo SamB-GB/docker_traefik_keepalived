@@ -12,7 +12,7 @@ set -e
 # Configuration
 # ==========================================
 
-# HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/yum)
+# HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/dnf)
 # Leave blank if no proxy is needed
 # Note: Passwords with special characters will be automatically URL-encoded
 PROXY_HOST="10.0.60.61"  # Example: "proxy.company.com"
@@ -445,7 +445,7 @@ validate_os() {
         echo ""
         echo "To install sudo, run the following commands as root:"
         echo "  apt-get update && apt-get install sudo  # Debian/Ubuntu"
-        echo "  yum install sudo                         # CentOS/RHEL"
+        echo "  dnf install sudo                         # CentOS/RHEL"
         echo "  usermod -aG sudo YOUR_USERNAME"
         echo ""
         echo "Then log out and log back in, and run this script again."
@@ -1094,8 +1094,8 @@ if [[ "UNINSTALL_KEEPALIVED_FLAG" == "true" ]]; then
         if command -v apt-get &>/dev/null; then
             apt-get -y purge keepalived 2>/dev/null || true
             apt-get -y autoremove 2>/dev/null || true
-        elif command -v yum &>/dev/null; then
-            yum -y remove keepalived 2>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf -y remove keepalived 2>/dev/null || true
         fi
         echo "✓ Removed"
     else
@@ -1145,8 +1145,8 @@ if [[ "UNINSTALL_DOCKER_FLAG" == "true" ]]; then
         apt-get -y autoremove 2>/dev/null || true
         rm -f /etc/apt/sources.list.d/docker.list
         rm -f /etc/apt/keyrings/docker.gpg
-    elif command -v yum &>/dev/null; then
-        yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dnf -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
     fi
     echo "✓ Removed"
     
@@ -1299,8 +1299,8 @@ REMOTECLEANUP
                         if command -v apt-get &>/dev/null; then
                             sudo apt-get -y purge keepalived 2>/dev/null || true
                             sudo apt-get -y autoremove 2>/dev/null || true
-                        elif command -v yum &>/dev/null; then
-                            sudo yum -y remove keepalived 2>/dev/null || true
+                        elif command -v dnf &>/dev/null; then
+                            sudo dnf -y remove keepalived 2>/dev/null || true
                         fi
                     fi
                     echo "✓ Uninstalled"
@@ -1380,8 +1380,8 @@ REMOTECLEANUP
                             sudo apt-get -y autoremove 2>/dev/null || true
                             sudo rm -f /etc/apt/sources.list.d/docker.list
                             sudo rm -f /etc/apt/keyrings/docker.gpg
-                        elif command -v yum &>/dev/null; then
-                            sudo yum -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+                        elif command -v dnf &>/dev/null; then
+                            sudo dnf -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
                         fi
                         echo "✓ Uninstalled"
                         
@@ -1619,7 +1619,7 @@ validate_proxy_config() {
             echo ""
             echo "Solutions:"
             echo "  1. Install python3: sudo apt-get install -y python3 (Debian/Ubuntu)"
-            echo "  2. Install python3: sudo yum install -y python3 (RHEL/CentOS)"
+            echo "  2. Install python3: sudo dnf install -y python3 (RHEL/CentOS)"
             echo "  3. Install jq: sudo apt-get install -y jq"
             echo "  4. Or the script will use fallback encoding (less reliable)"
             echo ""
@@ -1706,24 +1706,24 @@ backup_file() {
 # Package Management
 # ==========================================
 
-# Function to install packages using OS specific package manager only APT and YUM supported
+# Function to install packages using OS specific package manager only APT and dnf supported
 install_packages() {
     local packages=("$@")
     log "Installing packages: ${packages[*]}"
     
     # Set proxy for package managers if configured
     local apt_proxy_opts=""
-    local yum_proxy_opts=""
+    local dnf_proxy_opts=""
     
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
             # URL-encode the password to handle special characters
             ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
             apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-            yum_proxy_opts="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+            dnf_proxy_opts="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
         else
             apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            yum_proxy_opts="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            dnf_proxy_opts="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
         fi
     fi
     
@@ -1733,7 +1733,7 @@ install_packages() {
     fi
     
     if [ -n "$DNF_SSL_OPT" ]; then
-        yum_proxy_opts="$yum_proxy_opts $DNF_SSL_OPT"
+        dnf_proxy_opts="$dnf_proxy_opts $DNF_SSL_OPT"
     fi
     
     # Detect package manager and install
@@ -1743,12 +1743,12 @@ install_packages() {
             log "Warning: Some repositories failed, continuing with available ones..."
         }
         apt-get $apt_proxy_opts -yq install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
-    elif command -v yum &>/dev/null; then
-        yum $yum_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
     elif command -v dnf &>/dev/null; then
-        dnf $yum_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+        dnf $dnf_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    elif command -v dnf &>/dev/null; then
+        dnf $dnf_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
     else
-        exit_on_error "No supported package manager found (apt-get, yum, or dnf)"
+        exit_on_error "No supported package manager found (apt-get, dnf, or dnf)"
     fi
     
     log "✓ Packages installed successfully"
@@ -3037,10 +3037,10 @@ log "Detected Version: $OS_VERSION"
 
 if command -v apt-get &>/dev/null; then
     PKG_MANAGER="apt"
-  elif command -v yum &>/dev/null; then
-    PKG_MANAGER="yum"
+  elif command -v dnf &>/dev/null; then
+    PKG_MANAGER="dnf"
   else
-    exit_on_error "Unsupported package manager. Only apt and yum are supported."
+    exit_on_error "Unsupported package manager. Only apt and dnf are supported."
 fi
 
 log "Detected package manager: $PKG_MANAGER"
@@ -3154,15 +3154,15 @@ echo ""
 
 # Set proxy options for package managers
 APT_PROXY_OPT=""
-YUM_PROXY_OPT=""
+dnf_PROXY_OPT=""
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
         ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
         APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        dnf_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
     else
         APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        YUM_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        dnf_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
     fi
 fi
 
@@ -3175,13 +3175,13 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     )
     log "Updating apt package lists..."
     sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
-  elif [[ "$PKG_MANAGER" == "yum" ]]; then
+  elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     PREREQ_PACKAGES=(
-        ca-certificates curl yum-utils
+        ca-certificates curl dnf-utils
         gnupg2 wget nano iproute ipcalc
     )
-    log "Cleaning yum metadata..."
-    sudo yum $YUM_PROXY_OPT clean all || exit_on_error "Failed to clean yum metadata"
+    log "Cleaning dnf metadata..."
+    sudo dnf $dnf_PROXY_OPT clean all || exit_on_error "Failed to clean dnf metadata"
 fi
 
 # Install prerequisites using install_packages function
@@ -3224,10 +3224,10 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
 
     sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
-elif [[ "$PKG_MANAGER" == "yum" ]]; then
-    log "Installing Docker via yum..."
+elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+    log "Installing Docker via dnf..."
     # Add Docker repo
-    sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    sudo dnf-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
@@ -4084,8 +4084,8 @@ echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT update -qq
     sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
-elif command -v yum &>/dev/null; then
-    sudo yum install -y ca-certificates curl yum-utils gnupg2 wget nano iproute ipcalc
+elif command -v dnf &>/dev/null; then
+    sudo dnf install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc
 fi
 
 # Install Docker
@@ -4234,9 +4234,9 @@ sleep 5
 # Install Keepalived
 echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
-    sudo apt-get install -y keepalived
-elif command -v yum &>/dev/null; then
-    sudo yum install -y keepalived
+    sudo apt-get $APT_PROXY_OPT install -y keepalived
+elif command -v dnf &>/dev/null; then
+    sudo dnf install -y keepalived
 fi
 
 # Create keepalived_script user/group
