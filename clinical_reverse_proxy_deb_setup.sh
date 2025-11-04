@@ -4085,7 +4085,7 @@ if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT update -qq
     sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
 elif command -v dnf &>/dev/null; then
-    sudo dnf install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc
+    sudo dnf $dnf_PROXY_OPT install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc
 fi
 
 # Install Docker
@@ -4236,7 +4236,7 @@ echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT install -y keepalived
 elif command -v dnf &>/dev/null; then
-    sudo dnf install -y keepalived
+    sudo dnf $dnf_PROXY_OPT install -y keepalived
 fi
 
 # Create keepalived_script user/group
