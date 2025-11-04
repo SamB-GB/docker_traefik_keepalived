@@ -4082,8 +4082,8 @@ export BACKUP_NODE_INSTALL="yes"  # Flag to skip prompts
 # Install prerequisites
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
+    sudo $APT_PROXY_OPT apt-get update -qq
+    sudo $APT_PROXY_OPT apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
 elif command -v yum &>/dev/null; then
     sudo yum install -y ca-certificates curl yum-utils gnupg2 wget nano iproute ipcalc
 fi
