@@ -3336,7 +3336,22 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
 elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     log "Installing Docker via dnf..."
     # Add Docker repo
-    sudo dnf $dnf_proxy_opts $DNF_SSL_OPT config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+    # Global package-manager options (proxy + SSL)
+    DNF_OPTS=""
+
+    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+            DNF_OPTS+=" --setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        else
+            DNF_OPTS+=" --setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        fi
+    fi
+
+    [ -n "$DNF_SSL_OPT" ] && DNF_OPTS+=" $DNF_SSL_OPT"
+
+    sudo dnf $DNF_OPTS $DNF_SSL_OPT config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
@@ -4275,6 +4290,8 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_add:
+      - NET_BIND_SERVICE
     networks:
       - proxynet
     ports:
