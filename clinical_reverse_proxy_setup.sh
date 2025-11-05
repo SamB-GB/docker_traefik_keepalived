@@ -2867,45 +2867,103 @@ fi
 ### START Attempt to auto-detect network interfaces on backup nodes
 echo ""
 echo "=========================================="
-echo "Auto-Detecting Network Interfaces"
+echo "Network Interfaces"
 echo "=========================================="
 echo ""
 
 for i in "${!BACKUP_NODES[@]}"; do
-    node="${BACKUP_NODES[$i]}"
-    ip="${BACKUP_IPS[$i]}"
-    
-    echo -n "Detecting interface on $node ($ip)... "
-    
-    # Now SSH is fully configured and working
-    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-            "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
-    else
-        detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-            "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
-    fi
-    
-    if [ -n "$detected_interface" ]; then
-        echo "✓ $detected_interface"
-        BACKUP_INTERFACES[$i]="$detected_interface"
-    else
-        echo "❌ Auto-detection failed"
-        echo "Available interfaces on $node:"
+    if [ "${BACKUP_INTERFACES[$i]}" = "Will be auto-detected after SSH setup" ]; then
+        node="${BACKUP_NODES[$i]}"
+        ip="${BACKUP_IPS[$i]}"
+        
+        echo "Interface detection for $node ($ip):"
+        
+        # Attempt auto-detection
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                "ip -o link show | awk '{print \$2}' | sed 's/:$//' | grep -v lo"
+            detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
         else
-            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                "ip -o link show | awk '{print \$2}' | sed 's/:$//' | grep -v lo"
+            detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
         fi
-        read -p "Enter interface name for $node: " manual_interface
-        BACKUP_INTERFACES[$i]="$manual_interface"
+        
+        if [ -n "$detected_interface" ]; then
+            # Auto-detection succeeded - give user choice
+            echo "  Detected interface: $detected_interface"
+            echo ""
+            
+            # Loop until valid input
+            while true; do
+                read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
+                use_detected=${use_detected:-yes}
+                
+                case "${use_detected,,}" in
+                    yes|y)
+                        BACKUP_INTERFACES[$i]="$detected_interface"
+                        echo "  ✓ Using detected interface: $detected_interface"
+                        break
+                        ;;
+                    no|n)
+                        echo ""
+                        echo "  Available interfaces on $node:"
+                        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+                        else
+                            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+                        fi
+                        echo ""
+                        read -p "  Enter interface name: " custom_interface
+                        BACKUP_INTERFACES[$i]="$custom_interface"
+                        echo "  ✓ Using custom interface: $custom_interface"
+                        break
+                        ;;
+                    custom|c)
+                        echo ""
+                        echo "  Available interfaces on $node:"
+                        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+                        else
+                            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+                        fi
+                        echo ""
+                        read -p "  Enter interface name: " custom_interface
+                        BACKUP_INTERFACES[$i]="$custom_interface"
+                        echo "  ✓ Using custom interface: $custom_interface"
+                        break
+                        ;;
+                    *)
+                        echo "  ERROR: Invalid input. Please enter 'yes', 'no', or 'custom'"
+                        continue
+                        ;;
+                esac
+            done
+        else
+            # Auto-detection failed - prompt for manual entry
+            echo "  ⚠️  Auto-detection failed"
+            echo ""
+            echo "  Available interfaces on $node:"
+            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+            else
+                ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
+            fi
+            echo ""
+            read -p "  Enter interface name: " manual_interface
+            BACKUP_INTERFACES[$i]="$manual_interface"
+            echo "  ✓ Using interface: $manual_interface"
+        fi
+        
+        echo ""
     fi
 done
 
-echo ""
-echo "✓ Network interface detection complete"
+echo "✓ Network interface configuration complete"
 echo ""
 ### END Auto-detect network interfaces on backup nodes
 ######################################################
