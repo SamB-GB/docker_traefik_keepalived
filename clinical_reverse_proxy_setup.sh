@@ -426,6 +426,10 @@ validate_os() {
             echo "✓ Version: $OS_VERSION"
         fi
     fi
+    
+    # Check for required commands
+    echo "Checking required commands..."
+    local missing=0
 
     # Check for sudo
     if ! command -v sudo &> /dev/null; then
@@ -487,7 +491,7 @@ check_execution_context() {
     else
         # Try with password prompt
         if sudo -v 2>/dev/null; then
-            echo "✓"
+            echo "✓ Password verified"
         else
             echo "❌ FAILED"
             echo ""
