@@ -1836,9 +1836,9 @@ prompt_multi_node_deployment() {
         local all_valid=true
         for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
             local priority=$((100 - ((i - 1) * 10)))
-            
+    
             echo "Backup Node #$i (priority $priority):"
-            
+    
             # Get hostname
             local backup_hostname=""
             while [[ -z "$backup_hostname" ]]; do
@@ -1847,19 +1847,19 @@ prompt_multi_node_deployment() {
                     echo "  ERROR: Hostname cannot be empty"
                 fi
             done
-            
+    
             # Get IP with validation
             local backup_ip=""
             local ip_valid=false
             while [ "$ip_valid" = false ]; do
                 read -p "  IP address: " backup_ip
-                
+        
                 # Validate IP format
                 if ! validate_ip "$backup_ip"; then
                     echo "  ERROR: Invalid IP address format"
                     continue
                 fi
-                
+        
                 # Check for duplicates
                 if [[ -n "${IP_MAP[$backup_ip]}" ]]; then
                     if [[ "$backup_ip" == "$MASTER_IP" ]]; then
@@ -1869,89 +1869,18 @@ prompt_multi_node_deployment() {
                     fi
                     continue
                 fi
-                
+        
                 # IP is valid and unique
                 ip_valid=true
                 IP_MAP["$backup_ip"]=1
             done
-            
-            # Auto-detect network interface for this backup node
-            local detected_interface=""
-            local interface_confirmed=false
-
-            echo -n "  Detecting network interface for $backup_ip... "
-
-            # Try SSH-based detection if we have credentials
-            # First check if we can reach the node at all
-            if timeout 3 ping -c 1 -W 1 "$backup_ip" &>/dev/null; then
-                # Try to detect interface via SSH
-                if command -v ssh &>/dev/null; then
-                    # Attempt passwordless SSH first (keys might already be set up)
-                    detected_interface=$(timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 \
-                        -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
-                        "$CURRENT_USER@$backup_ip" \
-                        "ip -o addr show | grep 'inet $backup_ip' | awk '{print \$2}' | head -1" 2>/dev/null || echo "")
-        
-                    if [ -n "$detected_interface" ]; then
-                        echo "✓ Detected: $detected_interface"
-                    else
-                        echo "⚠️  Could not auto-detect (SSH not available yet)"
-                        detected_interface=""
-                    fi
-                else
-                    echo "⚠️  SSH not available for detection"
-                fi
-            else
-                echo "⚠️  Node not reachable (will detect later)"
-            fi
-
-            # Prompt for interface with detected value as default
-            local backup_interface=""
-            if [ -n "$detected_interface" ]; then
-                echo "  Network interface detected: $detected_interface"
     
-                # Loop until valid input
-                while true; do
-                    read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
-                    use_detected=${use_detected:-yes}
-        
-                    case "${use_detected,,}" in
-                        yes|y)
-                            backup_interface="$detected_interface"
-                            break
-                            ;;
-                        no|n)
-                            read -p "  Enter interface name: " backup_interface
-                            break
-                            ;;
-                        custom|c)
-                            read -p "  Enter interface name: " backup_interface
-                            break
-                            ;;
-                        *)
-                            echo "  ERROR: Invalid input. Please enter 'yes', 'no', or 'custom'"
-                            continue
-                            ;;
-                    esac
-                done
-            else
-                # No detection possible, prompt directly
-                echo "  Network interface (e.g., eth0, ens33, enp0s3):"
-                echo "    Note: This is the interface with IP $backup_ip"
-                echo "    We'll verify this later during deployment"
-                read -p "  Interface name: " backup_interface
-            fi
-
-            # Validate interface name format (basic check)
-            while [[ -z "$backup_interface" ]]; do
-                echo "  ERROR: Interface name cannot be empty"
-                read -p "  Interface name: " backup_interface
-            done
-            
-            # Store the values
+            # Store values - interface will be detected after SSH setup
             BACKUP_NODES+=("$backup_hostname")
             BACKUP_IPS+=("$backup_ip")
-            BACKUP_INTERFACES+=("$backup_interface")
+            BACKUP_INTERFACES+=("Will be auto-detected after SSH setup")  # Mark for later auto-detection
+    
+            echo "  Network interface: Will be auto-detected after SSH setup"
             echo ""
         done
         
@@ -2761,70 +2690,6 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "Multi-Node SSH Setup"
     echo "=========================================="
     echo ""
-    
-    # Check SSH connectivity to all backup nodes
-    echo "Checking SSH connectivity to backup nodes..."
-    echo ""
-    
-    SSH_CHECK_FAILED=0
-    FAILED_SSH_HOSTS=()
-    
-    for i in "${!BACKUP_NODES[@]}"; do
-        node="${BACKUP_NODES[$i]}"
-        ip="${BACKUP_IPS[$i]}"
-        
-        echo -n "Testing SSH to $node ($ip)... "
-        
-        if timeout 5 ssh -o ConnectTimeout=3 \
-                        -o BatchMode=yes \
-                        -o StrictHostKeyChecking=no \
-                        -o UserKnownHostsFile=/dev/null \
-                        -o LogLevel=ERROR \
-                        "$CURRENT_USER@$ip" "exit" 2>/dev/null; then
-            echo "✓ Reachable"
-        else
-            if command -v nc &> /dev/null; then
-                if timeout 3 nc -z -w 2 "$ip" 22 2>/dev/null; then
-                    echo "✓ Reachable (authentication required, which is expected)"
-                else
-                    echo "❌ FAILED - Port 22 not reachable"
-                    SSH_CHECK_FAILED=1
-                    FAILED_SSH_HOSTS+=("$node ($ip)")
-                fi
-            else
-                if ping -c 1 -W 2 "$ip" &>/dev/null; then
-                    echo "⚠️  Host responds to ping, but SSH check inconclusive"
-                else
-                    echo "❌ FAILED - Host unreachable"
-                    SSH_CHECK_FAILED=1
-                    FAILED_SSH_HOSTS+=("$node ($ip)")
-                fi
-            fi
-        fi
-    done
-    
-    echo ""
-    
-    if [ $SSH_CHECK_FAILED -eq 1 ]; then
-        echo "=========================================="
-        echo "❌ ERROR: SSH Connectivity Check Failed"
-        echo "=========================================="
-        echo "Cannot reach SSH service on:"
-        for failed in "${FAILED_SSH_HOSTS[@]}"; do
-            echo "  - $failed"
-        done
-        echo ""
-        read -p "Continue anyway? Setup will likely fail. [y/N]: " CONTINUE_ANYWAY
-        if [[ ! "$CONTINUE_ANYWAY" =~ ^[Yy]$ ]]; then
-            echo "Installation cancelled."
-            cleanup
-            exit 1
-        fi
-    else
-        echo "✓ SSH service is reachable on all backup nodes"
-    fi
-    
-    echo ""
     echo "Setting up SSH keys for passwordless access..."
     echo ""
     
@@ -2997,6 +2862,53 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "✓ Sudo verified on all backup nodes"
     echo ""
 fi
+
+######################################################
+### START Attempt to auto-detect network interfaces on backup nodes
+echo ""
+echo "=========================================="
+echo "Auto-Detecting Network Interfaces"
+echo "=========================================="
+echo ""
+
+for i in "${!BACKUP_NODES[@]}"; do
+    node="${BACKUP_NODES[$i]}"
+    ip="${BACKUP_IPS[$i]}"
+    
+    echo -n "Detecting interface on $node ($ip)... "
+    
+    # Now SSH is fully configured and working
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+            "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
+    else
+        detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+            "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
+    fi
+    
+    if [ -n "$detected_interface" ]; then
+        echo "✓ $detected_interface"
+        BACKUP_INTERFACES[$i]="$detected_interface"
+    else
+        echo "❌ Auto-detection failed"
+        echo "Available interfaces on $node:"
+        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                "ip -o link show | awk '{print \$2}' | sed 's/:$//' | grep -v lo"
+        else
+            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                "ip -o link show | awk '{print \$2}' | sed 's/:$//' | grep -v lo"
+        fi
+        read -p "Enter interface name for $node: " manual_interface
+        BACKUP_INTERFACES[$i]="$manual_interface"
+    fi
+done
+
+echo ""
+echo "✓ Network interface detection complete"
+echo ""
+### END Auto-detect network interfaces on backup nodes
+######################################################
 
 ### END Multi-Node SSH Setup
 ######################################################
