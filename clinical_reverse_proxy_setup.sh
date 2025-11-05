@@ -3585,6 +3585,8 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_add:
+      - NET_BIND_SERVICE
     networks:
       - proxynet
     ports:
