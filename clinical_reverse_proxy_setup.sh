@@ -965,7 +965,6 @@ if [[ "$1" == "--clean" ]]; then
     echo ""
     echo "Components to be removed:"
     echo "  - Traefik Docker container"
-    echo "  - Docker network (proxynet)"
     echo "  - Traefik configuration files (/home/haloap/traefik)"
     echo "  - SSL certificates"
     echo "  - Keepalived (if installed)"
@@ -1041,13 +1040,13 @@ else
 fi
 
 # Remove Docker network
-echo -n "Removing Docker network 'proxynet'... "
-if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
-    cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-    echo "✓ Removed"
-else
-    echo "Not found"
-fi
+#echo -n "Removing Docker network 'proxynet'... "
+#if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
+#    cleanup_docker_cmd network rm proxynet 2>/dev/null || true
+#    echo "✓ Removed"
+#else
+#    echo "Not found"
+#fi
 
 # Remove Traefik directories
 echo -n "Removing Traefik directories... "
@@ -1223,13 +1222,13 @@ REMOTECLEANUP
             fi
             
             # Remove Docker network
-            echo -n "Removing Docker network 'proxynet'... "
-            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
-                cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-                echo "✓ Removed"
-            else
-                echo "Not found or Docker not accessible"
-            fi
+            # echo -n "Removing Docker network 'proxynet'... "
+            # if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
+            #     cleanup_docker_cmd network rm proxynet 2>/dev/null || true
+            #     echo "✓ Removed"
+            # else
+            #     echo "Not found or Docker not accessible"
+            # fi
             
             # Remove Traefik image (optional)
             if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd images 2>/dev/null | grep -q traefik; then
@@ -3290,7 +3289,7 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
         gnupg2 wget nano iproute ipcalc dnf-plugins-core
     )
     log "Cleaning dnf metadata..."
-    sudo dnf $dnf_PROXY_OPT clean all || exit_on_error "Failed to clean dnf metadata"
+    sudo dnf $DNF_PROXY_OPT clean all || exit_on_error "Failed to clean dnf metadata"
 fi
 
 # Install prerequisites using install_packages function
@@ -3351,7 +3350,7 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 
     [ -n "$DNF_SSL_OPT" ] && DNF_OPTS+=" $DNF_SSL_OPT"
 
-    sudo dnf $DNF_OPTS $DNF_SSL_OPT config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    sudo dnf $DNF_OPTS config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
@@ -3567,10 +3566,10 @@ if [[ ! -w "/home/haloap/traefik" ]]; then
 fi
 
 # Create a Docker network for Traefik
-log "Creating Docker network 'proxynet'..."
-if ! docker_cmd network inspect proxynet > /dev/null 2>&1; then
-    docker_cmd network create proxynet || exit_on_error "Failed to create Docker network"
-fi
+#log "Creating Docker network 'proxynet'..."
+#if ! docker_cmd network inspect proxynet > /dev/null 2>&1; then
+#    docker_cmd network create proxynet || exit_on_error "Failed to create Docker network"
+#fi
 
 # Create the docker-compose.yaml file for Traefik
 log "Creating docker-compose.yaml file..."
@@ -3585,14 +3584,10 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+      - label=type:container_runtime_t
     cap_add:
       - NET_BIND_SERVICE
-    networks:
-      - proxynet
-    ports:
-      - 80:80
-      - 443:443
-      - 8800:8800 # only required for keepalived check script
+    network_mode: "host"
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -3601,10 +3596,6 @@ services:
       - ./certs/cert.crt:/certs/cert.crt:ro
       - ./certs/server.key:/certs/server.key:ro
       - ./logs:/var/log
-
-networks:
-  proxynet:
-    external: true
 EOF
 
  # Set docker-compose.yaml permissions
@@ -3953,9 +3944,12 @@ get_network_interface() {
     echo "$interface"
 }
 
-# Get the network interface
-NETWORK_INTERFACE=$(get_network_interface)
-log "Using network interface: $NETWORK_INTERFACE"
+if [[ -z "$NETWORK_INTERFACE" ]]; then
+    log "⚠️  Network interface not set, prompting for configuration..."
+    NETWORK_INTERFACE=$(get_network_interface)
+else
+    log "Using previously configured network interface: $NETWORK_INTERFACE"
+fi
 
 # Prompt for virtual IP address (if not already loaded)
 if [[ -z "$VIRTUAL_IP" ]]; then
@@ -4209,7 +4203,7 @@ if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT update -qq
     sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
 elif command -v dnf &>/dev/null; then
-    sudo dnf $dnf_PROXY_OPT install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc
+    sudo dnf $DNF_PROXY_OPT install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc dnf-plugins-core
 fi
 
 # Install Docker
@@ -4292,14 +4286,10 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+      - label=type:container_runtime_t
     cap_add:
       - NET_BIND_SERVICE
-    networks:
-      - proxynet
-    ports:
-      - 80:80
-      - 443:443
-      - 8800:8800
+    network_mode: "host"
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -4308,10 +4298,6 @@ services:
       - ./certs/cert.crt:/certs/cert.crt:ro
       - ./certs/server.key:/certs/server.key:ro
       - ./logs:/var/log
-
-networks:
-  proxynet:
-    external: true
 DOCKERCOMPOSE
 
 # Create traefik.yml (same as master)
@@ -4345,9 +4331,9 @@ if [ -f "/tmp/clinical_conf.yml" ]; then
 fi
 
 # Create Docker network
-if ! docker network inspect proxynet > /dev/null 2>&1; then
-    docker network create proxynet
-fi
+# if ! docker network inspect proxynet > /dev/null 2>&1; then
+#    docker network create proxynet
+# fi
 
 # Start Traefik
 echo "Starting Traefik..."
@@ -4362,7 +4348,7 @@ echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT install -y keepalived
 elif command -v dnf &>/dev/null; then
-    sudo dnf $dnf_PROXY_OPT install -y keepalived
+    sudo dnf $DNF_PROXY_OPT install -y keepalived
 fi
 
 # Create keepalived_script user/group
