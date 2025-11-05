@@ -4219,8 +4219,12 @@ elif command -v dnf &>/dev/null; then
 fi
 
 # Install Docker
+echo "Installing Docker..."
+
 if command -v apt-get &>/dev/null; then
+    # Debian/Ubuntu Docker installation
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+        echo "Adding Docker repository..."
         sudo install -m 0755 -d /etc/apt/keyrings
         curl $CURL_DOWNLOAD_OPTS -fsSL https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
@@ -4229,8 +4233,34 @@ if command -v apt-get &>/dev/null; then
         
         sudo apt-get $APT_PROXY_OPT update -qq
     fi
+    
+    echo "Installing Docker packages..."
     sudo apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
+    
+elif command -v dnf &>/dev/null; then
+    # RHEL/Rocky/CentOS Docker installation
+    if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
+        echo "Adding Docker repository..."
+        sudo dnf $DNF_PROXY_OPT config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    fi
+    
+    echo "Installing Docker packages..."
+    sudo dnf $DNF_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
+    
+else
+    echo "ERROR: No supported package manager found (apt or dnf)"
+    exit 1
 fi
+
+echo "✓ Docker installed successfully"
+
+# Verify Docker installation
+if ! command -v docker &>/dev/null; then
+    echo "ERROR: Docker installation failed - docker command not found"
+    exit 1
+fi
+
+docker --version
 
 # Configure Docker proxy if needed
 if [ -n "$PROXY" ]; then
