@@ -426,17 +426,6 @@ validate_os() {
             echo "✓ Version: $OS_VERSION"
         fi
     fi
-    
-    # Check for required commands
-    echo "Checking required commands..."
-    local missing=0
-    
-    for cmd in curl wget; do
-        if ! command -v $cmd &> /dev/null; then
-            echo "❌ $cmd not found"
-            missing=1
-        fi
-    done
 
     # Check for sudo
     if ! command -v sudo &> /dev/null; then
