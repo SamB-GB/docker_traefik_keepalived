@@ -1875,14 +1875,18 @@ prompt_multi_node_deployment() {
                 IP_MAP["$backup_ip"]=1
             done
     
-            # Store values - interface will be detected after SSH setup
+            # Store values - NO interface prompt yet
             BACKUP_NODES+=("$backup_hostname")
             BACKUP_IPS+=("$backup_ip")
-            BACKUP_INTERFACES+=("Will be auto-detected after SSH setup")  # Mark for later auto-detection
+            BACKUP_INTERFACES+=("")  # Empty - will be configured after SSH setup
     
-            echo "  Network interface: Will be auto-detected after SSH setup"
+            echo "  ✓ Node added"
             echo ""
         done
+
+        echo ""
+        echo "Note: Network interfaces will be configured after SSH setup"
+        echo ""
         
         # Display summary with interfaces
         echo "=========================================="
@@ -2865,106 +2869,249 @@ fi
 
 ######################################################
 ### START Attempt to auto-detect network interfaces on backup nodes
-echo ""
-echo "=========================================="
-echo "Network Interfaces"
-echo "=========================================="
-echo ""
 
-for i in "${!BACKUP_NODES[@]}"; do
-    if [ "${BACKUP_INTERFACES[$i]}" = "Will be auto-detected after SSH setup" ]; then
-        node="${BACKUP_NODES[$i]}"
-        ip="${BACKUP_IPS[$i]}"
-        
-        echo "Interface detection for $node ($ip):"
-        
-        # Attempt auto-detection
-        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
-        else
-            detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
-        fi
-        
-        if [ -n "$detected_interface" ]; then
-            # Auto-detection succeeded - give user choice
-            echo "  Detected interface: $detected_interface"
-            echo ""
-            
-            # Loop until valid input
-            while true; do
-                read -p "  Use this interface? (yes/no/custom) [yes]: " use_detected
-                use_detected=${use_detected:-yes}
-                
-                case "${use_detected,,}" in
-                    yes|y)
-                        BACKUP_INTERFACES[$i]="$detected_interface"
-                        echo "  ✓ Using detected interface: $detected_interface"
-                        break
-                        ;;
-                    no|n)
-                        echo ""
-                        echo "  Available interfaces on $node:"
-                        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-                        else
-                            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-                        fi
-                        echo ""
-                        read -p "  Enter interface name: " custom_interface
-                        BACKUP_INTERFACES[$i]="$custom_interface"
-                        echo "  ✓ Using custom interface: $custom_interface"
-                        break
-                        ;;
-                    custom|c)
-                        echo ""
-                        echo "  Available interfaces on $node:"
-                        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                            sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-                        else
-                            ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                                "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-                        fi
-                        echo ""
-                        read -p "  Enter interface name: " custom_interface
-                        BACKUP_INTERFACES[$i]="$custom_interface"
-                        echo "  ✓ Using custom interface: $custom_interface"
-                        break
-                        ;;
-                    *)
-                        echo "  ERROR: Invalid input. Please enter 'yes', 'no', or 'custom'"
-                        continue
-                        ;;
-                esac
-            done
-        else
-            # Auto-detection failed - prompt for manual entry
-            echo "  ⚠️  Auto-detection failed"
-            echo ""
-            echo "  Available interfaces on $node:"
-            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                    "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-            else
-                ssh $SSH_OPTS "$CURRENT_USER@$ip" \
-                    "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo"
-            fi
-            echo ""
-            read -p "  Enter interface name: " manual_interface
-            BACKUP_INTERFACES[$i]="$manual_interface"
-            echo "  ✓ Using interface: $manual_interface"
-        fi
-        
+if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
+    echo ""
+    echo "=========================================="
+    echo "Network Interface Configuration"
+    echo "=========================================="
+    echo ""
+    echo "Configuring network interfaces for Keepalived Virtual IP..."
+    echo ""
+    
+    # ==========================================
+    # Configure Master Node Interface
+    # ==========================================
+    
+    echo "Master Node Configuration ($MASTER_HOSTNAME - $MASTER_IP):"
+    echo ""
+    
+    # Attempt auto-detection for master
+    echo "Attempting to detect network interface..."
+    master_detected_interface=$(ip -o addr show | grep "inet $MASTER_IP" | awk '{print $2}' | head -1)
+    
+    if [ -n "$master_detected_interface" ]; then
+        echo "  ✓ Detected interface: $master_detected_interface"
         echo ""
+        
+        # Show all available interfaces
+        echo "  All available interfaces on this system:"
+        ip -o link show | awk '{print "    - " $2}' | sed 's/:$//' | grep -v lo
+        echo ""
+        
+        # Prompt user
+        while true; do
+            read -p "  Use detected interface '$master_detected_interface'? (yes/no/list) [yes]: " use_detected
+            use_detected=${use_detected:-yes}
+            
+            case "${use_detected,,}" in
+                yes|y)
+                    NETWORK_INTERFACE="$master_detected_interface"
+                    echo "  ✓ Master interface set to: $NETWORK_INTERFACE"
+                    break
+                    ;;
+                no|n|list|l)
+                    echo ""
+                    echo "  Available interfaces:"
+                    ip -o link show | awk '{print "    - " $2}' | sed 's/:$//' | grep -v lo
+                    echo ""
+                    read -p "  Enter interface name: " custom_interface
+                    
+                    if ip link show "$custom_interface" &>/dev/null; then
+                        NETWORK_INTERFACE="$custom_interface"
+                        echo "  ✓ Master interface set to: $NETWORK_INTERFACE"
+                        break
+                    else
+                        echo "  ⚠️  Interface '$custom_interface' not found"
+                        read -p "  Use it anyway? (yes/no) [no]: " use_anyway
+                        if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                            NETWORK_INTERFACE="$custom_interface"
+                            echo "  ⚠️  Master interface set to: $NETWORK_INTERFACE (unverified)"
+                            break
+                        fi
+                    fi
+                    ;;
+                *)
+                    echo "  ERROR: Please enter 'yes', 'no', or 'list'"
+                    continue
+                    ;;
+            esac
+        done
+    else
+        echo "  ⚠️  Auto-detection failed"
+        echo ""
+        echo "  Available interfaces on this system:"
+        ip -o link show | awk '{print "    - " $2}' | sed 's/:$//' | grep -v lo
+        echo ""
+        
+        while true; do
+            read -p "  Enter interface name: " manual_interface
+            if [ -z "$manual_interface" ]; then
+                echo "  ERROR: Interface name cannot be empty"
+                continue
+            fi
+            
+            if ip link show "$manual_interface" &>/dev/null; then
+                NETWORK_INTERFACE="$manual_interface"
+                echo "  ✓ Master interface set to: $NETWORK_INTERFACE"
+                break
+            else
+                echo "  ⚠️  Interface '$manual_interface' not found"
+                read -p "  Use it anyway? (yes/no) [no]: " use_anyway
+                if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                    NETWORK_INTERFACE="$manual_interface"
+                    echo "  ⚠️  Master interface set to: $NETWORK_INTERFACE (unverified)"
+                    break
+                fi
+            fi
+        done
     fi
-done
+    
+    echo ""
+    
+    # ==========================================
+    # Configure Backup Node Interfaces
+    # ==========================================
+    
+    if [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
+        echo "Backup Nodes Configuration:"
+        echo ""
+        
+        for i in "${!BACKUP_NODES[@]}"; do
+            node="${BACKUP_NODES[$i]}"
+            ip="${BACKUP_IPS[$i]}"
+            
+            echo "  Configuring $node ($ip):"
+            
+            # Attempt auto-detection
+            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
+            else
+                detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
+            fi
+            
+            if [ -n "$detected_interface" ]; then
+                echo "    ✓ Detected interface: $detected_interface"
+                
+                # Show available interfaces
+                echo "    Available interfaces on $node:"
+                if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                    sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
+                else
+                    ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
+                fi
+                echo ""
+                
+                # Prompt user
+                while true; do
+                    read -p "    Use detected interface '$detected_interface'? (yes/no/list) [yes]: " use_detected
+                    use_detected=${use_detected:-yes}
+                    
+                    case "${use_detected,,}" in
+                        yes|y)
+                            BACKUP_INTERFACES[$i]="$detected_interface"
+                            echo "    ✓ Interface set to: $detected_interface"
+                            break
+                            ;;
+                        no|n|list|l)
+                            echo ""
+                            read -p "    Enter interface name: " custom_interface
+                            
+                            # Validate on remote
+                            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                                interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                    "ip link show $custom_interface 2>/dev/null" 2>/dev/null)
+                            else
+                                interface_exists=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                    "ip link show $custom_interface 2>/dev/null" 2>/dev/null)
+                            fi
+                            
+                            if [ -n "$interface_exists" ]; then
+                                BACKUP_INTERFACES[$i]="$custom_interface"
+                                echo "    ✓ Interface set to: $custom_interface"
+                                break
+                            else
+                                echo "    ⚠️  Interface '$custom_interface' not found on $node"
+                                read -p "    Use it anyway? (yes/no) [no]: " use_anyway
+                                if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                                    BACKUP_INTERFACES[$i]="$custom_interface"
+                                    echo "    ⚠️  Interface set to: $custom_interface (unverified)"
+                                    break
+                                fi
+                            fi
+                            ;;
+                        *)
+                            echo "    ERROR: Please enter 'yes', 'no', or 'list'"
+                            continue
+                            ;;
+                    esac
+                done
+            else
+                echo "    ⚠️  Auto-detection failed"
+                echo "    Available interfaces on $node:"
+                if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                    sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
+                else
+                    ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
+                fi
+                echo ""
+                
+                while true; do
+                    read -p "    Enter interface name for $node: " manual_interface
+                    if [ -z "$manual_interface" ]; then
+                        echo "    ERROR: Interface name cannot be empty"
+                        continue
+                    fi
+                    
+                    # Validate on remote
+                    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                        interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                            "ip link show $manual_interface 2>/dev/null" 2>/dev/null)
+                    else
+                        interface_exists=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                            "ip link show $manual_interface 2>/dev/null" 2>/dev/null)
+                    fi
+                    
+                    if [ -n "$interface_exists" ]; then
+                        BACKUP_INTERFACES[$i]="$manual_interface"
+                        echo "    ✓ Interface set to: $manual_interface"
+                        break
+                    else
+                        echo "    ⚠️  Interface '$manual_interface' not found on $node"
+                        read -p "    Use it anyway? (yes/no) [no]: " use_anyway
+                        if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                            BACKUP_INTERFACES[$i]="$manual_interface"
+                            echo "    ⚠️  Interface set to: $manual_interface (unverified)"
+                            break
+                        fi
+                    fi
+                done
+            fi
+            
+            echo ""
+        done
+    fi
+    
+    echo "=========================================="
+    echo "✓ Network Interface Configuration Complete"
+    echo "=========================================="
+    echo ""
+    echo "Summary:"
+    echo "  Master: $MASTER_HOSTNAME - Interface: $NETWORK_INTERFACE"
+    if [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
+        for i in "${!BACKUP_NODES[@]}"; do
+            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} - Interface: ${BACKUP_INTERFACES[$i]}"
+        done
+    fi
+    echo ""
+fi
 
-echo "✓ Network interface configuration complete"
-echo ""
 ### END Auto-detect network interfaces on backup nodes
 ######################################################
 
@@ -3616,15 +3763,13 @@ echo ""
 ######################################################
 ### START KeepAlived Installation
 
-# In multi-node mode, Keepalived is always installed
-# In single-node mode, ask user
+# Keepalived is ONLY for multi-node deployments
 if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     INSTALL_KEEPALIVED="yes"
-    log "Multi-node deployment: Keepalived will be installed automatically"
+    log "Multi-node deployment: Keepalived will be installed for HA"
 else
-    # Ask user if Keepalived should be installed
-    read -p "Do you want to install and configure Keepalived? (yes/no): " INSTALL_KEEPALIVED
-    INSTALL_KEEPALIVED=$(echo "$INSTALL_KEEPALIVED" | tr '[:upper:]' '[:lower:]')
+    INSTALL_KEEPALIVED="no"
+    log "Single-node deployment: Keepalived not needed"
 fi
 
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
