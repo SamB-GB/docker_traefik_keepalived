@@ -759,7 +759,7 @@ check_single_node() {
     if [ "$check_type" = "remote" ]; then
         # Check DNS resolution
         echo -n "  DNS resolution... "
-        DNS_TEST=$(run_check "nslookup registry-1.docker.io >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
+        DNS_TEST=$(run_check "getent hosts registry-1.docker.io >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
         
         if echo "$DNS_TEST" | grep -q "OK"; then
             echo "✓ Working"
@@ -2901,7 +2901,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         
         # Prompt user
         while true; do
-            read -p "  Use detected interface '$master_detected_interface'? (yes/no/list) [yes]: " use_detected
+            read -p "  Use detected interface '$master_detected_interface'? (yes/no/other) [yes]: " use_detected
             use_detected=${use_detected:-yes}
             
             case "${use_detected,,}" in
@@ -2910,7 +2910,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                     echo "  ✓ Master interface set to: $NETWORK_INTERFACE"
                     break
                     ;;
-                no|n|list|l)
+                no|n|other|l)
                     echo ""
                     echo "  Available interfaces:"
                     ip -o link show | awk '{print "    - " $2}' | sed 's/:$//' | grep -v lo
@@ -2932,7 +2932,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                     fi
                     ;;
                 *)
-                    echo "  ERROR: Please enter 'yes', 'no', or 'list'"
+                    echo "  ERROR: Please enter 'yes', 'no', or 'other'"
                     continue
                     ;;
             esac
@@ -3008,7 +3008,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                 
                 # Prompt user
                 while true; do
-                    read -p "    Use detected interface '$detected_interface'? (yes/no/list) [yes]: " use_detected
+                    read -p "    Use detected interface '$detected_interface'? (yes/no/other) [yes]: " use_detected
                     use_detected=${use_detected:-yes}
                     
                     case "${use_detected,,}" in
@@ -3017,7 +3017,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                             echo "    ✓ Interface set to: $detected_interface"
                             break
                             ;;
-                        no|n|list|l)
+                        no|n|other|l)
                             echo ""
                             read -p "    Enter interface name: " custom_interface
                             
@@ -3045,7 +3045,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                             fi
                             ;;
                         *)
-                            echo "    ERROR: Please enter 'yes', 'no', or 'list'"
+                            echo "    ERROR: Please enter 'yes', 'no', or 'other'"
                             continue
                             ;;
                     esac
