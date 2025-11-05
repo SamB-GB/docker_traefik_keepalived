@@ -3289,7 +3289,7 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
   elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     PREREQ_PACKAGES=(
         ca-certificates curl dnf-utils
-        gnupg2 wget nano iproute ipcalc
+        gnupg2 wget nano iproute ipcalc dnf-plugins-core
     )
     log "Cleaning dnf metadata..."
     sudo dnf $dnf_PROXY_OPT clean all || exit_on_error "Failed to clean dnf metadata"
@@ -3338,7 +3338,7 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
 elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     log "Installing Docker via dnf..."
     # Add Docker repo
-    sudo dnf-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
