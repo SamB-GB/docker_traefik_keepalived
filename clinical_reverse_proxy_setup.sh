@@ -4122,6 +4122,7 @@ echo ""
 # Proxy support
 PROXY="__PROXY__"
 APT_SSL_OPT="__APT_SSL_OPT__"
+DNF_SSL_OPT="__DNF_SSL_OPT__"
 WGET_SSL_OPT="__WGET_SSL_OPT__"
 
 if [ -n "$PROXY" ]; then
@@ -4141,8 +4142,19 @@ if [ -n "$PROXY" ]; then
     export https_proxy="http://$PROXY"
     export no_proxy="localhost,127.0.0.1"
     APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
+    DNF_PROXY_OPT="--setopt=proxy=http://$PROXY"
 else
     APT_PROXY_OPT=""
+    DNF_PROXY_OPT=""
+fi
+
+# Add SSL options if configured
+if [ -n "$APT_SSL_OPT" ]; then
+    APT_PROXY_OPT="$APT_PROXY_OPT $APT_SSL_OPT"
+fi
+
+if [ -n "$DNF_SSL_OPT" ]; then
+    DNF_PROXY_OPT="$DNF_PROXY_OPT $DNF_SSL_OPT"
 fi
 
 # Use proxy and SSL options if configured
@@ -4460,6 +4472,7 @@ fi
         sed -i "s/BACKUP_INTERFACE_PLACEHOLDER/${BACKUP_INTERFACES[$i]}/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__PROXY__|${PROXY_VAL}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__APT_SSL_OPT__|${APT_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
