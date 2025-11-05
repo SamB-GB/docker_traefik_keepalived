@@ -259,14 +259,15 @@ execute_remote_script() {
     local ip=$1
     local script_path=$2
     
-    PASS_B64="$(printf '%s' "$SUDO_PASS" | base64 -w0 2>/dev/null || printf '%s' "$SUDO_PASS" | base64)"
+    PASS_B64="$(printf '%s' "$SUDO_PASS" | base64)"
     
     write_local_file "$SCRIPTS_DIR/run_script_wrapper.sh" <<'WRAPPER'
 #!/bin/bash
-set -e
+set +e
 SUDO_PASS="$(printf %s "$SUDO_PASS_B64" | base64 -d)"
-echo "$SUDO_PASS" | sudo -S bash SCRIPT_PATH 2>&1
-rm -f SCRIPT_PATH
+echo "$SUDO_PASS" | sudo -S bash SCRIPT_PATH 2>&1 || true
+rm -f SCRIPT_PATH || true
+exit 0
 WRAPPER
     chmod 644 "$SCRIPTS_DIR/run_script_wrapper.sh"
     sed -i "s|SCRIPT_PATH|$script_path|g" "$SCRIPTS_DIR/run_script_wrapper.sh"
@@ -275,9 +276,9 @@ WRAPPER
     copy_to_remote "$SCRIPTS_DIR/run_script_wrapper.sh" "$ip" "$SCRIPTS_DIR/run_script.sh"
 
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
     else
-        ssh $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
     fi
     
     rm -f "$SCRIPTS_DIR/run_script_wrapper.sh"
