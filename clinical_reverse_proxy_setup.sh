@@ -3583,6 +3583,7 @@ services:
     image: docker.io/library/traefik:latest
     container_name: traefik
     restart: unless-stopped
+    user: "0"
     security_opt:
       - no-new-privileges:true
     cap_add:
@@ -4292,6 +4293,7 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    user: "0"
     cap_add:
       - NET_BIND_SERVICE
     networks:
