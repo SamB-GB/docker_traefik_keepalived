@@ -3594,6 +3594,12 @@ chmod 640 "$DOCKER_COMPOSE_FILE"
 log "Creating traefik.yml configuration file..."
 TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
 
+# Ensure traefik.yml is not a directory from previous failed runs
+if [[ -d "$TRAEFIK_CONFIG_FILE" ]]; then
+    log "Removing incorrectly created directory: $TRAEFIK_CONFIG_FILE"
+    sudo rm -rf "$TRAEFIK_CONFIG_FILE" || exit_on_error "Failed to remove directory $TRAEFIK_CONFIG_FILE"
+fi
+
 backup_file "$TRAEFIK_CONFIG_FILE"
 
 tee "$TRAEFIK_CONFIG_FILE" > /dev/null <<EOF
@@ -3639,6 +3645,12 @@ EOF
 # Create a complete clinical_conf.yml configuration file
 log "Creating clinical_conf.yml configuration file..."
 TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
+
+# Ensure clinical_conf.yml is not a directory from previous failed runs
+if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
+    log "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
+    sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || exit_on_error "Failed to remove directory $TRAEFIK_DYNAMIC_FILE"
+fi
 
 backup_file "$TRAEFIK_DYNAMIC_FILE"
 
