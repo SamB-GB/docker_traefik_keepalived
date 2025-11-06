@@ -2071,25 +2071,13 @@ EOF
     SecurityHeaders:
       headers:
         customResponseHeaders:
-          Strict-Transport-Security: "max-age=31536000; includeSubDomains; preload"
-          X-Content-Type-Options: "nosniff"
-          Server: ""
-          X-Frame-Options: ""
-          Content-Security-Policy: "frame-ancestors 'self' https://iframetester.com;"
-        frameDeny: false
+          Strict-Transport-Security: 'max-age=31536000; includeSubDomains; preload'
+          X-Content-Type-Options: 'nosniff'
+          Server: ''
+          X-Frame-Options : 'SAMEORIGIN'
         browserXssFilter: true
     compress:
       compress: {}
-    cookiesmanager:
-      plugin:
-        cookiesmanager:
-          adder:
-            - name: "SameSite"
-              value: "none"
-
-serversTransport:
-  default:
-    idleTimeout: 90m
 EOF
 
     else
@@ -2395,29 +2383,13 @@ EOF
     SecurityHeaders:
       headers:
         customResponseHeaders:
-          X-Forwarded-Proto: "https"
-          X-Frame-Options: "SAMEORIGIN"
-          X-XSS-Protection: "1; mode=block"
-          Strict-Transport-Security: "max-age=31536000; includeSubDomains"
-          X-Content-Type-Options: "nosniff"
-          Content-Security-Policy: "frame-ancestors 'self' https://iframetester.com;"
-        frameDeny: false
-        sslRedirect: true
+          Strict-Transport-Security: 'max-age=31536000; includeSubDomains; preload'
+          X-Content-Type-Options: 'nosniff'
+          Server: ''
+          X-Frame-Options : 'SAMEORIGIN'
         browserXssFilter: true
     compress:
       compress: {}
-    cookiesmanager:
-      plugin:
-        cookiesmanager:
-          adder:
-            - name: "SameSite"
-              value: "none"
-            - name: "Secure"
-              value: "true"
-
-serversTransport:
-  default:
-    idleTimeout: 90m
 EOF
 
     fi
@@ -2873,7 +2845,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "Network Interface Configuration"
     echo "=========================================="
     echo ""
-    echo "Configuring network interfaces for Keepalived Virtual IP..."
+    echo "Configuring network interfaces for Keepalived Virtual IP... Please set the network interface on each node the VIP should bind to"
     echo ""
     
     # ==========================================
@@ -3458,9 +3430,25 @@ if [[ -z "$CERT_FILE" ]]; then
     log "Prompting user for certificates..."
     CERT_DIR="/home/haloap/traefik/certs"
     
-    # Create directory with sudo and set proper ownership
+    # Create directory structure
+    log "Creating certificate directory..."
     sudo mkdir -p "$CERT_DIR"
-    sudo chown -R "$CURRENT_USER:$CURRENT_USER" /home/haloap 2>/dev/null || true
+    sudo mkdir -p /home/haloap/traefik/config
+    sudo mkdir -p /home/haloap/traefik/logs
+    
+    # Set proper ownership - REMOVE the || true to catch failures!
+    log "Setting ownership to $CURRENT_USER..."
+    CURRENT_GROUP=$(id -gn "$CURRENT_USER")
+    sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap || exit_on_error "Failed to set ownership on /home/haloap"
+    
+    # Verify permissions
+    if [ ! -w "$CERT_DIR" ]; then
+        log "ERROR: Cannot write to $CERT_DIR after ownership change"
+        ls -la "$CERT_DIR"
+        exit_on_error "Certificate directory is not writable"
+    fi
+    
+    log "✓ Certificate directory permissions verified"
     
     CERT_FILE="$CERT_DIR/cert.crt"
     KEY_FILE="$CERT_DIR/server.key"
@@ -3612,6 +3600,10 @@ tee "$TRAEFIK_CONFIG_FILE" > /dev/null <<EOF
 entryPoints:
   http:
     address: ':80'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
     http:
       redirections:
         entryPoint:
@@ -3619,6 +3611,10 @@ entryPoints:
           scheme: 'https'
   https:
     address: ':443'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
   ping:
     address: ':8800'
 ping:
@@ -4345,8 +4341,13 @@ DOCKERCOMPOSE
 # Create traefik.yml (same as master)
 cat > /home/haloap/traefik/config/traefik.yml <<'TRAEFIKCONF'
 entryPoints:
+entryPoints:
   http:
     address: ':80'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
     http:
       redirections:
         entryPoint:
@@ -4354,6 +4355,10 @@ entryPoints:
           scheme: 'https'
   https:
     address: ':443'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
   ping:
     address: ':8800'
 ping:
