@@ -15,11 +15,11 @@ set -e
 # HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/dnf)
 # Leave blank if no proxy is needed
 # Note: Passwords with special characters will be automatically URL-encoded
-PROXY_HOST="10.0.60.61"  # Example: "proxy.company.com"
-PROXY_PORT="3128"  # Example: "8080"
-PROXY_USER="sbarr"
-PROXY_PASSWORD="98lrxfn0a!" # Special characters will be handled automatically
-SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
+PROXY_HOST=""  # Example: "proxy.company.com"
+PROXY_PORT=""  # Example: "8080"
+PROXY_USER=""
+PROXY_PASSWORD="" # Special characters will be handled automatically
+SKIP_SSL_VERIFY="false"  # Set to "true" to disable SSL verification (not recommended)
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
@@ -35,6 +35,7 @@ LOGFILE="/var/log/installation.log"
 
 # Get the actual user running the script (before sudo elevation)
 CURRENT_USER="${SUDO_USER:-$USER}"
+CURRENT_GROUP=$(id -gn "$CURRENT_USER")
 
 # Get the actual user's home directory (not root's when using sudo)
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
@@ -3438,7 +3439,6 @@ if [[ -z "$CERT_FILE" ]]; then
     
     # Set proper ownership - REMOVE the || true to catch failures!
     log "Setting ownership to $CURRENT_USER..."
-    CURRENT_GROUP=$(id -gn "$CURRENT_USER")
     sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap || exit_on_error "Failed to set ownership on /home/haloap"
     
     # Verify permissions
@@ -3545,12 +3545,12 @@ echo ""
 # Create Docker & Traefik directories with proper ownership
 log "Creating Docker and Traefik directories..."
 sudo mkdir -p /home/haloap/traefik/{certs,config,logs}
-sudo chown -R "$CURRENT_USER:$CURRENT_USER" /home/haloap 2>/dev/null || true
+sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap 2>/dev/null || true
 
 # Verify ownership
 if [[ ! -w "/home/haloap/traefik" ]]; then
     log "Warning: /home/haloap/traefik not writable, attempting to fix ownership..."
-    sudo chown -R "$CURRENT_USER:$CURRENT_USER" /home/haloap || exit_on_error "Failed to set ownership on /home/haloap"
+    sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap || exit_on_error "Failed to set ownership on /home/haloap"
 fi
 
 # Create a Docker network for Traefik
@@ -3562,6 +3562,13 @@ fi
 # Create the docker-compose.yaml file for Traefik
 log "Creating docker-compose.yaml file..."
 DOCKER_COMPOSE_FILE="/home/haloap/traefik/docker-compose.yaml"
+
+# Ensure docker-compose.yaml is not a directory
+if [[ -d "$DOCKER_COMPOSE_FILE" ]]; then
+    log "Removing incorrectly created directory: $DOCKER_COMPOSE_FILE"
+    sudo rm -rf "$DOCKER_COMPOSE_FILE" || exit_on_error "Failed to remove directory"
+fi
+
 backup_file "$DOCKER_COMPOSE_FILE"
 
 tee "$DOCKER_COMPOSE_FILE" > /dev/null <<EOF
@@ -4206,6 +4213,8 @@ else
     ACTUAL_HOME="$HOME"
 fi
 
+CURRENT_GROUP=$(id -gn "$CURRENT_USER")
+
 echo "Installing as user: $CURRENT_USER"
 echo ""
 
@@ -4316,7 +4325,39 @@ fi
 
 # Create Traefik directories
 sudo mkdir -p /home/haloap/traefik/{certs,config,logs}
-sudo chown -R "$CURRENT_USER:$CURRENT_USER" /home/haloap
+sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
+
+TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
+TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
+DOCKER_COMPOSE_FILE="/home/haloap/traefik/docker-compose.yaml"
+
+# Ensure traefik.yml is not a directory (from manual creation or previous error)
+if [[ -d "$TRAEFIK_CONFIG_FILE" ]]; then
+    echo "Removing incorrectly created directory: $TRAEFIK_CONFIG_FILE"
+    sudo rm -rf "$TRAEFIK_CONFIG_FILE" || { echo "Failed to remove directory"; exit 1; }
+fi
+
+# Ensure clinical_conf.yml is not a directory (from manual creation or previous error)
+if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
+    echo "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
+    sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || { echo "Failed to remove directory"; exit 1; }
+fi
+
+# Ensure docker-compose.yaml is not a directory
+if [[ -d "$DOCKER_COMPOSE_FILE" ]]; then
+    echo "Removing incorrectly created directory: $DOCKER_COMPOSE_FILE"
+    sudo rm -rf "$DOCKER_COMPOSE_FILE" || { echo "Failed to remove directory"; exit 1; }
+fi
+
+# Ensure CERT_FILE and KEY_FILE are not directories
+if [[ -d "$CERT_FILE" ]]; then
+    echo "Removing directory $CERT_FILE"
+    rm -rf "$CERT_FILE" || exit_on_error "Failed to remove directory $CERT_FILE"
+fi
+if [[ -d "$KEY_FILE" ]]; then
+    echo "Removing directory $KEY_FILE"
+    rm -rf "$KEY_FILE" || exit_on_error "Failed to remove directory $KEY_FILE"
+fi
 
 # Copy certificates
 if [ -n "$SSL_CERT_CONTENT" ] && [ -n "$SSL_KEY_CONTENT" ]; then
@@ -4353,7 +4394,6 @@ DOCKERCOMPOSE
 # Create traefik.yml (same as master)
 cat > /home/haloap/traefik/config/traefik.yml <<'TRAEFIKCONF'
 entryPoints:
-entryPoints:
   http:
     address: ':80'
     transport:
@@ -4376,6 +4416,14 @@ entryPoints:
 ping:
   entryPoint: 'ping'
 
+#log:
+#  level: DEBUG
+#  filePath: "/var/log/traefik.log"
+
+#accessLog:
+#  filePath: "/var/log/access.log"
+#  bufferingSize: 100
+
 providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
@@ -4393,6 +4441,9 @@ fi
 # if ! docker network inspect proxynet > /dev/null 2>&1; then
 #    docker network create proxynet
 # fi
+
+# Set ownership
+sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
 
 # Start Traefik
 echo "Starting Traefik..."
