@@ -215,7 +215,38 @@ ensure_SCRIPTS_DIR() {
 
 # ==========================================
 # Proxy Strategy Implementation
+
+# Detect repo hosts that are reachable directly (no proxy)
+_detect_direct_repo_hosts() {
+    local hosts=()
+    local out=""
+
+    # Collect hosts from yum/dnf repo files
+    if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then
+        mapfile -t hosts < <(grep -hE '^(baseurl|mirrorlist)' /etc/yum.repos.d/*.repo 2>/dev/null \
+                              | grep -oE 'https?://[^/]+' \
+                              | sed -E 's#^https?://##' \
+                              | sort -u)
+    fi
+
+    # Probe each host directly (bypass proxy); keep those that answer
+    for h in "${hosts[@]}"; do
+        if timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "https://$h" >/dev/null 2>&1 || \
+           timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "http://$h"  >/dev/null 2>&1; then
+            out="${out}${out:+,}$h"
+        fi
+    done
+
+    echo "$out"
+}
 # ==========================================
+
+# Mask credentials in URLs for logging
+_mask_url_creds() {
+    local url="$1"
+    # Replace :password@ with :****@
+    echo "$url" | sed -E 's#(https?://[^:]+:)[^@]*(@)#\1****\2#g'
+}
 
 setup_proxy_strategy() {
     log "Configuring proxy strategy: ${PROXY_STRATEGY}"
@@ -257,17 +288,11 @@ setup_proxy_strategy() {
 
         # Auto-detect repo hosts from .repo files and add only those reachable DIRECT
         if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-            mapfile -t _hosts < <(grep -hE '^(baseurl|mirrorlist)' /etc/yum.repos.d/*.repo 2>/dev/null \
-                                   | grep -oE 'https?://[^/]+' \
-                                   | sed -E 's#^https?://##' \
-                                   | sort -u)
-            for h in "${_hosts[@]}"; do
-                # Quick direct probes (prefer https, then http) with short timeouts
-                if timeout 3 curl -sI ${CURL_SSL_OPT} "https://$h" >/dev/null 2>&1 || \
-                   timeout 3 curl -sI ${CURL_SSL_OPT} "http://$h"  >/dev/null 2>&1; then
-                    extra="${extra:+$extra,}$h"
-                fi
-            done
+            local detected
+            detected=$(_detect_direct_repo_hosts)
+            if [ -n "$detected" ]; then
+                extra="${extra:+$extra,}$detected"
+            fi
         fi
 
         # De-duplicate entries
@@ -332,8 +357,10 @@ setup_proxy_strategy() {
     # Export key proxy variables so they survive subshells
     export PROXY_STRATEGY DNF_PROXY_OPT APT_PROXY_OPT_PROXY PROXY_URL PROXY_URL_NO_CREDS http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
     log "✓ Proxy strategy configured: ${PROXY_STRATEGY}"
-    log "  http_proxy: ${http_proxy:-<not set>}"
-    log "  https_proxy: ${https_proxy:-<not set>}"
+    local _hp=$([ -n "${http_proxy:-}" ] && _mask_url_creds "$http_proxy" || echo "<not set>")
+    local _hps=$([ -n "${https_proxy:-}" ] && _mask_url_creds "$https_proxy" || echo "<not set>")
+    log "  http_proxy: ${_hp}"
+    log "  https_proxy: ${_hps}"
     log "  no_proxy: ${no_proxy:-<not set>}"
     return 0
 }
@@ -474,12 +501,75 @@ execute_remote_script() {
     local script_path=$2
     
     PASS_B64="$(printf '%s' "$SUDO_PASS" | base64)"
-    
+
     write_local_file "$SCRIPTS_DIR/run_script_wrapper.sh" <<'WRAPPER'
 #!/bin/bash
 set +e
+
+# === Receive inputs ===
 SUDO_PASS="$(printf %s "$SUDO_PASS_B64" | base64 -d)"
-echo "$SUDO_PASS" | sudo -S bash SCRIPT_PATH 2>&1 || true
+
+# The caller may pass these as env when invoking this wrapper over SSH
+# PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASSWORD, INTERNAL_REPO_DOMAINS, SKIP_SSL_VERIFY
+
+# === Minimal URL-encode for password (python3 -> jq -> manual) ===
+_urlenc() {
+  local s="$1" e=""
+  if command -v python3 >/dev/null 2>&1; then
+    e=$(python3 -c "import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=''))" "$s" 2>/dev/null) || e=""
+  fi
+  if [ -z "$e" ] && command -v jq >/dev/null 2>&1; then
+    e=$(printf '%s' "$s" | jq -sRr @uri 2>/dev/null) || e=""
+  fi
+  if [ -z "$e" ]; then
+    e="$s"; e="${e//%/%25}"; e="${e//!/%21}"; e="${e//:/%3A}"; e="${e//@/%40}"; e="${e//#/%23}"; e="${e//\$/%24}"; e="${e//&/%26}"; e="${e//\'/%27}"; e="${e//\(/%28}"; e="${e//)/%29}"; e="${e//\*/%2A}"; e="${e//+/%2B}"; e="${e//,/%2C}"; e="${e//\//%2F}"; e="${e//;/%3B}"; e="${e//=/%3D}"; e="${e//\?/%3F}"; e="${e//[/%5B}"; e="${e//]/%5D}"; e="${e// /%20}"
+  fi
+  printf '%s' "$e"
+}
+
+# === Build CURL SSL option ===
+CURL_SSL_OPT=""; [ "${SKIP_SSL_VERIFY}" = "true" ] && CURL_SSL_OPT="--insecure"
+
+# === Reconstruct proxy env if host/port provided ===
+if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+  if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+    _ENC=$(_urlenc "${PROXY_PASSWORD}")
+    export http_proxy="http://${PROXY_USER}:${_ENC}@${PROXY_HOST}:${PROXY_PORT}"
+  else
+    export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+  fi
+  export https_proxy="$http_proxy"
+
+  # Build a smart no_proxy on the remote (no function calls)
+  if [ -z "${no_proxy}" ] || [ "${no_proxy}" = "localhost,127.0.0.1,::1,.local" ]; then
+    np_base="localhost,127.0.0.1,::1,.local"; detected_hosts=""
+    if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then
+      while IFS= read -r h; do
+        if timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "https://$h" >/dev/null 2>&1 || \
+           timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "http://$h"  >/dev/null 2>&1; then
+          case ",${detected_hosts}," in *,"$h",*) :;; *) detected_hosts="${detected_hosts}${detected_hosts:+,}$h";; esac
+        fi
+      done < <(grep -hE '^(baseurl|mirrorlist)' /etc/yum.repos.d/*.repo 2>/dev/null | grep -oE 'https?://[^/]+' | sed -E 's#^https?://##' | sort -u)
+    fi
+    if [ -n "${INTERNAL_REPO_DOMAINS}" ]; then
+      detected_hosts="${detected_hosts}${detected_hosts:+,}${INTERNAL_REPO_DOMAINS}"
+    fi
+    if [ -n "$detected_hosts" ]; then
+      export no_proxy="${np_base},${detected_hosts}"
+    else
+      export no_proxy="${np_base}"
+    fi
+  fi
+  export HTTP_PROXY="$http_proxy"
+  export HTTPS_PROXY="$https_proxy"
+  export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" NO_PROXY="$no_proxy"
+fi
+
+# === Elevate with environment preserved ===
+# Use -E to pass proxy env to root for dnf/curl within SCRIPT_PATH
+printf '%s' "$SUDO_PASS" | sudo -E -S bash SCRIPT_PATH 2>&1 || true
+
+# Cleanup wrapper copy
 rm -f SCRIPT_PATH || true
 exit 0
 WRAPPER
@@ -490,9 +580,9 @@ WRAPPER
     copy_to_remote "$SCRIPTS_DIR/run_script_wrapper.sh" "$ip" "$SCRIPTS_DIR/run_script.sh"
 
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
     else
-        ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
     fi
     
     rm -f "$SCRIPTS_DIR/run_script_wrapper.sh"
@@ -845,7 +935,8 @@ check_single_node() {
             export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
             PROXY_CURL_OPT="-x ${PROXY_HOST}:${PROXY_PORT} ${CURL_SSL_OPT}"
         fi
-        export no_proxy="localhost,127.0.0.1"
+        # Respect any precomputed no_proxy from strategy
+        export no_proxy="${no_proxy:-localhost,127.0.0.1}"
     else
         PROXY_CURL_OPT="${CURL_SSL_OPT}"
     fi
@@ -1858,6 +1949,63 @@ backup_file() {
 install_packages() {
     local packages=("$@")
     log "Installing packages: ${packages[*]}"
+    # Ensure proxy context exists in this scope (avoid calling other functions if sourced differently)
+    if [ -z "${PROXY_STRATEGY:-}" ]; then
+        log "Proxy strategy not set in current scope; restoring from environment..."
+        # If env proxies are missing but proxy host is defined, rebuild minimal env
+        if [ -z "${http_proxy:-}" ] && [ -n "${PROXY_HOST:-}" ] && [ -n "${PROXY_PORT:-}" ]; then
+            local _encpass=""
+            if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASSWORD:-}" ]; then
+                _encpass=$(url_encode_password "${PROXY_PASSWORD}")
+                export http_proxy="http://${PROXY_USER}:${_encpass}@${PROXY_HOST}:${PROXY_PORT}"
+                export https_proxy="$http_proxy"
+            else
+                export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+                export https_proxy="$http_proxy"
+            fi
+            # Prefer existing no_proxy; otherwise, build a smart list of direct repo hosts (no helper calls)
+            if [ -z "${no_proxy:-}" ] || [ "${no_proxy}" = "localhost,127.0.0.1,::1,.local" ]; then
+                local np_base="localhost,127.0.0.1,::1,.local"
+                local detected_hosts=""
+                # Parse repo hosts
+                if ls /etc/yum.repos.d/*.repo >/dev/null 2>&1; then
+                    # shellcheck disable=SC2013
+                    while IFS= read -r h; do
+                        # Probe direct reachability (bypass proxy entirely)
+                        if timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "https://$h" >/dev/null 2>&1 || \
+                           timeout 3 curl -sI --noproxy '*' ${CURL_SSL_OPT} "http://$h"  >/dev/null 2>&1; then
+                            if ! echo ",$detected_hosts," | grep -q ",$h,"; then
+                                detected_hosts="${detected_hosts}${detected_hosts:+,}$h"
+                            fi
+                        fi
+                    done < <(grep -hE '^(baseurl|mirrorlist)' /etc/yum.repos.d/*.repo 2>/dev/null | \
+                               grep -oE 'https?://[^/]+' | sed -E 's#^https?://##' | sort -u)
+                fi
+                # Add any user-provided internal domains
+                if [ -n "$INTERNAL_REPO_DOMAINS" ]; then
+                    detected_hosts="${detected_hosts}${detected_hosts:+,}${INTERNAL_REPO_DOMAINS}"
+                fi
+                if [ -n "$detected_hosts" ]; then
+                    export no_proxy="${np_base},${detected_hosts}"
+                else
+                    export no_proxy="${np_base}"
+                fi
+            fi
+            export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" NO_PROXY="$no_proxy"
+            # Mask password inline without calling helpers
+            if [ -n "$http_proxy" ]; then
+                local _hp_masked
+                _hp_masked=$(echo "$http_proxy" | sed -E 's#(https?://[^:]+:)[^@]*(@)#\1****\2#g')
+                log "Reconstructed proxy env (env-only): http_proxy=${_hp_masked}, no_proxy=${no_proxy}"
+            else
+                log "Reconstructed proxy env (env-only): http_proxy=<unset>, no_proxy=${no_proxy}"
+            fi
+        fi
+        # Mark strategy as env-only for logging purposes
+        PROXY_STRATEGY="env-only"
+    fi
+    # Re-export in case a subshell cleared them
+    export PROXY_STRATEGY DNF_PROXY_OPT APT_PROXY_OPT_PROXY http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
     
     if command -v apt-get &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
@@ -1870,7 +2018,7 @@ install_packages() {
             exit_on_error "Failed to install: ${packages[*]}"
 
     elif command -v dnf &>/dev/null; then
-        log "Installing via DNF (strategy: ${PROXY_STRATEGY})..."
+        log "Installing via DNF (strategy: ${PROXY_STRATEGY}, dnf_proxy_opt: ${DNF_PROXY_OPT:+set}${DNF_PROXY_OPT:-none})..."
         sudo -E bash -c 'echo "[dnf env] http_proxy=${http_proxy:-<unset>} HTTPS_PROXY=${HTTPS_PROXY:-<unset>} no_proxy=${no_proxy:-<unset>}"' >> "$LOGFILE" 2>/dev/null || true
         # DNF uses environment proxy (http_proxy/https_proxy/no_proxy) automatically
         # Or explicit --setopt=proxy if DNF_PROXY_OPT is set
