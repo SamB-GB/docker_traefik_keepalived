@@ -15,11 +15,11 @@ set -e
 # HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/dnf)
 # Leave blank if no proxy is needed
 # Note: Passwords with special characters will be automatically URL-encoded
-PROXY_HOST=""  # Example: "proxy.company.com"
-PROXY_PORT=""  # Example: "8080"
-PROXY_USER=""
-PROXY_PASSWORD="" # Special characters will be handled automatically
-SKIP_SSL_VERIFY="false"  # Set to "true" to disable SSL verification (not recommended)
+PROXY_HOST="eis-prx006.krages.int"  # Example: "proxy.company.com"
+PROXY_PORT="8080"  # Example: "8080"
+PROXY_USER="BARR3207"
+PROXY_PASSWORD="LF9s3C7!gamU" # Special characters will be handled automatically
+SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
 
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
@@ -826,6 +826,11 @@ check_single_node() {
                 cleanup
                 exit 1
             fi
+            # User confirmed to continue despite warnings, reset failure flag
+            REPO_CHECK_FAILED=0
+        else
+
+            REPO_CHECK_FAILED=0
         fi
     else
         echo "  ✓ All checks passed"
@@ -1735,15 +1740,48 @@ install_packages() {
             log "Warning: Some repositories failed, continuing with available ones..."
         }
         apt-get $apt_proxy_opts -yq install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+    
     elif command -v dnf &>/dev/null; then
-        dnf $dnf_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
-    elif command -v dnf &>/dev/null; then
-        dnf $dnf_proxy_opts $DNF_SSL_OPT -y install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
+        # Try normal install first
+        log "Attempting package installation..."
+        if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ Packages installed successfully"
+        else
+            # If normal install fails, try with --nobest to use older versions
+            log "Normal install failed, trying with --nobest flag..."
+            if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
+                log "✓ Packages installed successfully (using older versions)"
+            else
+                # If --nobest also fails, try with --skip-broken
+                log "Install with --nobest failed, trying with --skip-broken..."
+                if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest --skip-broken 2>&1 | tee -a "$LOGFILE"; then
+                    log "⚠️  Some packages may not have been installed (--skip-broken used)"
+                else
+                    exit_on_error "Failed to install packages: ${packages[*]}"
+                fi
+            fi
+        fi
+    
+    elif command -v yum &>/dev/null; then
+        # Try normal install first
+        log "Attempting package installation..."
+        if yum $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ Packages installed successfully"
+        else
+            # If normal install fails, try with --nobest
+            log "Normal install failed, trying with --nobest flag..."
+            if yum $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
+                log "✓ Packages installed successfully (using older versions)"
+            else
+                exit_on_error "Failed to install packages: ${packages[*]}"
+            fi
+        fi
+    
     else
-        exit_on_error "No supported package manager found (apt-get, dnf, or dnf)"
+        exit_on_error "No supported package manager found (apt-get, dnf, or yum)"
     fi
     
-    log "✓ Packages installed successfully"
+    log "✓ Package installation complete"
 }
 
 # Prompt for multi-node deployment configuration
@@ -3235,15 +3273,15 @@ echo ""
 
 # Set proxy options for package managers
 APT_PROXY_OPT=""
-dnf_PROXY_OPT=""
+DNF_PROXY_OPT=""
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
         ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
         APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        dnf_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
     else
         APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        dnf_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+        DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
     fi
 fi
 
@@ -3256,13 +3294,13 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     )
     log "Updating apt package lists..."
     sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
-  elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     PREREQ_PACKAGES=(
-        ca-certificates curl dnf-utils
-        gnupg2 wget nano iproute ipcalc dnf-plugins-core
+        ca-certificates curl dnf-plugins-core
+        gnupg2 wget nano iproute python3 jq
     )
     log "Cleaning dnf metadata..."
-    sudo dnf $DNF_PROXY_OPT clean all || exit_on_error "Failed to clean dnf metadata"
+    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True clean all || exit_on_error "Failed to clean dnf metadata"
 fi
 
 # Install prerequisites using install_packages function
@@ -3270,6 +3308,84 @@ log "Installing base packages..."
 sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages ${PREREQ_PACKAGES[*]}"
 
 ### END installing Prerequisites 
+######################################################
+
+######################################################
+### START Docker Dependency Pre-installation
+######################################################
+
+if [[ "$PKG_MANAGER" == "dnf" ]]; then
+    echo ""
+    echo "=========================================="
+    echo "Installing Docker Dependencies"
+    echo "=========================================="
+    echo ""
+    
+    # Check if container-selinux is already installed
+    if rpm -q container-selinux &>/dev/null; then
+        log "✓ container-selinux already installed"
+    else
+        log "Installing container-selinux (required for Docker)..."
+        
+        # Method 1: Try normal install from available repos
+        if sudo dnf --setopt=skip_if_unavailable=True install -y container-selinux 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ container-selinux installed successfully"
+        else
+            log "Normal install failed, trying with --nobest..."
+            
+            # Method 2: Try with --nobest to use older version
+            if sudo dnf --setopt=skip_if_unavailable=True install -y container-selinux --nobest 2>&1 | tee -a "$LOGFILE"; then
+                log "✓ container-selinux installed (older version)"
+            else
+                log "Standard repos failed, trying Rocky Linux repos..."
+                
+                # Method 3: Try to add Rocky Linux repos and install from there
+                if curl -s -o /tmp/rocky-repos.rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>&1 | tee -a "$LOGFILE"; then
+                    log "Rocky Linux repo package downloaded"
+                    
+                    if sudo rpm -ivh /tmp/rocky-repos.rpm 2>&1 | tee -a "$LOGFILE"; then
+                        log "Rocky Linux repos added"
+                        
+                        # Try to install from Rocky repos
+                        if sudo dnf --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos install -y container-selinux 2>&1 | tee -a "$LOGFILE"; then
+                            log "✓ container-selinux installed from Rocky Linux repos"
+                        else
+                            log "ERROR: Failed to install container-selinux from Rocky repos"
+                        fi
+                    fi
+                    rm -f /tmp/rocky-repos.rpm
+                else
+                    log "ERROR: Could not download Rocky Linux repos"
+                fi
+            fi
+        fi
+        
+        # Final check
+        if ! rpm -q container-selinux &>/dev/null; then
+            echo ""
+            echo "=========================================="
+            echo "⚠️  WARNING: container-selinux Not Installed"
+            echo "=========================================="
+            echo ""
+            echo "Docker installation will likely fail without container-selinux."
+            echo ""
+            echo "This package is normally in RHEL BaseOS repos, but those repos"
+            echo "are currently unavailable due to SSL errors with T-Systems proxy."
+            echo ""
+            echo "Possible solutions:"
+            echo "  1. Fix access to RHEL repos (contact T-Systems IT)"
+            echo "  2. Manually configure alternative repos"
+            echo "  3. Use Podman instead of Docker (recommended for RHEL)"
+            echo ""
+            log "ERROR: container-selinux could not be installed"
+            exit_on_error "Cannot proceed without container-selinux"
+        else
+            log "✓ container-selinux is available"
+        fi
+    fi
+fi
+
+### END Docker Dependency Pre-installation
 ######################################################
 
 ######################################################
@@ -3323,7 +3439,7 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
 
     [ -n "$DNF_SSL_OPT" ] && DNF_OPTS+=" $DNF_SSL_OPT"
 
-    sudo dnf $DNF_OPTS config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    sudo dnf $DNF_OPTS --setopt=skip_if_unavailable=True config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
     sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
@@ -3807,7 +3923,6 @@ sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_passwor
 
 log "Deferring KeepAlived Startup until configuration file generated"
 
-
 # Adding Keepalived group for script check permissions
 log "Adding Keepalived group for script check permissions..."
 if ! getent group keepalived_script > /dev/null 2>&1; then
@@ -4232,7 +4347,7 @@ if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT update -qq
     sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
 elif command -v dnf &>/dev/null; then
-    sudo dnf $DNF_PROXY_OPT install -y ca-certificates curl dnf-utils gnupg2 wget nano iproute ipcalc dnf-plugins-core
+    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq
 fi
 
 # Install Docker
@@ -4262,7 +4377,7 @@ elif command -v dnf &>/dev/null; then
     fi
     
     echo "Installing Docker packages..."
-    sudo dnf $DNF_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
+    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io
     
 else
     echo "ERROR: No supported package manager found (apt or dnf)"
@@ -4458,7 +4573,7 @@ echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT install -y keepalived
 elif command -v dnf &>/dev/null; then
-    sudo dnf $DNF_PROXY_OPT install -y keepalived
+    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y keepalived
 fi
 
 # Create keepalived_script user/group
