@@ -219,128 +219,198 @@ ensure_SCRIPTS_DIR() {
 
 setup_proxy_strategy() {
     log "Configuring proxy strategy: ${PROXY_STRATEGY}"
-    
-    # Reset proxy variables
-    unset http_proxy https_proxy no_proxy
+
+    # Reset proxy-related state
+    unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
     PROXY_CURL_OPTS=""
     DNF_PROXY_OPT=""
     APT_PROXY_OPT_PROXY=""
-    
-    # Check if proxy is configured
+
+    # If no proxy host/port is provided, go direct
     if [ -z "${PROXY_HOST}" ] || [ -z "${PROXY_PORT}" ]; then
         log "No proxy configured - using direct connections"
         PROXY_STRATEGY="none"
+        log "✓ Proxy strategy configured: ${PROXY_STRATEGY}"
+        log "  http_proxy: <not set>"
+        log "  https_proxy: <not set>"
+        log "  no_proxy: <not set>"
         return 0
     fi
-    
-    # Build proxy URL
+
+    # Build proxy URLs
+    local ENCODED_PASS="" PROXY_URL PROXY_URL_NO_CREDS
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
         ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
         PROXY_URL="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
         PROXY_URL_NO_CREDS="http://${PROXY_HOST}:${PROXY_PORT}"
-        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT} -U ${PROXY_USER}:${PROXY_PASSWORD}"
+        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT} -U ${PROXY_USER}:${PROXY_PASSWORD} ${CURL_SSL_OPT}"
     else
         PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
         PROXY_URL_NO_CREDS="${PROXY_URL}"
-        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT}"
+        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT} ${CURL_SSL_OPT}"
     fi
-    
+
+    # Helper: build NO_PROXY using explicit INTERNAL_REPO_DOMAINS and probe-based detection
+    _build_no_proxy_list() {
+        local base="localhost,127.0.0.1,::1,.local"
+        local extra="${INTERNAL_REPO_DOMAINS}"
+
+        # Auto-detect repo hosts from .repo files and add only those reachable DIRECT
+        if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+            mapfile -t _hosts < <(grep -hE '^(baseurl|mirrorlist)' /etc/yum.repos.d/*.repo 2>/dev/null \
+                                   | grep -oE 'https?://[^/]+' \
+                                   | sed -E 's#^https?://##' \
+                                   | sort -u)
+            for h in "${_hosts[@]}"; do
+                # Quick direct probes (prefer https, then http) with short timeouts
+                if timeout 3 curl -sI ${CURL_SSL_OPT} "https://$h" >/dev/null 2>&1 || \
+                   timeout 3 curl -sI ${CURL_SSL_OPT} "http://$h"  >/dev/null 2>&1; then
+                    extra="${extra:+$extra,}$h"
+                fi
+            done
+        fi
+
+        # De-duplicate entries
+        printf '%s' "$base${extra:+,$extra}" | awk -v RS=',' '!a[$0]++ {out=out (out?",":"") $0} END{print out}'
+    }
+
     case "${PROXY_STRATEGY}" in
-        "all")
-            # All connections via proxy - for strict firewall environments
+        all)
             log "Strategy: ALL - All repos and downloads via proxy"
             export http_proxy="${PROXY_URL}"
             export https_proxy="${PROXY_URL}"
-            export no_proxy="localhost,127.0.0.1"
-            
-            # DNF/YUM proxy options
-            DNF_PROXY_OPT="--setopt=proxy=${PROXY_URL_NO_CREDS}"
-            
-            # APT proxy options
+            export no_proxy="localhost,127.0.0.1,::1,.local"
+            export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" NO_PROXY="$no_proxy"
+            # Force dnf/yum to use the authenticated proxy explicitly
             if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+                DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
             else
-                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+                DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
             fi
+            # APT explicit proxy
+            APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
             ;;
-            
-        "external")
-            # Proxy only for external, internal repos direct
+
+        external)
             log "Strategy: EXTERNAL - External via proxy, internal repos direct"
-            
-            # Build no_proxy list with internal domains
-            local NO_PROXY_LIST="localhost,127.0.0.1"
-            
-            if [ -n "${INTERNAL_REPO_DOMAINS}" ]; then
-                NO_PROXY_LIST="${NO_PROXY_LIST},${INTERNAL_REPO_DOMAINS}"
-                log "Internal domains (no proxy): ${INTERNAL_REPO_DOMAINS}"
-            else
-                # Auto-detect internal repo domains from DNF/YUM config
-                if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
-                    log "Auto-detecting internal repo domains..."
-                    local DETECTED_DOMAINS=$(grep -h "^baseurl\|^mirrorlist" /etc/yum.repos.d/*.repo 2>/dev/null | \
-                        grep -oP 'https?://\K[^/]+' | \
-                        grep -v "download.docker.com\|dl.rockylinux.org\|dl.fedoraproject.org\|repo.mysql.com" | \
-                        sort -u | tr '\n' ',' | sed 's/,$//')
-                    
-                    if [ -n "${DETECTED_DOMAINS}" ]; then
-                        NO_PROXY_LIST="${NO_PROXY_LIST},${DETECTED_DOMAINS}"
-                        log "Detected internal domains: ${DETECTED_DOMAINS}"
-                    fi
-                fi
-            fi
-            
-            # Set environment proxy with no_proxy exceptions
+            local NO_PROXY_LIST
+            NO_PROXY_LIST=$(_build_no_proxy_list)
             export http_proxy="${PROXY_URL}"
             export https_proxy="${PROXY_URL}"
             export no_proxy="${NO_PROXY_LIST}"
-            
-            # DNF/YUM will respect environment proxy and no_proxy
-            DNF_PROXY_OPT=""  # Let environment variables handle it
-            
-            # APT needs explicit proxy config
-            if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
-            else
-                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
-            fi
+            export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" NO_PROXY="$no_proxy"
+            # Let env + NO_PROXY govern dnf/yum (no forced --setopt proxy here)
+            DNF_PROXY_OPT=""
+            APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
             ;;
-            
-        "none")
-            # No proxy anywhere
+
+        none)
             log "Strategy: NONE - Direct connections, no proxy"
-            # All proxy variables remain empty
+            unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
+            DNF_PROXY_OPT=""
+            APT_PROXY_OPT_PROXY=""
             ;;
-            
-        "auto"|*)
-            # Auto-detect: Try without proxy first, use proxy if needed
-            log "Strategy: AUTO - Will try direct first, fallback to proxy"
-            
-            # Test if we can reach external repos without proxy
+
+        auto|*)
+            log "Strategy: AUTO - Try direct first, then proxy; settle on EXTERNAL if either works"
             log "Testing repository connectivity..."
-            
-            if timeout 5 curl -s -o /dev/null -w "%{http_code}" "https://download.docker.com/" 2>/dev/null | grep -q "200\|301\|302"; then
+            # Probe Docker CE endpoint direct
+            if timeout 5 curl -s -o /dev/null -w "%{http_code}" ${CURL_SSL_OPT} "https://download.docker.com/" 2>/dev/null | grep -qE '^(200|301|302)$'; then
                 log "External repos reachable directly - using EXTERNAL strategy"
-                PROXY_STRATEGY="external"
-                setup_proxy_strategy  # Recursive call with new strategy
-                return $?
-            else
-                log "External repos not reachable directly - using ALL strategy"
-                PROXY_STRATEGY="all"
-                setup_proxy_strategy  # Recursive call with new strategy
-                return $?
+                PROXY_STRATEGY="external"; setup_proxy_strategy; return $?
             fi
+            # Probe via proxy with credentials and accept 407 as success (proxy path viable)
+            if timeout 7 curl -s -o /dev/null -w "%{http_code}" -x "${PROXY_URL}" ${CURL_SSL_OPT} --proxy-anyauth "https://download.docker.com/" 2>/dev/null | grep -qE '^(200|301|302|407)$'; then
+                log "External repos reachable via proxy - using EXTERNAL strategy"
+                PROXY_STRATEGY="external"; setup_proxy_strategy; return $?
+            fi
+            log "Neither direct nor proxy probe succeeded - using ALL strategy"
+            PROXY_STRATEGY="all"; setup_proxy_strategy; return $?
             ;;
     esac
-    
+
+    # Export key proxy variables so they survive subshells
+    export PROXY_STRATEGY DNF_PROXY_OPT APT_PROXY_OPT_PROXY PROXY_URL PROXY_URL_NO_CREDS http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
     log "✓ Proxy strategy configured: ${PROXY_STRATEGY}"
     log "  http_proxy: ${http_proxy:-<not set>}"
     log "  https_proxy: ${https_proxy:-<not set>}"
     log "  no_proxy: ${no_proxy:-<not set>}"
-    
     return 0
 }
 
+# Validate proxy configuration
+validate_proxy_config() {
+    if [ -z "${PROXY_HOST}" ] || [ -z "${PROXY_PORT}" ]; then
+        echo "  Proxy: Not configured"
+        return 0
+    fi
+    
+    echo ""
+    echo "=========================================="
+    echo "Validating Proxy Configuration"
+    echo "=========================================="
+    
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated)"
+        echo "  User: ${PROXY_USER}"
+        
+        # Encode password and verify encoding
+        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+        
+        if ! verify_password_encoding "${PROXY_PASSWORD}" "$ENCODED_PASS"; then
+            echo ""
+            echo "⚠️  WARNING: Proxy Password Encoding"
+            echo ""
+            echo "Your password contains special characters but URL encoding did not work."
+            echo ""
+            echo "Solutions:"
+            echo "  1. Install python3: sudo apt-get install -y python3 (Debian/Ubuntu)"
+            echo "  2. Install python3: sudo dnf install -y python3 (RHEL/CentOS)"
+            echo "  3. Install jq: sudo apt-get install -y jq"
+            echo "  4. Or the script will use fallback encoding (less reliable)"
+            echo ""
+            read -p "Continue anyway with potentially broken encoding? [y/N]: " CONTINUE
+            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+                echo "Installation cancelled."
+                exit 1
+            fi
+        else
+            echo "✓ Password encoding successful"
+        fi
+        
+        # Check for tools
+        echo ""
+        echo "Checking encoding tools availability:"
+        if command -v python3 &>/dev/null; then
+            echo "  ✓ python3: $(python3 --version 2>&1)"
+        else
+            echo "  ✗ python3: not installed (recommended for reliable encoding)"
+        fi
+        
+        if command -v jq &>/dev/null; then
+            echo "  ✓ jq: $(jq --version 2>&1)"
+        else
+            echo "  ✗ jq: not installed (alternative encoding method)"
+        fi
+        
+        # Warn if neither python3 nor jq is available
+        if ! command -v python3 &>/dev/null && ! command -v jq &>/dev/null; then
+            echo ""
+            echo "⚠️  WARNING: Neither python3 nor jq is installed."
+            echo "   Using fallback manual encoding which may not handle all special characters."
+            echo "   Recommend: sudo $PKG_MANAGER install -y python3"
+            echo ""
+        fi
+        
+    else
+        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
+        echo "  Authentication: None"
+    fi
+    
+    echo ""
+    echo "✓ Proxy configuration validated"
+    echo ""
+}
 
 cleanup_remote_scripts_dirs() {
     echo ""
@@ -1020,6 +1090,11 @@ log "=== Clinical Traefik Setup Started ==="
 log "User: $CURRENT_USER"
 log "Home: $ACTUAL_HOME"
 
+validate_os
+check_execution_context
+validate_proxy_config
+setup_proxy_strategy || exit_on_error "Failed to setup proxy strategy"
+
 # ==========================================
 # Cleanup Mode
 # ==========================================
@@ -1591,6 +1666,7 @@ INITIAL_DEPLOYMENT_TYPE=""
 
 # Function to load existing values from clinical_traefik.env
 load_config() {
+    local _PS_SAVE="$PROXY_STRATEGY"
     if [[ -f "$CONFIG_FILE" ]]; then
         log "Loading configuration from $CONFIG_FILE"
 
@@ -1610,6 +1686,11 @@ load_config() {
         fi
 
         source "$CONFIG_FILE"
+        # Prevent env file from blanking or overriding runtime proxy strategy
+        if [ -z "${PROXY_STRATEGY}" ] && [ -n "${_PS_SAVE}" ]; then
+            PROXY_STRATEGY="${_PS_SAVE}"
+            log "Preserved proxy strategy from runtime: ${PROXY_STRATEGY}"
+        fi
 
         # Backup existing certificate and key files
         backup_file "$CERT_FILE"
@@ -1732,79 +1813,6 @@ clear_previous_configuration() {
     fi
 }
 
-# Validate proxy configuration
-validate_proxy_config() {
-    if [ -z "${PROXY_HOST}" ] || [ -z "${PROXY_PORT}" ]; then
-        echo "  Proxy: Not configured"
-        return 0
-    fi
-    
-    echo ""
-    echo "=========================================="
-    echo "Validating Proxy Configuration"
-    echo "=========================================="
-    
-    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT} (authenticated)"
-        echo "  User: ${PROXY_USER}"
-        
-        # Encode password and verify encoding
-        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-        
-        if ! verify_password_encoding "${PROXY_PASSWORD}" "$ENCODED_PASS"; then
-            echo ""
-            echo "⚠️  WARNING: Proxy Password Encoding"
-            echo ""
-            echo "Your password contains special characters but URL encoding did not work."
-            echo ""
-            echo "Solutions:"
-            echo "  1. Install python3: sudo apt-get install -y python3 (Debian/Ubuntu)"
-            echo "  2. Install python3: sudo dnf install -y python3 (RHEL/CentOS)"
-            echo "  3. Install jq: sudo apt-get install -y jq"
-            echo "  4. Or the script will use fallback encoding (less reliable)"
-            echo ""
-            read -p "Continue anyway with potentially broken encoding? [y/N]: " CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-                echo "Installation cancelled."
-                exit 1
-            fi
-        else
-            echo "✓ Password encoding successful"
-        fi
-        
-        # Check for tools
-        echo ""
-        echo "Checking encoding tools availability:"
-        if command -v python3 &>/dev/null; then
-            echo "  ✓ python3: $(python3 --version 2>&1)"
-        else
-            echo "  ✗ python3: not installed (recommended for reliable encoding)"
-        fi
-        
-        if command -v jq &>/dev/null; then
-            echo "  ✓ jq: $(jq --version 2>&1)"
-        else
-            echo "  ✗ jq: not installed (alternative encoding method)"
-        fi
-        
-        # Warn if neither python3 nor jq is available
-        if ! command -v python3 &>/dev/null && ! command -v jq &>/dev/null; then
-            echo ""
-            echo "⚠️  WARNING: Neither python3 nor jq is installed."
-            echo "   Using fallback manual encoding which may not handle all special characters."
-            echo "   Recommend: sudo $PKG_MANAGER install -y python3"
-            echo ""
-        fi
-        
-    else
-        echo "  Proxy: ${PROXY_HOST}:${PROXY_PORT}"
-        echo "  Authentication: None"
-    fi
-    
-    echo ""
-    echo "✓ Proxy configuration validated"
-    echo ""
-}
 
 # Function to backup existing configuration files limit to two with most recent named .bak.mostrecent
 backup_file() {
@@ -1853,46 +1861,42 @@ install_packages() {
     
     if command -v apt-get &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
-        
         # Combine SSL and proxy options
         local APT_OPTS="${APT_SSL_OPT} ${APT_PROXY_OPT_PROXY}"
-        
-        apt-get ${APT_OPTS} update > /tmp/apt_update.log 2>&1 || {
+        sudo -E apt-get ${APT_OPTS} update > /tmp/apt_update.log 2>&1 || {
             log "Warning: Some repositories failed, continuing..."
         }
-        apt-get ${APT_OPTS} -yq install "${packages[@]}" || \
+        sudo -E apt-get ${APT_OPTS} -yq install "${packages[@]}" || \
             exit_on_error "Failed to install: ${packages[*]}"
-        
+
     elif command -v dnf &>/dev/null; then
         log "Installing via DNF (strategy: ${PROXY_STRATEGY})..."
-        
+        sudo -E bash -c 'echo "[dnf env] http_proxy=${http_proxy:-<unset>} HTTPS_PROXY=${HTTPS_PROXY:-<unset>} no_proxy=${no_proxy:-<unset>}"' >> "$LOGFILE" 2>/dev/null || true
         # DNF uses environment proxy (http_proxy/https_proxy/no_proxy) automatically
         # Or explicit --setopt=proxy if DNF_PROXY_OPT is set
-        
-        if dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+        if sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
             log "✓ Packages installed"
         else
             log "Trying with --nobest..."
-            if dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
+            if sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
                 log "✓ Packages installed (older versions)"
             else
                 exit_on_error "Failed to install: ${packages[*]}"
             fi
         fi
-        
+
     elif command -v yum &>/dev/null; then
         log "Installing via YUM (strategy: ${PROXY_STRATEGY})..."
-        
-        if yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+        if sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
             log "✓ Packages installed"
         else
-            yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE" || \
+            sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE" || \
                 exit_on_error "Failed to install: ${packages[*]}"
         fi
     else
         exit_on_error "No supported package manager found"
     fi
-    
+
     log "✓ Package installation complete"
 }
 
