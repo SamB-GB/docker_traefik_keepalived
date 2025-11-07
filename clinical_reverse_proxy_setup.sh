@@ -248,6 +248,22 @@ _mask_url_creds() {
     echo "$url" | sed -E 's#(https?://[^:]+:)[^@]*(@)#\1****\2#g'
 }
 
+# Normalize proxy environment variables to avoid double schemes
+normalize_proxy_env() {
+  for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+    val="${!v:-}"
+    if [ -n "$val" ]; then
+      # Strip accidental double prefixes (http://http://, https://https://, mixed)
+      val="${val#http://http://}"
+      val="${val#https://https://}"
+      val="${val#http://https://}"
+      val="${val#https://http://}"
+      export "$v=$val"
+    fi
+  done
+  : "${no_proxy:=localhost,127.0.0.1,::1,.local}"
+}
+
 setup_proxy_strategy() {
     log "Configuring proxy strategy: ${PROXY_STRATEGY}"
 
@@ -529,6 +545,17 @@ _urlenc() {
 
 # === Build CURL SSL option ===
 CURL_SSL_OPT=""; [ "${SKIP_SSL_VERIFY}" = "true" ] && CURL_SSL_OPT="--insecure"
+
+# === Normalize proxy usage inside target script ===
+# Prevent constructs like "http://http://..." when the target script builds envs from $PROXY
+if [ -f SCRIPT_PATH ]; then
+  sed -i -E 's#(=|\s)http://\$PROXY#\1\$PROXY#g' SCRIPT_PATH
+  sed -i -E 's#(=|\s)https://\$PROXY#\1\$PROXY#g' SCRIPT_PATH
+  sed -i -E 's#-x http://\$PROXY#-x \$PROXY#g' SCRIPT_PATH
+  sed -i -E 's#Acquire::http::Proxy=http://\$PROXY#Acquire::http::Proxy=\$PROXY#g' SCRIPT_PATH
+  sed -i -E 's#Acquire::https::Proxy=http://\$PROXY#Acquire::https::Proxy=\$PROXY#g' SCRIPT_PATH
+  sed -i -E 's#--setopt=proxy=http://\$PROXY#--setopt=proxy=\$PROXY#g' SCRIPT_PATH
+fi
 
 # === Reconstruct proxy env if host/port provided ===
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
