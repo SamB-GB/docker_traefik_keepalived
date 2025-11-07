@@ -21,6 +21,20 @@ PROXY_USER="BARR3207"
 PROXY_PASSWORD="LF9s3C7!gamU" # Special characters will be handled automatically
 SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
 
+# Proxy Strategy - How to handle internal vs external repos
+# Options:
+#   "auto"     - Try without proxy first, fallback to proxy if needed (DEFAULT)
+#   "all"      - Use proxy for all connections (strict firewall environments)
+#   "external" - Use proxy only for external downloads, DNF direct (mixed access)
+#   "none"     - No proxy used anywhere
+PROXY_STRATEGY="auto"
+
+# Internal Repo Domains (optional - for "external" strategy)
+# Comma-separated list of internal repo domains that don't need proxy
+# Example: "repo.svc.t-systems.at,internal.company.com"
+# Leave empty for auto-detection
+INTERNAL_REPO_DOMAINS=""
+
 # Multi-node deployment variables
 MULTI_NODE_DEPLOYMENT="no"
 BACKUP_NODE_COUNT=0
@@ -198,6 +212,135 @@ ensure_SCRIPTS_DIR() {
         ssh $SSH_OPTS "$CURRENT_USER@$ip" "mkdir -p $SCRIPTS_DIR && chmod 755 $SCRIPTS_DIR"
     fi
 }
+
+# ==========================================
+# Proxy Strategy Implementation
+# ==========================================
+
+setup_proxy_strategy() {
+    log "Configuring proxy strategy: ${PROXY_STRATEGY}"
+    
+    # Reset proxy variables
+    unset http_proxy https_proxy no_proxy
+    PROXY_CURL_OPTS=""
+    DNF_PROXY_OPT=""
+    APT_PROXY_OPT_PROXY=""
+    
+    # Check if proxy is configured
+    if [ -z "${PROXY_HOST}" ] || [ -z "${PROXY_PORT}" ]; then
+        log "No proxy configured - using direct connections"
+        PROXY_STRATEGY="none"
+        return 0
+    fi
+    
+    # Build proxy URL
+    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
+        PROXY_URL="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
+        PROXY_URL_NO_CREDS="http://${PROXY_HOST}:${PROXY_PORT}"
+        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT} -U ${PROXY_USER}:${PROXY_PASSWORD}"
+    else
+        PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+        PROXY_URL_NO_CREDS="${PROXY_URL}"
+        PROXY_CURL_OPTS="-x ${PROXY_HOST}:${PROXY_PORT}"
+    fi
+    
+    case "${PROXY_STRATEGY}" in
+        "all")
+            # All connections via proxy - for strict firewall environments
+            log "Strategy: ALL - All repos and downloads via proxy"
+            export http_proxy="${PROXY_URL}"
+            export https_proxy="${PROXY_URL}"
+            export no_proxy="localhost,127.0.0.1"
+            
+            # DNF/YUM proxy options
+            DNF_PROXY_OPT="--setopt=proxy=${PROXY_URL_NO_CREDS}"
+            
+            # APT proxy options
+            if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+            else
+                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+            fi
+            ;;
+            
+        "external")
+            # Proxy only for external, internal repos direct
+            log "Strategy: EXTERNAL - External via proxy, internal repos direct"
+            
+            # Build no_proxy list with internal domains
+            local NO_PROXY_LIST="localhost,127.0.0.1"
+            
+            if [ -n "${INTERNAL_REPO_DOMAINS}" ]; then
+                NO_PROXY_LIST="${NO_PROXY_LIST},${INTERNAL_REPO_DOMAINS}"
+                log "Internal domains (no proxy): ${INTERNAL_REPO_DOMAINS}"
+            else
+                # Auto-detect internal repo domains from DNF/YUM config
+                if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
+                    log "Auto-detecting internal repo domains..."
+                    local DETECTED_DOMAINS=$(grep -h "^baseurl\|^mirrorlist" /etc/yum.repos.d/*.repo 2>/dev/null | \
+                        grep -oP 'https?://\K[^/]+' | \
+                        grep -v "download.docker.com\|dl.rockylinux.org\|dl.fedoraproject.org\|repo.mysql.com" | \
+                        sort -u | tr '\n' ',' | sed 's/,$//')
+                    
+                    if [ -n "${DETECTED_DOMAINS}" ]; then
+                        NO_PROXY_LIST="${NO_PROXY_LIST},${DETECTED_DOMAINS}"
+                        log "Detected internal domains: ${DETECTED_DOMAINS}"
+                    fi
+                fi
+            fi
+            
+            # Set environment proxy with no_proxy exceptions
+            export http_proxy="${PROXY_URL}"
+            export https_proxy="${PROXY_URL}"
+            export no_proxy="${NO_PROXY_LIST}"
+            
+            # DNF/YUM will respect environment proxy and no_proxy
+            DNF_PROXY_OPT=""  # Let environment variables handle it
+            
+            # APT needs explicit proxy config
+            if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
+                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+            else
+                APT_PROXY_OPT_PROXY="-o Acquire::http::Proxy=${PROXY_URL} -o Acquire::https::Proxy=${PROXY_URL}"
+            fi
+            ;;
+            
+        "none")
+            # No proxy anywhere
+            log "Strategy: NONE - Direct connections, no proxy"
+            # All proxy variables remain empty
+            ;;
+            
+        "auto"|*)
+            # Auto-detect: Try without proxy first, use proxy if needed
+            log "Strategy: AUTO - Will try direct first, fallback to proxy"
+            
+            # Test if we can reach external repos without proxy
+            log "Testing repository connectivity..."
+            
+            if timeout 5 curl -s -o /dev/null -w "%{http_code}" "https://download.docker.com/" 2>/dev/null | grep -q "200\|301\|302"; then
+                log "External repos reachable directly - using EXTERNAL strategy"
+                PROXY_STRATEGY="external"
+                setup_proxy_strategy  # Recursive call with new strategy
+                return $?
+            else
+                log "External repos not reachable directly - using ALL strategy"
+                PROXY_STRATEGY="all"
+                setup_proxy_strategy  # Recursive call with new strategy
+                return $?
+            fi
+            ;;
+    esac
+    
+    log "✓ Proxy strategy configured: ${PROXY_STRATEGY}"
+    log "  http_proxy: ${http_proxy:-<not set>}"
+    log "  https_proxy: ${https_proxy:-<not set>}"
+    log "  no_proxy: ${no_proxy:-<not set>}"
+    
+    return 0
+}
+
 
 cleanup_remote_scripts_dirs() {
     echo ""
@@ -1708,77 +1851,46 @@ install_packages() {
     local packages=("$@")
     log "Installing packages: ${packages[*]}"
     
-    # Set proxy for package managers if configured
-    local apt_proxy_opts=""
-    local dnf_proxy_opts=""
-    
-    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            # URL-encode the password to handle special characters
-            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-            apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-            dnf_proxy_opts="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        else
-            apt_proxy_opts="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            dnf_proxy_opts="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        fi
-    fi
-    
-    # Add SSL options if configured
-    if [ -n "$APT_SSL_OPT" ]; then
-        apt_proxy_opts="$apt_proxy_opts $APT_SSL_OPT"
-    fi
-    
-    if [ -n "$DNF_SSL_OPT" ]; then
-        dnf_proxy_opts="$dnf_proxy_opts $DNF_SSL_OPT"
-    fi
-    
-    # Detect package manager and install
     if command -v apt-get &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get $apt_proxy_opts update > /tmp/apt_update.log 2>&1 || {
-            log "Warning: Some repositories failed, continuing with available ones..."
+        
+        # Combine SSL and proxy options
+        local APT_OPTS="${APT_SSL_OPT} ${APT_PROXY_OPT_PROXY}"
+        
+        apt-get ${APT_OPTS} update > /tmp/apt_update.log 2>&1 || {
+            log "Warning: Some repositories failed, continuing..."
         }
-        apt-get $apt_proxy_opts -yq install "${packages[@]}" || exit_on_error "Failed to install packages: ${packages[*]}"
-    
+        apt-get ${APT_OPTS} -yq install "${packages[@]}" || \
+            exit_on_error "Failed to install: ${packages[*]}"
+        
     elif command -v dnf &>/dev/null; then
-        # Try normal install first
-        log "Attempting package installation..."
-        if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
-            log "✓ Packages installed successfully"
+        log "Installing via DNF (strategy: ${PROXY_STRATEGY})..."
+        
+        # DNF uses environment proxy (http_proxy/https_proxy/no_proxy) automatically
+        # Or explicit --setopt=proxy if DNF_PROXY_OPT is set
+        
+        if dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ Packages installed"
         else
-            # If normal install fails, try with --nobest to use older versions
-            log "Normal install failed, trying with --nobest flag..."
-            if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
-                log "✓ Packages installed successfully (using older versions)"
+            log "Trying with --nobest..."
+            if dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
+                log "✓ Packages installed (older versions)"
             else
-                # If --nobest also fails, try with --skip-broken
-                log "Install with --nobest failed, trying with --skip-broken..."
-                if dnf $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest --skip-broken 2>&1 | tee -a "$LOGFILE"; then
-                    log "⚠️  Some packages may not have been installed (--skip-broken used)"
-                else
-                    exit_on_error "Failed to install packages: ${packages[*]}"
-                fi
+                exit_on_error "Failed to install: ${packages[*]}"
             fi
         fi
-    
+        
     elif command -v yum &>/dev/null; then
-        # Try normal install first
-        log "Attempting package installation..."
-        if yum $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
-            log "✓ Packages installed successfully"
+        log "Installing via YUM (strategy: ${PROXY_STRATEGY})..."
+        
+        if yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ Packages installed"
         else
-            # If normal install fails, try with --nobest
-            log "Normal install failed, trying with --nobest flag..."
-            if yum $dnf_proxy_opts $DNF_SSL_OPT --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
-                log "✓ Packages installed successfully (using older versions)"
-            else
-                exit_on_error "Failed to install packages: ${packages[*]}"
-            fi
+            yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE" || \
+                exit_on_error "Failed to install: ${packages[*]}"
         fi
-    
     else
-        exit_on_error "No supported package manager found (apt-get, dnf, or yum)"
+        exit_on_error "No supported package manager found"
     fi
     
     log "✓ Package installation complete"
@@ -2671,6 +2783,7 @@ EOF
 validate_os
 check_execution_context
 validate_proxy_config
+setup_proxy_strategy
 
 # Create scripts directory with correct ownership
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
@@ -3315,72 +3428,33 @@ sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_passwor
 ######################################################
 
 if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    echo ""
-    echo "=========================================="
-    echo "Installing Docker Dependencies"
-    echo "=========================================="
-    echo ""
-    
-    # Check if container-selinux is already installed
-    if rpm -q container-selinux &>/dev/null; then
-        log "✓ container-selinux already installed"
-    else
-        log "Installing container-selinux (required for Docker)..."
+    if ! rpm -q container-selinux &>/dev/null; then
+        log "Installing container-selinux..."
         
-        # Method 1: Try normal install from available repos
-        if sudo dnf --setopt=skip_if_unavailable=True install -y container-selinux 2>&1 | tee -a "$LOGFILE"; then
-            log "✓ container-selinux installed successfully"
-        else
-            log "Normal install failed, trying with --nobest..."
+        # Try from configured repos (respects proxy strategy)
+        if sudo dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install container-selinux 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ container-selinux installed"
             
-            # Method 2: Try with --nobest to use older version
-            if sudo dnf --setopt=skip_if_unavailable=True install -y container-selinux --nobest 2>&1 | tee -a "$LOGFILE"; then
-                log "✓ container-selinux installed (older version)"
-            else
-                log "Standard repos failed, trying Rocky Linux repos..."
+        elif sudo dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install container-selinux --nobest 2>&1 | tee -a "$LOGFILE"; then
+            log "✓ container-selinux installed (older version)"
+            
+        else
+            # Fallback to Rocky Linux
+            log "Trying Rocky Linux repos..."
+            
+            if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -o /tmp/rocky-repos.rpm \
+                https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>&1 | tee -a "$LOGFILE"; then
                 
-                # Method 3: Try to add Rocky Linux repos and install from there
-                if curl -s -o /tmp/rocky-repos.rpm https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>&1 | tee -a "$LOGFILE"; then
-                    log "Rocky Linux repo package downloaded"
-                    
-                    if sudo rpm -ivh /tmp/rocky-repos.rpm 2>&1 | tee -a "$LOGFILE"; then
-                        log "Rocky Linux repos added"
-                        
-                        # Try to install from Rocky repos
-                        if sudo dnf --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos install -y container-selinux 2>&1 | tee -a "$LOGFILE"; then
-                            log "✓ container-selinux installed from Rocky Linux repos"
-                        else
-                            log "ERROR: Failed to install container-selinux from Rocky repos"
-                        fi
-                    fi
-                    rm -f /tmp/rocky-repos.rpm
-                else
-                    log "ERROR: Could not download Rocky Linux repos"
-                fi
+                sudo rpm -ivh /tmp/rocky-repos.rpm 2>&1 | tee -a "$LOGFILE" || true
+                rm -f /tmp/rocky-repos.rpm
+                
+                # Try installing from Rocky
+                sudo dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos -y install container-selinux 2>&1 | tee -a "$LOGFILE" || true
             fi
         fi
         
-        # Final check
         if ! rpm -q container-selinux &>/dev/null; then
-            echo ""
-            echo "=========================================="
-            echo "⚠️  WARNING: container-selinux Not Installed"
-            echo "=========================================="
-            echo ""
-            echo "Docker installation will likely fail without container-selinux."
-            echo ""
-            echo "This package is normally in RHEL BaseOS repos, but those repos"
-            echo "are currently unavailable due to SSL errors with T-Systems proxy."
-            echo ""
-            echo "Possible solutions:"
-            echo "  1. Fix access to RHEL repos (contact T-Systems IT)"
-            echo "  2. Manually configure alternative repos"
-            echo "  3. Use Podman instead of Docker (recommended for RHEL)"
-            echo ""
-            log "ERROR: container-selinux could not be installed"
-            exit_on_error "Cannot proceed without container-selinux"
-        else
-            log "✓ container-selinux is available"
+            exit_on_error "Failed to install container-selinux"
         fi
     fi
 fi
@@ -3403,15 +3477,15 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     # Add Docker's official GPG key
     sudo install -m 0755 -d /etc/apt/keyrings
     
-    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            curl -x "http://${PROXY_HOST}:${PROXY_PORT}" --proxy-user "${PROXY_USER}:${PROXY_PASSWORD}" -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        else
-            curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        fi
+    # Download GPG key (respects proxy strategy via curl)
+    if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -fsSL \
+        https://download.docker.com/linux/$OS_ID/gpg | \
+        sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>&1 | tee -a "$LOGFILE"; then
+        log "✓ Docker GPG key added"
     else
-        curl -fsSL https://download.docker.com/linux/$OS_ID/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        exit_on_error "Failed to download Docker GPG key"
     fi
+    
     sudo chmod a+r /etc/apt/keyrings/docker.gpg
 
     # Add repository
@@ -3419,28 +3493,49 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
     https://download.docker.com/linux/$OS_ID $OS_VERSION stable" | \
     sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
-    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
+    # Update package lists (respects proxy strategy)
+    sudo apt-get ${APT_PROXY_OPT_PROXY} ${APT_SSL_OPT} update || exit_on_error "Failed to update package lists"
+    
+    # Install Docker packages
+    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
+        export http_proxy='${http_proxy:-}'; \
+        export https_proxy='${https_proxy:-}'; \
+        export no_proxy='${no_proxy:-}'; \
+        PKG_MANAGER=$PKG_MANAGER \
+        APT_SSL_OPT='$APT_SSL_OPT' \
+        APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
+        PROXY_STRATEGY='$PROXY_STRATEGY' \
+        LOGFILE='$LOGFILE' \
+        install_packages docker-ce docker-ce-cli containerd.io"
+
 elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     log "Installing Docker via dnf..."
-    # Add Docker repo
-
-    # Global package-manager options (proxy + SSL)
-    DNF_OPTS=""
-
-    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-        if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-            ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-            DNF_OPTS+=" --setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        else
-            DNF_OPTS+=" --setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        fi
+    
+    # Download Docker repository file using curl (external resource - uses proxy)
+    log "Downloading Docker repository configuration..."
+    
+    if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -fsSL \
+        https://download.docker.com/linux/centos/docker-ce.repo \
+        -o /tmp/docker-ce.repo 2>&1 | tee -a "$LOGFILE"; then
+        
+        sudo mv /tmp/docker-ce.repo /etc/yum.repos.d/docker-ce.repo
+        log "✓ Docker repository added"
+    else
+        exit_on_error "Failed to download Docker repository"
     fi
-
-    [ -n "$DNF_SSL_OPT" ] && DNF_OPTS+=" $DNF_SSL_OPT"
-
-    sudo dnf $DNF_OPTS --setopt=skip_if_unavailable=True config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages docker-ce docker-ce-cli containerd.io"
+    
+    # Install Docker packages (DNF respects proxy strategy)
+    log "Installing Docker packages..."
+    sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
+        export http_proxy='${http_proxy:-}'; \
+        export https_proxy='${https_proxy:-}'; \
+        export no_proxy='${no_proxy:-}'; \
+        PKG_MANAGER=$PKG_MANAGER \
+        DNF_SSL_OPT='$DNF_SSL_OPT' \
+        DNF_PROXY_OPT='$DNF_PROXY_OPT' \
+        PROXY_STRATEGY='$PROXY_STRATEGY' \
+        LOGFILE='$LOGFILE' \
+        install_packages docker-ce docker-ce-cli containerd.io"
 fi
 
 # Verify Docker installation
@@ -4238,7 +4333,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         # Create remote installation script
         log "Creating installation script for $node..."
         
-        write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
+write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
 #!/bin/bash
 set -e
 set -x
@@ -4249,31 +4344,54 @@ echo "Installing Traefik on Backup Node"
 echo "=========================================="
 echo ""
 
-# Proxy support
+# Proxy configuration
 PROXY="__PROXY__"
+PROXY_STRATEGY="__PROXY_STRATEGY__"
+INTERNAL_REPO_DOMAINS="__INTERNAL_REPO_DOMAINS__"
+CURL_SSL_OPT="__CURL_SSL_OPT__"
 APT_SSL_OPT="__APT_SSL_OPT__"
 DNF_SSL_OPT="__DNF_SSL_OPT__"
-WGET_SSL_OPT="__WGET_SSL_OPT__"
 
+# Setup proxy based on strategy
 if [ -n "$PROXY" ]; then
-    if echo "$PROXY" | grep -q '@'; then
-        # Authenticated proxy
-        PROXY_DISPLAY="${PROXY#*@}"
-        PROXY_USER="${PROXY%@*}"
-        PROXY_USER="${PROXY_USER%%:*}"
-        echo "Using authenticated proxy: $PROXY_DISPLAY (user: $PROXY_USER)"
-    else
-        # No authentication
-        PROXY_DISPLAY="$PROXY"
-        echo "Using proxy: $PROXY_DISPLAY"
-    fi
-    
-    export http_proxy="http://$PROXY"
-    export https_proxy="http://$PROXY"
-    export no_proxy="localhost,127.0.0.1"
-    APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
-    DNF_PROXY_OPT="--setopt=proxy=http://$PROXY"
+    case "$PROXY_STRATEGY" in
+        "all")
+            # All connections via proxy - for strict firewall environments
+            echo "Proxy strategy: ALL (all repos via proxy)"
+            export http_proxy="http://$PROXY"
+            export https_proxy="http://$PROXY"
+            export no_proxy="localhost,127.0.0.1"
+            PROXY_CURL_OPTS="-x http://$PROXY"
+            APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
+            DNF_PROXY_OPT="--setopt=proxy=http://$PROXY"
+            ;;
+        "external")
+            # External via proxy, internal direct
+            echo "Proxy strategy: EXTERNAL (external via proxy, internal direct)"
+            NO_PROXY_LIST="localhost,127.0.0.1"
+            if [ -n "$INTERNAL_REPO_DOMAINS" ]; then
+                NO_PROXY_LIST="$NO_PROXY_LIST,$INTERNAL_REPO_DOMAINS"
+                echo "Internal domains (no proxy): $INTERNAL_REPO_DOMAINS"
+            fi
+            export http_proxy="http://$PROXY"
+            export https_proxy="http://$PROXY"
+            export no_proxy="$NO_PROXY_LIST"
+            PROXY_CURL_OPTS="-x http://$PROXY"
+            APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
+            DNF_PROXY_OPT=""  # DNF respects environment proxy with no_proxy
+            ;;
+        "none"|*)
+            # No proxy
+            echo "Proxy strategy: NONE (no proxy)"
+            unset http_proxy https_proxy
+            PROXY_CURL_OPTS=""
+            APT_PROXY_OPT=""
+            DNF_PROXY_OPT=""
+            ;;
+    esac
 else
+    echo "No proxy configured"
+    PROXY_CURL_OPTS=""
     APT_PROXY_OPT=""
     DNF_PROXY_OPT=""
 fi
@@ -4285,26 +4403,6 @@ fi
 
 if [ -n "$DNF_SSL_OPT" ]; then
     DNF_PROXY_OPT="$DNF_PROXY_OPT $DNF_SSL_OPT"
-fi
-
-# Use proxy and SSL options if configured
-        CURL_DOWNLOAD_OPTS="$CURL_SSL_OPT"
-        if [ -n "$PROXY" ]; then
-            if echo "$PROXY" | grep -q '@'; then
-                # Authenticated proxy - extract components
-                PROXY_AUTH="${PROXY%@*}"
-                PROXY_HOST="${PROXY#*@}"
-                PROXY_USER="${PROXY_AUTH%%:*}"
-                PROXY_PASS="${PROXY_AUTH#*:}"
-                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://${PROXY_HOST} -U ${PROXY_USER}:${PROXY_PASS}"
-            else
-                CURL_DOWNLOAD_OPTS="$CURL_DOWNLOAD_OPTS -x http://$PROXY"
-            fi
-        fi
-
-# Add SSL options if configured
-if [ -n "$APT_SSL_OPT" ]; then
-    APT_PROXY_OPT="$APT_PROXY_OPT $APT_SSL_OPT"
 fi
 
 echo "=== Installing on $(hostname) ==="
@@ -4339,15 +4437,42 @@ export NODE_ROLE="BACKUP"
 export PRIORITY="BACKUP_PRIORITY_PLACEHOLDER"
 export INSTALL_KEEPALIVED="yes"
 export MULTI_NODE_DEPLOYMENT="no"
-export BACKUP_NODE_INSTALL="yes"  # Flag to skip prompts
+export BACKUP_NODE_INSTALL="yes"
 
 # Install prerequisites
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT update -qq
-    sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano ipcalc
+    sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
 elif command -v dnf &>/dev/null; then
-    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq
+    # Try normal install first
+    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
+        # Try with --nobest if normal install fails
+        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq --nobest
+    fi
+fi
+
+# Install container-selinux for RHEL/CentOS (required for Docker)
+if command -v dnf &>/dev/null && ! rpm -q container-selinux &>/dev/null; then
+    echo "Installing container-selinux..."
+    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux; then
+        if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux --nobest; then
+            # Try Rocky repos as fallback (download with curl using proxy)
+            echo "Trying Rocky Linux repos..."
+            if curl $PROXY_CURL_OPTS $CURL_SSL_OPT -o /tmp/rocky-repos.rpm \
+                https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>/dev/null; then
+                sudo rpm -ivh /tmp/rocky-repos.rpm 2>/dev/null || true
+                sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos install -y container-selinux 2>/dev/null || true
+                rm -f /tmp/rocky-repos.rpm
+            fi
+        fi
+    fi
+    
+    if rpm -q container-selinux &>/dev/null; then
+        echo "✓ container-selinux installed"
+    else
+        echo "⚠️  WARNING: container-selinux not installed (Docker may fail)"
+    fi
 fi
 
 # Install Docker
@@ -4358,7 +4483,11 @@ if command -v apt-get &>/dev/null; then
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         echo "Adding Docker repository..."
         sudo install -m 0755 -d /etc/apt/keyrings
-        curl $CURL_DOWNLOAD_OPTS -fsSL https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        
+        # Download GPG key with curl (uses proxy)
+        curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
+            https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | \
+            sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
         
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -4372,12 +4501,25 @@ if command -v apt-get &>/dev/null; then
 elif command -v dnf &>/dev/null; then
     # RHEL/Rocky/CentOS Docker installation
     if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
-        echo "Adding Docker repository..."
-        sudo dnf $DNF_PROXY_OPT config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        echo "Downloading Docker repository..."
+        # Download repo file with curl (uses proxy)
+        if curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
+            https://download.docker.com/linux/centos/docker-ce.repo \
+            -o /tmp/docker-ce.repo; then
+            sudo mv /tmp/docker-ce.repo /etc/yum.repos.d/docker-ce.repo
+            echo "✓ Docker repository added"
+        else
+            echo "ERROR: Failed to download Docker repository"
+            exit 1
+        fi
     fi
     
     echo "Installing Docker packages..."
-    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io
+    # Try normal install first
+    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io; then
+        # Try with --nobest if normal install fails
+        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io --nobest
+    fi
     
 else
     echo "ERROR: No supported package manager found (apt or dnf)"
@@ -4394,7 +4536,7 @@ fi
 
 docker --version
 
-# Configure Docker proxy if needed
+# Configure Docker proxy if needed (for container pulls)
 if [ -n "$PROXY" ]; then
     echo "Configuring Docker daemon to use proxy..."
     sudo mkdir -p /etc/docker
@@ -4446,13 +4588,13 @@ TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
 TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
 DOCKER_COMPOSE_FILE="/home/haloap/traefik/docker-compose.yaml"
 
-# Ensure traefik.yml is not a directory (from manual creation or previous error)
+# Ensure traefik.yml is not a directory
 if [[ -d "$TRAEFIK_CONFIG_FILE" ]]; then
     echo "Removing incorrectly created directory: $TRAEFIK_CONFIG_FILE"
     sudo rm -rf "$TRAEFIK_CONFIG_FILE" || { echo "Failed to remove directory"; exit 1; }
 fi
 
-# Ensure clinical_conf.yml is not a directory (from manual creation or previous error)
+# Ensure clinical_conf.yml is not a directory
 if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
     echo "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
     sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || { echo "Failed to remove directory"; exit 1; }
@@ -4467,11 +4609,11 @@ fi
 # Ensure CERT_FILE and KEY_FILE are not directories
 if [[ -d "$CERT_FILE" ]]; then
     echo "Removing directory $CERT_FILE"
-    rm -rf "$CERT_FILE" || exit_on_error "Failed to remove directory $CERT_FILE"
+    rm -rf "$CERT_FILE" || exit 1
 fi
 if [[ -d "$KEY_FILE" ]]; then
     echo "Removing directory $KEY_FILE"
-    rm -rf "$KEY_FILE" || exit_on_error "Failed to remove directory $KEY_FILE"
+    rm -rf "$KEY_FILE" || exit 1
 fi
 
 # Copy certificates
@@ -4482,12 +4624,11 @@ if [ -n "$SSL_CERT_CONTENT" ] && [ -n "$SSL_KEY_CONTENT" ]; then
     chmod 600 "$KEY_FILE"
 fi
 
-# Create docker-compose.yaml (same as master)
+# Create docker-compose.yaml
 cat > /home/haloap/traefik/docker-compose.yaml <<'DOCKERCOMPOSE'
 services:
   traefik:
     image: docker.io/library/traefik:latest
-    # Using official Docker Hub image: docker.io/traefik/traefik:latest
     container_name: traefik
     restart: unless-stopped
     security_opt:
@@ -4506,7 +4647,7 @@ services:
       - ./logs:/var/log
 DOCKERCOMPOSE
 
-# Create traefik.yml (same as master)
+# Create traefik.yml
 cat > /home/haloap/traefik/config/traefik.yml <<'TRAEFIKCONF'
 entryPoints:
   http:
@@ -4531,14 +4672,6 @@ entryPoints:
 ping:
   entryPoint: 'ping'
 
-#log:
-#  level: DEBUG
-#  filePath: "/var/log/traefik.log"
-
-#accessLog:
-#  filePath: "/var/log/access.log"
-#  bufferingSize: 100
-
 providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
@@ -4551,11 +4684,6 @@ TRAEFIKCONF
 if [ -f "/tmp/clinical_conf.yml" ]; then
     cp /tmp/clinical_conf.yml /home/haloap/traefik/config/clinical_conf.yml
 fi
-
-# Create Docker network
-# if ! docker network inspect proxynet > /dev/null 2>&1; then
-#    docker network create proxynet
-# fi
 
 # Set ownership
 sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
@@ -4573,7 +4701,9 @@ echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
     sudo apt-get $APT_PROXY_OPT install -y keepalived
 elif command -v dnf &>/dev/null; then
-    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True install -y keepalived
+    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
+        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
+    fi
 fi
 
 # Create keepalived_script user/group
@@ -4596,31 +4726,28 @@ HEALTHCHECK
 sudo chmod +x /bin/haloap_service_check.sh
 sudo chown keepalived_script:docker /bin/haloap_service_check.sh
 
-# Auto-detect network interface for this backup node's IP
+# Auto-detect network interface
 echo "Auto-detecting network interface..."
 BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
-# Use the interface specified during configuration
 BACKUP_NODE_INTERFACE="BACKUP_INTERFACE_PLACEHOLDER"
 
 echo "Using configured interface: $BACKUP_NODE_INTERFACE"
 
-# Verify the interface exists on this node
+# Verify the interface exists
 if ! ip link show "$BACKUP_NODE_INTERFACE" &>/dev/null; then
-    echo "⚠️  WARNING: Interface $BACKUP_NODE_INTERFACE does not exist on this node!"
+    echo "⚠️  WARNING: Interface $BACKUP_NODE_INTERFACE does not exist!"
     echo "Available interfaces:"
     ip -o link show | awk '{print "  - " $2}' | sed 's/:$//'
     echo ""
-    echo "Attempting auto-detection as fallback..."
+    echo "Attempting auto-detection..."
     
-    BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
     DETECTED_INTERFACE=$(ip -o addr show | grep "inet $BACKUP_NODE_IP" | awk '{print $2}' | head -1)
     
     if [ -n "$DETECTED_INTERFACE" ]; then
         echo "✓ Auto-detected: $DETECTED_INTERFACE"
         BACKUP_NODE_INTERFACE="$DETECTED_INTERFACE"
     else
-        echo "❌ Auto-detection failed. Using configured interface anyway."
-        echo "   Keepalived may not work correctly!"
+        echo "❌ Auto-detection failed"
     fi
 fi
 
@@ -4683,7 +4810,10 @@ fi
         sed -i "s/BACKUP_PRIORITY_PLACEHOLDER/$priority/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s/BACKUP_NODE_IP_PLACEHOLDER/$ip/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s/BACKUP_INTERFACE_PLACEHOLDER/${BACKUP_INTERFACES[$i]}/g" "$SCRIPTS_DIR/install_backup_${node}.sh"
-        sed -i "s|__PROXY__|${PROXY_VAL}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__PROXY__|${PROXY_URL:-}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__PROXY_STRATEGY__|${PROXY_STRATEGY}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__INTERNAL_REPO_DOMAINS__|${INTERNAL_REPO_DOMAINS}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__CURL_SSL_OPT__|${CURL_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__APT_SSL_OPT__|${APT_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
