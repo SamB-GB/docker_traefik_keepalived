@@ -2783,7 +2783,7 @@ EOF
 validate_os
 check_execution_context
 validate_proxy_config
-setup_proxy_strategy
+setup_proxy_strategy || exit_on_error "Failed to setup proxy strategy"
 
 # Create scripts directory with correct ownership
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
@@ -3384,20 +3384,6 @@ echo "Install Prerequisites"
 echo "=========================================="
 echo ""
 
-# Set proxy options for package managers
-APT_PROXY_OPT=""
-DNF_PROXY_OPT=""
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-        ENCODED_PASS=$(printf '%s' "${PROXY_PASSWORD}" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "${PROXY_PASSWORD}" 2>/dev/null || echo "${PROXY_PASSWORD}")
-        APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-        DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-    else
-        APT_PROXY_OPT="-o Acquire::http::Proxy=http://${PROXY_HOST}:${PROXY_PORT} -o Acquire::https::Proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-        DNF_PROXY_OPT="--setopt=proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-    fi
-fi
-
 # Define prerequisites based on package manager
 if [[ "$PKG_MANAGER" == "apt" ]]; then
     PREREQ_PACKAGES=(
@@ -3413,7 +3399,9 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
         gnupg2 wget nano iproute python3 jq
     )
     log "Cleaning dnf metadata..."
-    sudo dnf $DNF_PROXY_OPT --setopt=skip_if_unavailable=True clean all || exit_on_error "Failed to clean dnf metadata"
+    sudo dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True clean all || {
+        log "Warning: dnf clean had issues, continuing..."
+    }
 fi
 
 # Install prerequisites using install_packages function
