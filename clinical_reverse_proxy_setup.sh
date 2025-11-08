@@ -3571,7 +3571,7 @@ if [[ "$PKG_MANAGER" == "apt" ]]; then
         wget nano ipcalc
     )
     log "Updating apt package lists..."
-    sudo apt-get $APT_PROXY_OPT update || exit_on_error "Failed to update package lists"
+    sudo apt-get $APT_PROXY_OPT_PROXY update || exit_on_error "Failed to update package lists"
 elif [[ "$PKG_MANAGER" == "dnf" ]]; then
     PREREQ_PACKAGES=(
         ca-certificates curl dnf-plugins-core
@@ -4560,6 +4560,7 @@ if [ -n "$PROXY" ]; then
             export no_proxy="localhost,127.0.0.1"
             PROXY_CURL_OPTS="-x $PROXY"
             APT_PROXY_OPT="-o Acquire::http::Proxy=$PROXY -o Acquire::https::Proxy=$PROXY"
+            APT_PROXY_OPT_PROXY="$APT_PROXY_OPT"
             DNF_PROXY_OPT="--setopt=proxy=$PROXY"
             ;;
         "external")
@@ -4575,6 +4576,7 @@ if [ -n "$PROXY" ]; then
             export no_proxy="$NO_PROXY_LIST"
             PROXY_CURL_OPTS="-x $PROXY"
             APT_PROXY_OPT="-o Acquire::http::Proxy=$PROXY -o Acquire::https::Proxy=$PROXY"
+            APT_PROXY_OPT_PROXY="$APT_PROXY_OPT"
             DNF_PROXY_OPT=""  # DNF respects environment proxy with no_proxy
             ;;
         "none"|*)
@@ -4639,8 +4641,8 @@ export BACKUP_NODE_INSTALL="yes"
 # Install prerequisites
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
-    sudo -E apt-get $APT_PROXY_OPT update -qq
-    sudo -E apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
+    sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
+    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
 elif command -v dnf &>/dev/null; then
     # Try normal install first
     if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
@@ -4689,11 +4691,11 @@ if command -v apt-get &>/dev/null; then
         
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         
-        sudo -E apt-get $APT_PROXY_OPT update -qq
+        sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
     fi
     
     echo "Installing Docker packages..."
-    sudo -E apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
+    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y docker-ce docker-ce-cli containerd.io
     
 elif command -v dnf &>/dev/null; then
     # RHEL/Rocky/CentOS Docker installation
@@ -4896,7 +4898,7 @@ sleep 5
 # Install Keepalived
 echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
-    sudo -E apt-get $APT_PROXY_OPT install -y keepalived
+    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y keepalived
 elif command -v dnf &>/dev/null; then
     if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
         sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
