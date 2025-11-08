@@ -3585,7 +3585,22 @@ fi
 
 # Install prerequisites using install_packages function
 log "Installing base packages..."
-sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages ${PREREQ_PACKAGES[*]}"
+sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
+    export http_proxy='${http_proxy:-}'; \
+    export https_proxy='${https_proxy:-}'; \
+    export no_proxy='${no_proxy:-}'; \
+    PKG_MANAGER=$PKG_MANAGER \
+    PROXY_HOST='$PROXY_HOST' \
+    PROXY_PORT='$PROXY_PORT' \
+    PROXY_USER='$PROXY_USER' \
+    PROXY_PASSWORD='$PROXY_PASSWORD' \
+    APT_SSL_OPT='$APT_SSL_OPT' \
+    DNF_SSL_OPT='$DNF_SSL_OPT' \
+    DNF_PROXY_OPT='$DNF_PROXY_OPT' \
+    APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
+    PROXY_STRATEGY='$PROXY_STRATEGY' \
+    LOGFILE='$LOGFILE' \
+    install_packages ${PREREQ_PACKAGES[*]}"
 
 ### END installing Prerequisites 
 ######################################################
@@ -4181,7 +4196,22 @@ echo ""
 
 # Install Keepalived
 log "Installing Keepalived..."
-sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); PKG_MANAGER=$PKG_MANAGER PROXY_HOST='$PROXY_HOST' PROXY_PORT='$PROXY_PORT' PROXY_USER='$PROXY_USER' PROXY_PASSWORD='$PROXY_PASSWORD' APT_SSL_OPT='$APT_SSL_OPT' DNF_SSL_OPT='$DNF_SSL_OPT' LOGFILE='$LOGFILE' install_packages keepalived"
+sudo bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
+    export http_proxy='${http_proxy:-}'; \
+    export https_proxy='${https_proxy:-}'; \
+    export no_proxy='${no_proxy:-}'; \
+    PKG_MANAGER=$PKG_MANAGER \
+    PROXY_HOST='$PROXY_HOST' \
+    PROXY_PORT='$PROXY_PORT' \
+    PROXY_USER='$PROXY_USER' \
+    PROXY_PASSWORD='$PROXY_PASSWORD' \
+    APT_SSL_OPT='$APT_SSL_OPT' \
+    DNF_SSL_OPT='$DNF_SSL_OPT' \
+    DNF_PROXY_OPT='$DNF_PROXY_OPT' \
+    APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
+    PROXY_STRATEGY='$PROXY_STRATEGY' \
+    LOGFILE='$LOGFILE' \
+    install_packages keepalived"
 
 log "Deferring KeepAlived Startup until configuration file generated"
 
