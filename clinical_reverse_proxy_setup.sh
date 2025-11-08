@@ -4555,12 +4555,12 @@ if [ -n "$PROXY" ]; then
         "all")
             # All connections via proxy - for strict firewall environments
             echo "Proxy strategy: ALL (all repos via proxy)"
-            export http_proxy="http://$PROXY"
-            export https_proxy="http://$PROXY"
+            export http_proxy="$PROXY" 
+            export https_proxy="$PROXY"
             export no_proxy="localhost,127.0.0.1"
-            PROXY_CURL_OPTS="-x http://$PROXY"
-            APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
-            DNF_PROXY_OPT="--setopt=proxy=http://$PROXY"
+            PROXY_CURL_OPTS="-x $PROXY"
+            APT_PROXY_OPT="-o Acquire::http::Proxy=$PROXY -o Acquire::https::Proxy=$PROXY"
+            DNF_PROXY_OPT="--setopt=proxy=$PROXY"
             ;;
         "external")
             # External via proxy, internal direct
@@ -4570,11 +4570,11 @@ if [ -n "$PROXY" ]; then
                 NO_PROXY_LIST="$NO_PROXY_LIST,$INTERNAL_REPO_DOMAINS"
                 echo "Internal domains (no proxy): $INTERNAL_REPO_DOMAINS"
             fi
-            export http_proxy="http://$PROXY"
-            export https_proxy="http://$PROXY"
+            export http_proxy="$PROXY" 
+            export https_proxy="$PROXY"
             export no_proxy="$NO_PROXY_LIST"
-            PROXY_CURL_OPTS="-x http://$PROXY"
-            APT_PROXY_OPT="-o Acquire::http::Proxy=http://$PROXY -o Acquire::https::Proxy=http://$PROXY"
+            PROXY_CURL_OPTS="-x $PROXY"
+            APT_PROXY_OPT="-o Acquire::http::Proxy=$PROXY -o Acquire::https::Proxy=$PROXY"
             DNF_PROXY_OPT=""  # DNF respects environment proxy with no_proxy
             ;;
         "none"|*)
