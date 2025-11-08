@@ -4639,21 +4639,21 @@ export BACKUP_NODE_INSTALL="yes"
 # Install prerequisites
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
-    sudo apt-get $APT_PROXY_OPT update -qq
-    sudo apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
+    sudo -E apt-get $APT_PROXY_OPT update -qq
+    sudo -E apt-get $APT_PROXY_OPT install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
 elif command -v dnf &>/dev/null; then
     # Try normal install first
-    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
         # Try with --nobest if normal install fails
-        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq --nobest
+        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq --nobest
     fi
 fi
 
 # Install container-selinux for RHEL/CentOS (required for Docker)
 if command -v dnf &>/dev/null && ! rpm -q container-selinux &>/dev/null; then
     echo "Installing container-selinux..."
-    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux; then
-        if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux --nobest; then
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux; then
+        if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux --nobest; then
             # Try Rocky repos as fallback (download with curl using proxy)
             echo "Trying Rocky Linux repos..."
             if curl $PROXY_CURL_OPTS $CURL_SSL_OPT -o /tmp/rocky-repos.rpm \
@@ -4689,11 +4689,11 @@ if command -v apt-get &>/dev/null; then
         
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         
-        sudo apt-get $APT_PROXY_OPT update -qq
+        sudo -E apt-get $APT_PROXY_OPT update -qq
     fi
     
     echo "Installing Docker packages..."
-    sudo apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
+    sudo -E apt-get $APT_PROXY_OPT install -y docker-ce docker-ce-cli containerd.io
     
 elif command -v dnf &>/dev/null; then
     # RHEL/Rocky/CentOS Docker installation
@@ -4713,9 +4713,9 @@ elif command -v dnf &>/dev/null; then
     
     echo "Installing Docker packages..."
     # Try normal install first
-    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io; then
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io; then
         # Try with --nobest if normal install fails
-        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io --nobest
+        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io --nobest
     fi
     
 else
@@ -4896,10 +4896,10 @@ sleep 5
 # Install Keepalived
 echo "Installing Keepalived..."
 if command -v apt-get &>/dev/null; then
-    sudo apt-get $APT_PROXY_OPT install -y keepalived
+    sudo -E apt-get $APT_PROXY_OPT install -y keepalived
 elif command -v dnf &>/dev/null; then
-    if ! sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
-        sudo dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
+        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
     fi
 fi
 
