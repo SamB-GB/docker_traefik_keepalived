@@ -4747,8 +4747,8 @@ if [ -n "$PROXY" ]; then
     sudo tee /etc/docker/daemon.json > /dev/null <<DOCKEREOF
 {
   "proxies": {
-    "http-proxy": "http://$PROXY",
-    "https-proxy": "http://$PROXY",
+    "http-proxy": "$PROXY",
+    "https-proxy": "$PROXY",
     "no-proxy": "localhost,127.0.0.1"
   }
 }
@@ -5000,6 +5000,21 @@ if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         PROXY_VAL="${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
     else
         PROXY_VAL="${PROXY_HOST}:${PROXY_PORT}"
+    fi
+fi
+
+# Extract detected internal domains from current no_proxy setting
+# This ensures backup nodes get the same no_proxy list as master
+if [ "$PROXY_STRATEGY" = "external" ] && [ -n "${no_proxy:-}" ]; then
+    # Extract domains from no_proxy, excluding localhost entries
+    DETECTED_INTERNAL_DOMAINS=$(echo "${no_proxy}" | tr ',' '\n' | \
+        grep -v '^localhost$\|^127\.0\.0\.1$\|^::1$\|^\.local$' | \
+        tr '\n' ',' | sed 's/,$//')
+    
+    # Use detected domains if INTERNAL_REPO_DOMAINS is empty
+    if [ -z "${INTERNAL_REPO_DOMAINS}" ] && [ -n "${DETECTED_INTERNAL_DOMAINS}" ]; then
+        INTERNAL_REPO_DOMAINS="${DETECTED_INTERNAL_DOMAINS}"
+        log "Passing detected internal domains to backup node: ${INTERNAL_REPO_DOMAINS}"
     fi
 fi
         
