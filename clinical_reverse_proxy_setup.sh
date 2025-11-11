@@ -15,11 +15,11 @@ set -e
 # HTTP/HTTPS proxy for outbound downloads (curl/wget/apt/dnf)
 # Leave blank if no proxy is needed
 # Note: Passwords with special characters will be automatically URL-encoded
-PROXY_HOST="eis-prx006.krages.int"  # Example: "proxy.company.com"
-PROXY_PORT="8080"  # Example: "8080"
-PROXY_USER="BARR3207"
-PROXY_PASSWORD="LF9s3C7!gamU" # Special characters will be handled automatically
-SKIP_SSL_VERIFY="true"  # Set to "true" to disable SSL verification (not recommended)
+PROXY_HOST=""  # Example: "proxy.company.com"
+PROXY_PORT=""  # Example: "8080"
+PROXY_USER=""
+PROXY_PASSWORD="" # Special characters will be handled automatically
+SKIP_SSL_VERIFY="false"  # Set to "true" to disable SSL verification (not recommended)
 
 # Proxy Strategy - How to handle internal vs external repos
 # Options:
@@ -3817,6 +3817,103 @@ log "✓ Docker verification complete"
 ######################################################
 
 ######################################################
+### START Docker Repository Management
+######################################################
+
+if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+    echo ""
+    echo "=========================================="
+    echo "Docker Repository Management"
+    echo "=========================================="
+    echo ""
+    echo "Docker has been installed successfully: $(docker --version)"
+    echo ""
+    echo "You are using a proxy configuration. External Docker repositories may cause"
+    echo "future system update failures (apt update / dnf update) due to:"
+    echo "  • Proxy authentication issues"
+    echo "  • SSL inspection/certificate problems"
+    echo "  • Network connectivity issues"
+    echo ""
+    echo "Options:"
+    echo ""
+    echo "  [1] Disable Docker repository (RECOMMENDED)"
+    echo "      ✓ Prevents 'apt update' / 'dnf update' failures"
+    echo "      ✓ Docker version stays stable"
+    echo "      ✓ Can be re-enabled when needed for updates"
+    echo "      ✓ Docker pulls still work (daemon.json handles proxy)"
+    echo ""
+    echo "  [2] Keep Docker repository enabled"
+    echo "      ✓ Allows automatic Docker package updates"
+    echo "      ✗ May cause 'apt update' / 'dnf update' to fail"
+    echo "      ✗ Requires working proxy for all system updates"
+    echo ""
+    
+    read -p "Disable Docker repository? (yes/no) [yes]: " DISABLE_DOCKER_REPO
+    DISABLE_DOCKER_REPO=${DISABLE_DOCKER_REPO:-yes}
+    
+    if [[ "$DISABLE_DOCKER_REPO" =~ ^[Yy] ]]; then
+        log "Disabling Docker repository..."
+        
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            # Debian/Ubuntu - disable Docker repository
+            if [ -f /etc/apt/sources.list.d/docker.list ]; then
+                sudo mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled
+                log "✓ Docker repository disabled"
+                log "  Moved to: /etc/apt/sources.list.d/docker.list.disabled"
+            fi
+            
+            # Also disable Docker GPG key (prevents apt update warnings)
+            if [ -f /etc/apt/keyrings/docker.gpg ]; then
+                sudo mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled 2>/dev/null || true
+            fi
+            
+            echo ""
+            echo "✓ Docker repository disabled"
+            echo ""
+            echo "To re-enable Docker repository for updates:"
+            echo "  sudo mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list"
+            echo "  sudo mv /etc/apt/keyrings/docker.gpg.disabled /etc/apt/keyrings/docker.gpg"
+            echo "  sudo -E apt-get update"
+            
+        elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+            # RHEL/CentOS/Rocky/AlmaLinux - disable Docker repository
+            if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
+                if command -v dnf &>/dev/null && dnf config-manager --help &>/dev/null 2>&1; then
+                    sudo dnf config-manager --set-disabled docker-ce-stable 2>/dev/null
+                else
+                    sudo sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/docker-ce.repo
+                fi
+                log "✓ Docker repository disabled"
+            fi
+            
+            echo ""
+            echo "✓ Docker repository disabled"
+            echo ""
+            echo "To re-enable Docker repository for updates:"
+            echo "  sudo dnf config-manager --set-enabled docker-ce-stable"
+            echo "  sudo -E dnf update"
+        fi
+        
+        echo ""
+        log "Docker version locked at: $(docker --version)"
+        
+    else
+        log "Docker repository kept enabled"
+        echo ""
+        echo "⚠️  Note: Future 'apt update' or 'dnf update' commands may fail if"
+        echo "   the proxy configuration or SSL certificates cause issues with"
+        echo "   external Docker repositories."
+        echo ""
+    fi
+    
+else
+    log "No proxy configured - Docker repository remains enabled for automatic updates"
+fi
+
+### END Docker Repository Management
+######################################################
+
+######################################################
 ### START Prompt for SSL and KEY and then validate
 
 # Prompt user for certificates (if not already loaded)
@@ -4779,6 +4876,29 @@ if ! groups "$CURRENT_USER" | grep -q docker; then
     sudo usermod -aG docker "$CURRENT_USER"
 fi
 
+# Disable Docker repository based on master's configuration
+DISABLE_DOCKER_REPO="__DISABLE_DOCKER_REPO__"
+
+if [ "$DISABLE_DOCKER_REPO" = "yes" ]; then
+    echo "Disabling Docker repositories (as configured on master node)..."
+    
+    if command -v apt-get &>/dev/null; then
+        if [ -f /etc/apt/sources.list.d/docker.list ]; then
+            sudo mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled 2>/dev/null || true
+            sudo mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled 2>/dev/null || true
+            echo "✓ Docker repository disabled"
+        fi
+    elif command -v dnf &>/dev/null; then
+        if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
+            sudo dnf config-manager --set-disabled docker-ce-stable 2>/dev/null || \
+                sudo sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/docker-ce.repo
+            echo "✓ Docker repository disabled"
+        fi
+    fi
+else
+    echo "Docker repository kept enabled (as configured on master node)"
+fi
+
 # Create Traefik directories
 sudo mkdir -p /home/haloap/traefik/{certs,config,logs}
 sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
@@ -5031,6 +5151,7 @@ fi
         sed -i "s|__APT_SSL_OPT__|${APT_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__DISABLE_DOCKER_REPO__|${DISABLE_DOCKER_REPO}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
         # Also need to copy clinical_conf.yml to remote
@@ -5270,6 +5391,43 @@ fi
 
 echo "=========================================="
 echo ""
+echo "=========================================="
+echo "Repository Configuration"
+echo "=========================================="
+
+if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+    if [[ "$DISABLE_DOCKER_REPO" =~ ^[Yy] ]]; then
+        echo "Docker Repository: DISABLED"
+        echo "  Current version: $(docker --version)"
+        echo "  This prevents proxy/SSL issues during system updates"
+        echo ""
+        
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            echo "To update Docker in the future:"
+            echo "  1. sudo mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list"
+            echo "  2. sudo mv /etc/apt/keyrings/docker.gpg.disabled /etc/apt/keyrings/docker.gpg"
+            echo "  3. export http_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            echo "     export https_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            echo "  4. sudo -E apt-get update && sudo -E apt-get upgrade docker-ce"
+            echo "  5. sudo mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled"
+            echo "     sudo mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled"
+        elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+            echo "To update Docker in the future:"
+            echo "  1. sudo dnf config-manager --set-enabled docker-ce-stable"
+            echo "  2. export http_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            echo "     export https_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
+            echo "  3. sudo -E dnf upgrade docker-ce docker-ce-cli containerd.io"
+            echo "  4. sudo dnf config-manager --set-disabled docker-ce-stable"
+        fi
+    else
+        echo "Docker Repository: ENABLED"
+        echo "  Docker updates available via normal system updates"
+        echo "  ⚠️  Note: System updates may fail if proxy/SSL issues occur"
+    fi
+else
+    echo "Docker Repository: ENABLED"
+    echo "  No proxy configured - automatic updates available"
+fi
 
 # Cleanup temporary scripts directory
 cleanup
