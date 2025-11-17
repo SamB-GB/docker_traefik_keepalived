@@ -2396,6 +2396,7 @@ EOF
       middlewares:
         - SecurityHeaders
         - compress
+        - cors
       service: image-service
       tls: {}
       
@@ -2410,6 +2411,19 @@ EOF
         browserXssFilter: true
     compress:
       compress: {}
+
+    cors:
+      headers:
+        accessControlAllowOriginList:
+          - "*"
+        accessControlAllowMethods:
+          - "GET"
+          - "OPTIONS"
+        accessControlAllowHeaders:
+          - "Authorization"
+          - "Content-Type"
+        accessControlAllowCredentials: false
+        addVaryHeader: true
 EOF
 
     else
