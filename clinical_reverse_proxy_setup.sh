@@ -2388,6 +2388,8 @@ EOF
         done
 
         cat >> "$config_file" <<EOF
+        sticky:
+          cookie: {}
   routers:
     image-router:
       rule: "PathPrefix(\`/\`)"
@@ -2577,23 +2579,17 @@ EOF
 if [[ "$service" == "idp-service" ]]; then
     cat >> "$config_file" <<EOF
         sticky:
-          cookie:
-            name: "idp-session"
-            secure: true
+          cookie: {}
 EOF
 elif [[ "$service" == "api-service" ]]; then
     cat >> "$config_file" <<EOF
         sticky:
-          cookie:
-            name: "api-session"
-            secure: true
+          cookie: {}
 EOF
 elif [[ "$service" == "image-service" ]]; then
     cat >> "$config_file" <<EOF
         sticky:
-          cookie:
-            name: "image-session"
-            secure: true
+          cookie: {}
 EOF
 fi
 
