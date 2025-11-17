@@ -3567,7 +3567,7 @@ echo ""
 if [[ "$PKG_MANAGER" == "apt" ]]; then
     PREREQ_PACKAGES=(
         apt-transport-https ca-certificates curl 
-        software-properties-common gnupg lsb-release 
+        gnupg lsb-release 
         wget nano ipcalc
     )
     log "Updating apt package lists..."
@@ -4739,7 +4739,7 @@ export BACKUP_NODE_INSTALL="yes"
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
     sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
-    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget nano
+    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq apt-transport-https ca-certificates curl gnupg lsb-release wget nano
 elif command -v dnf &>/dev/null; then
     # Try normal install first
     if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
