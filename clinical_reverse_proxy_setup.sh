@@ -1825,6 +1825,11 @@ load_config() {
         fi
 
         # Recreate the certificate and key files from the saved content
+        # Ensure the directory exists
+        CERT_DIR=$(dirname "$CERT_FILE")
+        sudo mkdir -p "$CERT_DIR"
+        sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap || exit_on_error "Failed to set ownership on /home/haloap"
+
         touch "$CERT_FILE"
         touch "$KEY_FILE"
         echo "$SSL_CERT_CONTENT" > "$CERT_FILE"
