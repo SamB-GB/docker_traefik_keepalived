@@ -4128,7 +4128,10 @@ entryPoints:
           to: 'https'
           scheme: 'https'
       encodedCharacters:
-        allowEncodedBackSlash: true
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
   https:
     address: ':443'
     transport:
@@ -4137,7 +4140,10 @@ entryPoints:
         idleTimeout: 0
     http:
       encodedCharacters:
-        allowEncodedBackSlash: true
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
   ping:
     address: ':8800'
 ping:
@@ -5001,7 +5007,10 @@ entryPoints:
           to: 'https'
           scheme: 'https'
       encodedCharacters:
-        allowEncodedBackSlash: true
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
   https:
     address: ':443'
     transport:
@@ -5010,14 +5019,17 @@ entryPoints:
         idleTimeout: 0
     http:
       encodedCharacters:
-        allowEncodedBackSlash: true
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
   ping:
     address: ':8800'
 ping:
   entryPoint: 'ping'
 
 #log:
-#  level: DEBUG
+#  level: WARN
 #  filePath: "/var/log/traefik.log"
 
 #accessLog:
