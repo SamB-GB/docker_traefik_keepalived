@@ -4127,12 +4127,17 @@ entryPoints:
         entryPoint:
           to: 'https'
           scheme: 'https'
+      encodedCharacters:
+        allowEncodedBackSlash: true
   https:
     address: ':443'
     transport:
       respondingTimeouts:
         readTimeout: 0
         idleTimeout: 0
+    http:
+      encodedCharacters:
+        allowEncodedBackSlash: true
   ping:
     address: ':8800'
 ping:
@@ -4995,16 +5000,29 @@ entryPoints:
         entryPoint:
           to: 'https'
           scheme: 'https'
+      encodedCharacters:
+        allowEncodedBackSlash: true
   https:
     address: ':443'
     transport:
       respondingTimeouts:
         readTimeout: 0
         idleTimeout: 0
+    http:
+      encodedCharacters:
+        allowEncodedBackSlash: true
   ping:
     address: ':8800'
 ping:
   entryPoint: 'ping'
+
+#log:
+#  level: DEBUG
+#  filePath: "/var/log/traefik.log"
+
+#accessLog:
+#  filePath: "/var/log/access.log"
+#  bufferingSize: 100
 
 providers:
   docker:
