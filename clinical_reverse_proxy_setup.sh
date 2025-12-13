@@ -5029,7 +5029,7 @@ ping:
   entryPoint: 'ping'
 
 #log:
-#  level: WARN
+#  level: DEBUG
 #  filePath: "/var/log/traefik.log"
 
 #accessLog:
