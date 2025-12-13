@@ -5055,7 +5055,7 @@ sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
 # Start Traefik
 echo "Starting Traefik..."
 cd /home/haloap/traefik
-docker compose up -d --force-recreate
+docker compose up -d --force-recreate --pull always
 
 # Wait for Traefik to start
 sleep 5
