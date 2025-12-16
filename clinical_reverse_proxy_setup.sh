@@ -5007,10 +5007,10 @@ entryPoints:
           to: 'https'
           scheme: 'https'
       encodedCharacters:
-        allowEncodedBackSlash: true   # \  (UNC paths)
-        allowEncodedSemicolon: true   # ;
-        allowEncodedPercent: true     # %
-        allowEncodedHash: true        # #
+        allowEncodedBackSlash: true
+        allowEncodedSemicolon: true
+        allowEncodedPercent: true
+        allowEncodedHash: true
   https:
     address: ':443'
     transport:
@@ -5019,10 +5019,10 @@ entryPoints:
         idleTimeout: 0
     http:
       encodedCharacters:
-        allowEncodedBackSlash: true   # \  (UNC paths)
-        allowEncodedSemicolon: true   # ;
-        allowEncodedPercent: true     # %
-        allowEncodedHash: true        # #
+        allowEncodedBackSlash: true
+        allowEncodedSemicolon: true
+        allowEncodedPercent: true
+        allowEncodedHash: true
   ping:
     address: ':8800'
 ping:
