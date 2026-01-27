@@ -3142,11 +3142,11 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         PASS_B64=$(printf '%s' "$SUDO_PASS" | base64 -w0 2>/dev/null || printf '%s' "$SUDO_PASS" | base64)
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" \
-                "echo '$PASS_B64' | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
+            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@${ip}" \
+                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
         else
-            TEST_RESULT=$(ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" \
-                "echo '$PASS_B64' | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
+            TEST_RESULT=$(ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@${ip}" \
+                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
         fi
         
         if echo "$TEST_RESULT" | grep -q "SUDO_OK"; then
