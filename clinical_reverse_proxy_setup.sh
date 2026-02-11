@@ -173,9 +173,9 @@ run_remote_sudo() {
     local cmd=$2
     
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" -- bash -lc "echo \"$SUDO_PASS\" | ssh $SSH_OPTS '$CURRENT_USER@$ip' 'sudo -S bash -c \"$cmd\"'"
+        sudo -u "$SUDO_USER" -- bash -lc "echo \"$SUDO_PASS\" | ssh $SSH_OPTS -l '$CURRENT_USER' '$ip' 'sudo -S bash -c \"$cmd\"'"
     else
-        echo "$SUDO_PASS" | ssh $SSH_OPTS "$CURRENT_USER@$ip" "sudo -S bash -c \"$cmd\""
+        echo "$SUDO_PASS" | ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "sudo -S bash -c \"$cmd\""
     fi
 }
 
@@ -191,13 +191,13 @@ copy_to_remote() {
 
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
         # Try scp first with legacy protocol
-        if ! sudo -u "$SUDO_USER" scp -q $KEY_OPT $COPYS_OPTS "$file" "$CURRENT_USER@$ip:$dest" 2>/tmp/scp_err.$$; then
+        if ! sudo -u "$SUDO_USER" scp -q -o "User=$CURRENT_USER" $KEY_OPT $COPYS_OPTS "$file" "$ip:$dest" 2>/tmp/scp_err.$$; then
             # Fallback: stream over ssh without SFTP/SCP
-            sudo -u "$SUDO_USER" ssh $KEY_OPT $COPYS_OPTS "$CURRENT_USER@$ip" "cat > '$dest'" < "$file"
+            sudo -u "$SUDO_USER" ssh $KEY_OPT $COPYS_OPTS -l "$CURRENT_USER" "$ip" "cat > '$dest'" < "$file"
         fi
     else
-        if ! scp -q $KEY_OPT $COPYS_OPTS "$file" "$CURRENT_USER@$ip:$dest" 2>/tmp/scp_err.$$; then
-            ssh $KEY_OPT $COPYS_OPTS "$CURRENT_USER@$ip" "cat > '$dest'" < "$file"
+        if ! scp -q -o "User=$CURRENT_USER" $KEY_OPT $COPYS_OPTS "$file" "$ip:$dest" 2>/tmp/scp_err.$$; then
+            ssh $KEY_OPT $COPYS_OPTS -l "$CURRENT_USER" "$ip" "cat > '$dest'" < "$file"
         fi
     fi
     rm -f /tmp/scp_err.$$
@@ -207,9 +207,9 @@ copy_to_remote() {
 ensure_SCRIPTS_DIR() {
     local ip=$1
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "mkdir -p $SCRIPTS_DIR && chmod 755 $SCRIPTS_DIR"
+        sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "mkdir -p '$SCRIPTS_DIR' && chmod 755 '$SCRIPTS_DIR'"
     else
-        ssh $SSH_OPTS "$CURRENT_USER@$ip" "mkdir -p $SCRIPTS_DIR && chmod 755 $SCRIPTS_DIR"
+        ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "mkdir -p '$SCRIPTS_DIR' && chmod 755 '$SCRIPTS_DIR'"
     fi
 }
 
@@ -481,7 +481,7 @@ cleanup_remote_scripts_dirs() {
         
         # Try to remove the scripts directory on remote host
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            if sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
+            if sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
                 echo "✓ Done"
             else
                 echo "⚠️  Warning (cleanup failed, but not critical)"
@@ -489,7 +489,7 @@ cleanup_remote_scripts_dirs() {
                 failed_cleanups+=("$name")
             fi
         else
-            if ssh $SSH_OPTS "$CURRENT_USER@$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
+            if ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "rm -rf '$SCRIPTS_DIR' 2>/dev/null" 2>/dev/null; then
                 echo "✓ Done"
             else
                 echo "⚠️  Warning (cleanup failed, but not critical)"
@@ -607,9 +607,9 @@ WRAPPER
     copy_to_remote "$SCRIPTS_DIR/run_script_wrapper.sh" "$ip" "$SCRIPTS_DIR/run_script.sh"
 
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh' && rm -f '$SCRIPTS_DIR/run_script.sh'"
     else
-        ssh -tt $SSH_OPTS "$CURRENT_USER@$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash $SCRIPTS_DIR/run_script.sh && rm -f $SCRIPTS_DIR/run_script.sh"
+        ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh' && rm -f '$SCRIPTS_DIR/run_script.sh'"
     fi
     
     rm -f "$SCRIPTS_DIR/run_script_wrapper.sh"
@@ -730,7 +730,7 @@ validate_os() {
     # Check version for Ubuntu
     if [ "$OS_ID" = "ubuntu" ]; then
         case "$VERSION_ID" in
-            20.04|22.04|24.04)
+            20.04*|22.*|24.*|25.*)
                 echo "✓ Version: $VERSION_ID (supported)"
                 ;;
             *)
@@ -973,9 +973,9 @@ check_single_node() {
         local cmd="$1"
         if [ "$check_type" = "remote" ]; then
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$node_ip" "$cmd" 2>/dev/null
+                sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$node_ip" "$cmd" 2>/dev/null
             else
-                ssh $SSH_OPTS "$CURRENT_USER@$node_ip" "$cmd" 2>/dev/null
+                ssh $SSH_OPTS -l "$CURRENT_USER" "$node_ip" "$cmd" 2>/dev/null
             fi
         else
             eval "$cmd"
@@ -1207,6 +1207,54 @@ ensure_log_file
 log "=== Clinical Traefik Setup Started ==="
 log "User: $CURRENT_USER"
 log "Home: $ACTUAL_HOME"
+
+# ==========================================
+# Early Prerequisites Check
+# ==========================================
+# Install essential packages before OS detection and proxy checks.
+# The full prerequisites list (ipcalc, nano, etc.) is installed later;
+# this section only covers what is needed for the script to bootstrap.
+
+echo ""
+echo "Checking essential prerequisites..."
+
+if command -v apt-get &>/dev/null; then
+    _early_missing=""
+    for _pkg in lsb-release ca-certificates gnupg curl wget; do
+        if ! dpkg -l "$_pkg" 2>/dev/null | grep -q "^ii"; then
+            _early_missing="$_early_missing $_pkg"
+        fi
+    done
+    if [ -n "$_early_missing" ]; then
+        echo "Installing essential prerequisites:$_early_missing"
+        sudo apt-get update -qq 2>/dev/null
+        sudo apt-get install -y -qq $_early_missing || {
+            echo "⚠️  Warning: Could not install some prerequisites"
+            echo "   The script will continue but some checks may fail"
+        }
+        echo "✓ Essential prerequisites installed"
+    else
+        echo "✓ All essential prerequisites already installed"
+    fi
+elif command -v dnf &>/dev/null; then
+    _early_missing=""
+    for _pkg in ca-certificates curl wget gnupg2; do
+        if ! rpm -q "$_pkg" &>/dev/null; then
+            _early_missing="$_early_missing $_pkg"
+        fi
+    done
+    if [ -n "$_early_missing" ]; then
+        echo "Installing essential prerequisites:$_early_missing"
+        sudo dnf --setopt=skip_if_unavailable=True install -y $_early_missing || {
+            echo "⚠️  Warning: Could not install some prerequisites"
+            echo "   The script will continue but some checks may fail"
+        }
+        echo "✓ Essential prerequisites installed"
+    else
+        echo "✓ All essential prerequisites already installed"
+    fi
+fi
+echo ""
 
 validate_os
 check_execution_context
@@ -3049,12 +3097,12 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         echo "Copying SSH key to $node ($ip)..."
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            sudo -u "$SUDO_USER" ssh-copy-id -o StrictHostKeyChecking=accept-new -i "$ACTUAL_HOME/.ssh/id_rsa.pub" "$CURRENT_USER@$ip" || {
+            sudo -u "$SUDO_USER" ssh-copy-id -o StrictHostKeyChecking=accept-new -i "$ACTUAL_HOME/.ssh/id_rsa.pub" -o "User=$CURRENT_USER" "$ip" || {
                 echo "⚠️  Warning: Failed to copy SSH key to $node"
                 echo "   You may need to manually copy the key or enter password during deployment"
             }
         else
-            ssh-copy-id -o StrictHostKeyChecking=accept-new -i "$ACTUAL_HOME/.ssh/id_rsa.pub" "$CURRENT_USER@$ip" || {
+            ssh-copy-id -o StrictHostKeyChecking=accept-new -i "$ACTUAL_HOME/.ssh/id_rsa.pub" -o "User=$CURRENT_USER" "$ip" || {
                 echo "⚠️  Warning: Failed to copy SSH key to $node"
                 echo "   You may need to manually copy the key or enter password during deployment"
             }
@@ -3080,9 +3128,9 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         echo -n "Testing SSH to $node ($ip)... "
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" "echo SSH_TEST_OK" 2>/dev/null)
+            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null)
         else
-            TEST_RESULT=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" "echo SSH_TEST_OK" 2>/dev/null)
+            TEST_RESULT=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null)
         fi
         
         if echo "$TEST_RESULT" | grep -q "SSH_TEST_OK"; then
@@ -3127,9 +3175,9 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         echo -n "Testing sudo on $node... "
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            SUDO_EXISTS=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" "command -v sudo" 2>/dev/null)
+            SUDO_EXISTS=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "command -v sudo" 2>/dev/null)
         else
-            SUDO_EXISTS=$(ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@$ip" "command -v sudo" 2>/dev/null)
+            SUDO_EXISTS=$(ssh -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "command -v sudo" 2>/dev/null)
         fi
         
         if [ -z "$SUDO_EXISTS" ]; then
@@ -3142,11 +3190,11 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         PASS_B64=$(printf '%s' "$SUDO_PASS" | base64 -w0 2>/dev/null || printf '%s' "$SUDO_PASS" | base64)
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@${ip}" \
-                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
+            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | tail -1)
         else
-            TEST_RESULT=$(ssh -o ConnectTimeout=5 $SSH_OPTS "$CURRENT_USER@${ip}" \
-                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | head -1)
+            TEST_RESULT=$(ssh -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                "echo \"$PASS_B64\" | base64 -d | sudo -S -k echo SUDO_OK 2>&1" 2>/dev/null | tail -1)
         fi
         
         if echo "$TEST_RESULT" | grep -q "SUDO_OK"; then
@@ -3300,10 +3348,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
             
             # Attempt auto-detection
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                     "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
             else
-                detected_interface=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                detected_interface=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                     "ip -o addr show | grep 'inet $ip' | awk '{print \$2}' | head -1" 2>/dev/null)
             fi
             
@@ -3313,10 +3361,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                 # Show available interfaces
                 echo "    Available interfaces on $node:"
                 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                    sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                         "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
                 else
-                    ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                         "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
                 fi
                 echo ""
@@ -3338,10 +3386,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                             
                             # Validate on remote
                             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                                interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                                     "ip link show $custom_interface 2>/dev/null" 2>/dev/null)
                             else
-                                interface_exists=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                                interface_exists=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                                     "ip link show $custom_interface 2>/dev/null" 2>/dev/null)
                             fi
                             
@@ -3369,10 +3417,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                 echo "    ⚠️  Auto-detection failed"
                 echo "    Available interfaces on $node:"
                 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                    sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                         "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
                 else
-                    ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                    ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                         "ip -o link show | awk '{print \"      - \" \$2}' | sed 's/:$//' | grep -v lo"
                 fi
                 echo ""
@@ -3386,10 +3434,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                     
                     # Validate on remote
                     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                        interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        interface_exists=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                             "ip link show $manual_interface 2>/dev/null" 2>/dev/null)
                     else
-                        interface_exists=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" \
+                        interface_exists=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                             "ip link show $manual_interface 2>/dev/null" 2>/dev/null)
                     fi
                     
@@ -5231,9 +5279,9 @@ fi
         echo "Verifying deployment on $node..."
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            VERIFY_DOCKER=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
+            VERIFY_DOCKER=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
         else
-            VERIFY_DOCKER=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
+            VERIFY_DOCKER=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
         fi
         
         if echo "$VERIFY_DOCKER" | grep -q "traefik"; then
@@ -5243,9 +5291,9 @@ fi
         fi
         
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            VERIFY_KEEPALIVED=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS "$CURRENT_USER@$ip" "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
+            VERIFY_KEEPALIVED=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
         else
-            VERIFY_KEEPALIVED=$(ssh $SSH_OPTS "$CURRENT_USER@$ip" "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
+            VERIFY_KEEPALIVED=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
         fi
         
         if [ "$VERIFY_KEEPALIVED" = "active" ]; then
