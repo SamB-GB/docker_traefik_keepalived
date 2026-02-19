@@ -48,7 +48,8 @@ BACKUP_INTERFACES=()
 LOGFILE="/var/log/installation.log"
 
 # Get the actual user running the script (before sudo elevation)
-CURRENT_USER="${SUDO_USER:-$USER}"
+_RAW_USER="${SUDO_USER:-$USER}"
+CURRENT_USER="${_RAW_USER%%@*}"
 CURRENT_GROUP=$(id -gn "$CURRENT_USER")
 
 # Get the actual user's home directory (not root's when using sudo)
@@ -4789,7 +4790,10 @@ else
 fi
 
 # Get current user
-CURRENT_USER="${SUDO_USER:-$USER}"
+
+# Get the actual user running the script (before sudo elevation)
+_RAW_USER="${SUDO_USER:-$USER}"
+CURRENT_USER="${_RAW_USER%%@*}"
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
     ACTUAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 else
