@@ -44,6 +44,10 @@ BACKUP_NODES=()
 BACKUP_IPS=()
 BACKUP_INTERFACES=()
 
+# Custom CA certificate for upstream TLS verification
+USE_CUSTOM_CA="no"
+CUSTOM_CA_CERT_CONTENT=""
+
 # Logging setup
 LOGFILE="/var/log/installation.log"
 
@@ -895,7 +899,44 @@ check_repository_connectivity() {
                 echo ""
                 echo "$node ($ip):"
                 echo "----------"
-                
+
+                # Install minimal prerequisites on the backup node before running
+                # connectivity checks — curl/wget/ca-certificates may not be present yet.
+                # Uses write_local_file + execute_remote_script so SUDO_PASS is passed
+                # correctly via the wrapper (plain SSH sudo -S won't work here).
+                echo "  Installing prerequisites for connectivity checks..."
+                local _prereq_script="$SCRIPTS_DIR/prereq_check_${node}.sh"
+                write_local_file "$_prereq_script" <<'PREREQSCRIPT'
+#!/bin/bash
+set -e
+if command -v apt-get >/dev/null 2>&1; then
+    missing=""
+    for p in curl wget ca-certificates; do
+        dpkg -l "$p" 2>/dev/null | grep -q "^ii" || missing="$missing $p"
+    done
+    if [ -n "$missing" ]; then
+        echo "  Installing:$missing"
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq $missing
+    fi
+elif command -v dnf >/dev/null 2>&1; then
+    missing=""
+    for p in curl wget ca-certificates; do
+        rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"
+    done
+    if [ -n "$missing" ]; then
+        echo "  Installing:$missing"
+        dnf install -y --setopt=skip_if_unavailable=True $missing
+    fi
+fi
+echo "  Prerequisites ready"
+PREREQSCRIPT
+                chmod 644 "$_prereq_script"
+                ensure_SCRIPTS_DIR "$ip"
+                copy_to_remote "$_prereq_script" "$ip" "$_prereq_script"
+                execute_remote_script "$ip" "$_prereq_script"
+                rm -f "$_prereq_script"
+
                 check_single_node "remote" "$node" "$ip"
                 if [ $? -ne 0 ]; then
                     REMOTE_FAILURES=$((REMOTE_FAILURES + 1))
@@ -2350,8 +2391,8 @@ prompt_single_entry() {
             protocol="http"  # Enforce http for specific services
             break
         else
-            read -p "Enter protocol (http/https) [default: http]: " protocol <&4
-            protocol=${protocol:-http}
+            read -p "Enter protocol (http/https) [default: https]: " protocol <&4
+            protocol=${protocol:-https}
             if [[ "$protocol" != "http" && "$protocol" != "https" ]]; then
                 echo "Error: Invalid protocol. Please enter 'http' or 'https'." >&3
                 continue
@@ -2410,7 +2451,10 @@ generate_clinical_conf() {
 
         # Store for config saving
         IMAGE_SERVICE_URLS="$image_urls"
-        
+
+        # Prompt for custom CA certificate for upstream HTTPS connections
+        prompt_custom_ca
+
         # Generate config file
         cat > "$config_file" <<EOF
 tls:
@@ -2427,9 +2471,28 @@ tls:
         - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
 http:
+EOF
+
+        if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
+            cat >> "$config_file" <<EOF
+  serversTransports:
+    internalCA:
+      rootcas:
+        - /certs/customca.crt
+EOF
+        fi
+
+        cat >> "$config_file" <<EOF
   services:
     image-service:
       loadBalancer:
+EOF
+
+        if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
+            echo "        serversTransport: internalCA" >> "$config_file"
+        fi
+
+        cat >> "$config_file" <<EOF
         healthCheck:
           path: /health
         servers:
@@ -2551,12 +2614,7 @@ EOF
               [[ $service == "app-service" ]] && continue
               port="${service_ports[$service]}"
             
-              # Override protocol to http for filemonitor-service
-              if [[ "$service" == "filemonitor-service" ]]; then
-                new_entry="http://${host}:${port}"
-              else
-                new_entry="${protocol}://${host}:${port}"
-              fi
+              new_entry="${protocol}://${host}:${port}"
             
               batch_entries[$service]+=",$new_entry"
               done
@@ -2565,12 +2623,7 @@ EOF
               # Manual configuration
               for service in "${services_order[@]}"; do
                 [[ $service == "app-service" ]] && continue
-                  if [[ "$service" == "filemonitor-service" ]]; then
-            # Enforce http for filemonitor-service
-              entry=$(prompt_single_entry "$service" "${service_ports[$service]}" "true")
-            else
-            entry=$(prompt_single_entry "$service" "${service_ports[$service]}")
-              fi
+                entry=$(prompt_single_entry "$service" "${service_ports[$service]}")
             batch_entries[$service]+=",$entry"
             done
             fi
@@ -2614,6 +2667,9 @@ EOF
             declare -g "$sanitized_name"="$cleaned_value"
         done
 
+        # Prompt for custom CA certificate for upstream HTTPS connections
+        prompt_custom_ca
+
         # Generate full configuration
         cat > "$config_file" <<EOF
 tls:
@@ -2630,8 +2686,18 @@ tls:
         - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
 http:
-  services:
 EOF
+
+        if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
+            cat >> "$config_file" <<EOF
+  serversTransports:
+    internalCA:
+      rootcas:
+        - /certs/customca.crt
+EOF
+        fi
+
+        echo "  services:" >> "$config_file"
 
         # Add services
         for service in "${services_order[@]}"; do
@@ -2639,6 +2705,13 @@ EOF
             cat >> "$config_file" <<EOF
     $service:
       loadBalancer:
+EOF
+
+if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
+    echo "        serversTransport: internalCA" >> "$config_file"
+fi
+
+            cat >> "$config_file" <<EOF
         healthCheck:
           path: /health
 EOF
@@ -2852,6 +2925,11 @@ validate_ssl_cert() {
     return 0
 }
 
+# CA Certificate Validation - CA certs share the same PEM format as regular certs
+validate_ssl_ca() {
+    validate_ssl_cert "$1"
+}
+
 # Enhanced SSL KEY INPUT Validation
 validate_ssl_key() {
     local key="$1"
@@ -2942,6 +3020,30 @@ EOF
     exit 1
 }
 
+# Prompt for custom CA certificate for upstream TLS verification
+prompt_custom_ca() {
+    # Skip if already configured (re-run scenario)
+    if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
+        log "Using existing custom CA certificate from configuration"
+        return 0
+    fi
+
+    printf "\n" > /dev/tty
+    read -p "Would you like to use a custom CA certificate for upstream TLS? (y/n) [default: n]: " ca_choice < /dev/tty
+    ca_choice=${ca_choice:-n}
+    ca_choice=$(echo "$ca_choice" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$ca_choice" == "y" || "$ca_choice" == "yes" ]]; then
+        USE_CUSTOM_CA="yes"
+        echo "" > /dev/tty
+        echo "Please paste your CA certificate (PEM format) below." > /dev/tty
+        CUSTOM_CA_CERT_CONTENT=$(prompt_ssl_input "certificate")
+    else
+        USE_CUSTOM_CA="no"
+        CUSTOM_CA_CERT_CONTENT=""
+    fi
+}
+
 # Function to check if SSL CERTIFICATE matches the provided SSL KEY
 check_key_cert_match() {
     local CERT_FILE="$1"
@@ -2977,6 +3079,8 @@ CERT_FILE="$CERT_FILE"
 KEY_FILE="$KEY_FILE"
 SSL_CERT_CONTENT="$SSL_CERT_CONTENT"
 SSL_KEY_CONTENT="$SSL_KEY_CONTENT"
+USE_CUSTOM_CA="$USE_CUSTOM_CA"
+CUSTOM_CA_CERT_CONTENT="$CUSTOM_CA_CERT_CONTENT"
 VRRP="$VRRP"
 VIRTUAL_IP="$VIRTUAL_IP"
 VRID="$VRID"
@@ -4235,6 +4339,17 @@ echo ""
 # Call the function to generate the clinical_conf.yml services section
 generate_clinical_conf
 
+# Write custom CA certificate and update docker-compose volume mount if configured
+if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
+    log "Writing custom CA certificate to $CERT_DIR/customca.crt..."
+    echo "$CUSTOM_CA_CERT_CONTENT" | tee "$CERT_DIR/customca.crt" > /dev/null || exit_on_error "Failed to write custom CA certificate"
+    chmod 644 "$CERT_DIR/customca.crt" || exit_on_error "Failed to set permissions on custom CA certificate"
+    log "Custom CA certificate written successfully"
+
+    log "Adding custom CA volume mount to docker-compose.yaml..."
+    sed -i 's|      - ./certs/server.key:/certs/server.key:ro|      - ./certs/server.key:/certs/server.key:ro\n      - ./certs/customca.crt:/certs/customca.crt:ro|' "$DOCKER_COMPOSE_FILE"
+fi
+
 # Check if the container named 'traefik' exists (whether running or stopped)
 if docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
     # Stop the 'traefik' container if it's running
@@ -5021,6 +5136,13 @@ if [ -n "$SSL_CERT_CONTENT" ] && [ -n "$SSL_KEY_CONTENT" ]; then
     chmod 600 "$KEY_FILE"
 fi
 
+# Write custom CA certificate if configured
+if [ "$USE_CUSTOM_CA" = "yes" ] && [ -n "$CUSTOM_CA_CERT_CONTENT" ]; then
+    echo "$CUSTOM_CA_CERT_CONTENT" > /home/haloap/traefik/certs/customca.crt
+    chmod 644 /home/haloap/traefik/certs/customca.crt
+    echo "✓ Custom CA certificate written"
+fi
+
 # Create docker-compose.yaml
 cat > /home/haloap/traefik/docker-compose.yaml <<'DOCKERCOMPOSE'
 services:
@@ -5043,6 +5165,12 @@ services:
       - ./certs/server.key:/certs/server.key:ro
       - ./logs:/var/log
 DOCKERCOMPOSE
+
+# Add custom CA cert volume mount if configured
+if [ "$USE_CUSTOM_CA" = "yes" ] && [ -n "$CUSTOM_CA_CERT_CONTENT" ]; then
+    sed -i 's|      - ./certs/server.key:/certs/server.key:ro|      - ./certs/server.key:/certs/server.key:ro\n      - ./certs/customca.crt:/certs/customca.crt:ro|' /home/haloap/traefik/docker-compose.yaml
+    echo "✓ Custom CA volume mount added to docker-compose.yaml"
+fi
 
 # Create traefik.yml
 cat > /home/haloap/traefik/config/traefik.yml <<'TRAEFIKCONF'
