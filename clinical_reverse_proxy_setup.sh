@@ -2596,7 +2596,8 @@ EOF
 
                 # Ask to apply to others
                 printf "\n"
-                read -p "Use the same HOST and PROTOCOL and apply it to all the other services on their default ports (API, FM, iDP & Image Service)? (yes/no) [default: no]: " apply_all < /dev/tty
+
+                read -p "Use the same HOST and PROTOCOL for the API, FM, iDP & Image Service using their default ports? (yes/no) [default: no]: " apply_all < /dev/tty
                 apply_all=${apply_all:-no}
                 apply_all=$(echo "$apply_all" | tr '[:upper:]' '[:lower:]')
 
