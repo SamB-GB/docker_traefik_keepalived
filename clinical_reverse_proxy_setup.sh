@@ -2588,7 +2588,14 @@ EOF
                 echo " Host Configuration - Batch #$((batch_count + 1)) " > /dev/tty
                 echo "========================================" > /dev/tty
 
-                echo "needs description of what its looking for" > /dev/tty
+                echo "Enter the details of the upstream Halo AP server for this batch." > /dev/tty
+                echo "You will be prompted for the hostname (or IP), protocol, and port of the" > /dev/tty
+                echo "App Service. You can then choose to apply the same host and protocol to" > /dev/tty
+                echo "all other services (iDP, API, File Monitor, Image Service) on their" > /dev/tty
+                echo "default ports, or configure each one individually." > /dev/tty
+                echo "" > /dev/tty
+                echo "If Halo AP is running across multiple servers, you can add further" > /dev/tty
+                echo "batches when prompted. Each batch represents one upstream server node." > /dev/tty
 
                 # Configure app-service
                 current_app_entry=$(prompt_single_entry "app-service" "3000")
