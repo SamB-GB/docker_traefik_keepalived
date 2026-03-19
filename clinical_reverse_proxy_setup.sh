@@ -9,6 +9,33 @@
 set -e
 
 # ==========================================
+# Standardised y/n prompt helper
+# ==========================================
+# Usage: prompt_yn "Question" [default: y|n]
+# Returns 0 for yes, 1 for no. Only accepts y/n — re-prompts on anything else.
+prompt_yn() {
+    local message="$1"
+    local default="${2:-}"
+    local hint response
+
+    case "${default,,}" in
+        y) hint="[Y/n]" ;;
+        n) hint="[y/N]" ;;
+        *)  hint="[y/n]" ;;
+    esac
+
+    while true; do
+        read -p "$message $hint: " response
+        [[ -z "$response" && -n "$default" ]] && response="$default"
+        case "${response,,}" in
+            y) return 0 ;;
+            n) return 1 ;;
+            *) echo "  Please enter 'y' or 'n'." ;;
+        esac
+    done
+}
+
+# ==========================================
 # Configuration
 # ==========================================
 
@@ -417,8 +444,7 @@ validate_proxy_config() {
             echo "  3. Install jq: sudo apt-get install -y jq"
             echo "  4. Or the script will use fallback encoding (less reliable)"
             echo ""
-            read -p "Continue anyway with potentially broken encoding? [y/N]: " CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+            if ! prompt_yn "Continue anyway with potentially broken encoding?" "n"; then
                 echo "Installation cancelled."
                 exit 1
             fi
@@ -724,8 +750,7 @@ validate_os() {
             ;;
         *)
             echo "⚠️  Operating System: $PRETTY_NAME (untested)"
-            read -p "Continue anyway? [y/N]: " CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+            if ! prompt_yn "Continue anyway?"; then
                 echo "Installation cancelled"
                 exit 0
             fi
@@ -740,8 +765,7 @@ validate_os() {
                 ;;
             *)
                 echo "⚠️  Version: $VERSION_ID (untested, may work)"
-                read -p "Continue anyway? [y/N]: " CONTINUE
-                if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+                if ! prompt_yn "Continue anyway?"; then
                     echo "Installation cancelled"
                     exit 0
                 fi
@@ -753,8 +777,7 @@ validate_os() {
     if [ "$OS_ID" = "debian" ]; then
         if [ "$OS_VERSION" -lt 11 ]; then
             echo "⚠️  Debian version $OS_VERSION may be too old"
-            read -p "Continue anyway? [y/N]: " CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
+            if ! prompt_yn "Continue anyway?"; then
                 echo "Installation cancelled"
                 exit 0
             fi
@@ -951,8 +974,7 @@ PREREQSCRIPT
                 echo ""
                 echo "Deployment to these nodes may fail during package installation."
                 echo ""
-                read -p "Continue with multi-node deployment? [y/N]: " CONTINUE_MULTI
-                if [[ ! "$CONTINUE_MULTI" =~ ^[Yy]$ ]]; then
+                if ! prompt_yn "Continue with multi-node deployment?"; then
                     echo "Installation cancelled."
                     cleanup
                     exit 1
@@ -1193,8 +1215,7 @@ check_single_node() {
             echo "    - docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
             echo ""
             
-            read -p "  Continue anyway? Docker pulls will likely fail. [y/N]: " CONTINUE_ANYWAY
-            if [[ ! "$CONTINUE_ANYWAY" =~ ^[Yy]$ ]]; then
+            if ! prompt_yn "  Continue anyway? Docker pulls will likely fail." "n"; then
                 echo "  Installation cancelled."
                 cleanup
                 exit 1
@@ -1337,29 +1358,21 @@ if [[ "$1" == "--clean" ]]; then
             fi
         done
             echo ""
-            read -p "Do you want to clean backup nodes as well? (yes/no) [yes]: " CLEAN_BACKUPS
-            CLEAN_BACKUPS=${CLEAN_BACKUPS:-yes}
-            
-            if [[ "$CLEAN_BACKUPS" =~ ^[Yy] ]]; then
+            if prompt_yn "Do you want to clean backup nodes as well?" "y"; then
                 CLEAN_BACKUP_NODES=true
                 
                 # Ask about package removal
                 echo ""
                 echo "Package Removal Options for Backup Nodes:"
                 echo ""
-                read -p "Uninstall Keepalived package on backup nodes? (yes/no) [yes]: " UNINSTALL_KA_REMOTE
-                UNINSTALL_KA_REMOTE=${UNINSTALL_KA_REMOTE:-yes}
-                if [[ "$UNINSTALL_KA_REMOTE" =~ ^[Yy] ]]; then
+                if prompt_yn "Uninstall Keepalived package on backup nodes?" "y"; then
                     UNINSTALL_KEEPALIVED_REMOTE=true
                 fi
                 
-                read -p "Uninstall Docker on backup nodes? (yes/no) [no]: " UNINSTALL_DOCKER_REMOTE_INPUT
-                UNINSTALL_DOCKER_REMOTE_INPUT=${UNINSTALL_DOCKER_REMOTE_INPUT:-no}
-                if [[ "$UNINSTALL_DOCKER_REMOTE_INPUT" =~ ^[Yy] ]]; then
+                if prompt_yn "Uninstall Docker on backup nodes?" "n"; then
                     echo ""
                     echo "⚠️  WARNING: This will remove Docker and ALL containers/images on backup nodes!"
-                    read -p "Are you absolutely sure? Type 'yes' to continue: " CONFIRM_DOCKER_REMOTE
-                    if [[ "$CONFIRM_DOCKER_REMOTE" == "yes" ]]; then
+                    if prompt_yn "Are you absolutely sure?" "n"; then
                         UNINSTALL_DOCKER_REMOTE=true
                     fi
                 fi
@@ -1404,9 +1417,7 @@ if [[ "$1" == "--clean" ]]; then
     echo ""
     echo "⚠️  WARNING: This operation cannot be undone!"
     echo ""
-    read -p "Are you sure? Type 'yes' to continue: " CONFIRM
-    
-    if [[ "$CONFIRM" != "yes" ]]; then
+    if ! prompt_yn "Are you sure you want to proceed?" "n"; then
         echo "Cleanup cancelled."
         exit 0
     fi
@@ -1665,8 +1676,7 @@ REMOTECLEANUP
             # Remove Traefik image (optional)
             if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd images 2>/dev/null | grep -q traefik; then
                 echo ""
-                read -p "Remove Traefik Docker image? (yes/no) [no]: " REMOVE_IMAGE
-                if [[ "$REMOVE_IMAGE" == "yes" || "$REMOVE_IMAGE" == "y" ]]; then
+                if prompt_yn "Remove Traefik Docker image?" "n"; then
                     echo -n "Removing Traefik images... "
                     IMAGE_IDS=$(cleanup_docker_cmd images | grep traefik | awk '{print $3}')
                     if [ -n "$IMAGE_IDS" ]; then
@@ -1714,8 +1724,7 @@ REMOTECLEANUP
             # Ask if user wants to uninstall Keepalived package
             if command -v keepalived &> /dev/null; then
                 echo ""
-                read -p "Uninstall Keepalived package? (yes/no) [no]: " UNINSTALL_KEEPALIVED
-                if [[ "$UNINSTALL_KEEPALIVED" == "yes" || "$UNINSTALL_KEEPALIVED" == "y" ]]; then
+                if prompt_yn "Uninstall Keepalived package?" "n"; then
                     echo -n "Uninstalling Keepalived... "
                     if [[ -f /etc/os-release ]]; then
                         source /etc/os-release
@@ -1785,13 +1794,10 @@ REMOTECLEANUP
             # Ask about Docker
             echo ""
             if command -v docker &> /dev/null; then
-                read -p "Uninstall Docker? (yes/no) [no]: " UNINSTALL_DOCKER
-                if [[ "$UNINSTALL_DOCKER" == "yes" || "$UNINSTALL_DOCKER" == "y" ]]; then
+                if prompt_yn "Uninstall Docker?" "n"; then
                     echo ""
                     echo "⚠️  WARNING: This will remove Docker and ALL containers/images!"
-                    read -p "Are you absolutely sure? Type 'yes' to continue: " CONFIRM_DOCKER
-                    
-                    if [[ "$CONFIRM_DOCKER" == "yes" ]]; then
+                    if prompt_yn "Are you absolutely sure?" "n"; then
                         echo -n "Stopping Docker... "
                         sudo systemctl stop docker 2>/dev/null || true
                         sudo systemctl disable docker 2>/dev/null || true
@@ -1937,10 +1943,7 @@ prompt_use_existing_config() {
         echo "Existing configuration file detected!"
         echo "=========================================="
         echo ""
-        read -p "Do you want to use the existing configuration? (yes/no): " USE_EXISTING_CONFIG
-        USE_EXISTING_CONFIG=$(echo "$USE_EXISTING_CONFIG" | tr '[:upper:]' '[:lower:]')
-
-        if [[ "$USE_EXISTING_CONFIG" == "yes" || "$USE_EXISTING_CONFIG" == "y" ]]; then
+        if prompt_yn "Do you want to use the existing configuration?"; then
             log "User chose to use existing configuration."
             load_config
             return 0
@@ -2186,9 +2189,7 @@ prompt_multi_node_deployment() {
             echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Interface: ${BACKUP_INTERFACES[$i]:-auto}"
         done
         echo ""
-        read -p "Use existing multi-node configuration? (yes/no) [yes]: " USE_EXISTING
-        USE_EXISTING=${USE_EXISTING:-yes}
-        if [[ "$USE_EXISTING" =~ ^[Yy] ]]; then
+        if prompt_yn "Use existing multi-node configuration?" "y"; then
             return 0
         fi
     fi
@@ -2341,8 +2342,7 @@ prompt_multi_node_deployment() {
         echo ""
         
         # Confirm configuration
-        read -p "Is this configuration correct? (yes/no): " CONFIRM
-        if [[ "$CONFIRM" =~ ^[Yy] ]]; then
+        if prompt_yn "Is this configuration correct?"; then
             echo "✓ Configuration confirmed"
             return 0
         else
@@ -2444,8 +2444,7 @@ generate_clinical_conf() {
                 entry=$(prompt_single_entry "image-service" "8050")
                 image_urls+="${image_urls:+,}$entry"
                 
-                read -p "Add another image server? (yes/no) [no]: " add_more
-                [[ "${add_more,,}" != "yes" && "${add_more,,}" != "y" ]] && break
+                prompt_yn "Add another image server?" "n" || break
             done
         fi
 
@@ -2604,15 +2603,11 @@ EOF
                 # Ask to apply to others
                 printf "\n"
 
-                read -p "Use the same HOST and PROTOCOL for the API, FM, iDP & Image Service using their default ports? (yes/no) [default: no]: " apply_all < /dev/tty
-                apply_all=${apply_all:-no}
-                apply_all=$(echo "$apply_all" | tr '[:upper:]' '[:lower:]')
-
                 # Clear batch_entries for this iteration
                 unset batch_entries
                 declare -A batch_entries
 
-                if [[ "$apply_all" == "yes" || "$apply_all" == "y" ]]; then
+                if prompt_yn "Use the same HOST and PROTOCOL for the API, FM, iDP & Image Service using their default ports?" "n" < /dev/tty; then
                   if [[ $current_app_entry =~ ^(http[s]?)://([^:/]+):([0-9]+)$ ]]; then
                   protocol="${BASH_REMATCH[1]}"
                   host="${BASH_REMATCH[2]}"
@@ -2652,9 +2647,7 @@ EOF
                 done
 
                 printf "\n"
-                read -p "Add another batch? (yes/no) [default: no]: " add_more < /dev/tty
-                add_more=${add_more:-no}
-                [[ "$add_more" != "yes" && "$add_more" != "y" ]] && break
+                prompt_yn "Add another batch?" "n" < /dev/tty || break
                 
                 # Increment batch count safely
                 batch_count=$((batch_count + 1))
@@ -3377,16 +3370,16 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         
         # Prompt user
         while true; do
-            read -p "  Use detected interface '$master_detected_interface'? (yes/no/other) [yes]: " use_detected
-            use_detected=${use_detected:-yes}
+            read -p "  Use detected interface '$master_detected_interface'? (y/n/other) [Y/n]: " use_detected
+            use_detected=${use_detected:-y}
             
             case "${use_detected,,}" in
-                yes|y)
+                y)
                     NETWORK_INTERFACE="$master_detected_interface"
                     echo "  ✓ Master interface set to: $NETWORK_INTERFACE"
                     break
                     ;;
-                no|n|other|l)
+                n|other)
                     echo ""
                     echo "  Available interfaces:"
                     ip -o link show | awk '{print "    - " $2}' | sed 's/:$//' | grep -v lo
@@ -3399,8 +3392,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                         break
                     else
                         echo "  ⚠️  Interface '$custom_interface' not found"
-                        read -p "  Use it anyway? (yes/no) [no]: " use_anyway
-                        if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                        if prompt_yn "  Use it anyway?" "n"; then
                             NETWORK_INTERFACE="$custom_interface"
                             echo "  ⚠️  Master interface set to: $NETWORK_INTERFACE (unverified)"
                             break
@@ -3433,8 +3425,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                 break
             else
                 echo "  ⚠️  Interface '$manual_interface' not found"
-                read -p "  Use it anyway? (yes/no) [no]: " use_anyway
-                if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                if prompt_yn "  Use it anyway?" "n"; then
                     NETWORK_INTERFACE="$manual_interface"
                     echo "  ⚠️  Master interface set to: $NETWORK_INTERFACE (unverified)"
                     break
@@ -3484,16 +3475,16 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                 
                 # Prompt user
                 while true; do
-                    read -p "    Use detected interface '$detected_interface'? (yes/no/other) [yes]: " use_detected
-                    use_detected=${use_detected:-yes}
+                    read -p "    Use detected interface '$detected_interface'? (y/n/other) [Y/n]: " use_detected
+                    use_detected=${use_detected:-y}
                     
                     case "${use_detected,,}" in
-                        yes|y)
+                        y)
                             BACKUP_INTERFACES[$i]="$detected_interface"
                             echo "    ✓ Interface set to: $detected_interface"
                             break
                             ;;
-                        no|n|other|l)
+                        n|other)
                             echo ""
                             read -p "    Enter interface name: " custom_interface
                             
@@ -3512,8 +3503,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                                 break
                             else
                                 echo "    ⚠️  Interface '$custom_interface' not found on $node"
-                                read -p "    Use it anyway? (yes/no) [no]: " use_anyway
-                                if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                                if prompt_yn "    Use it anyway?" "n"; then
                                     BACKUP_INTERFACES[$i]="$custom_interface"
                                     echo "    ⚠️  Interface set to: $custom_interface (unverified)"
                                     break
@@ -3521,7 +3511,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                             fi
                             ;;
                         *)
-                            echo "    ERROR: Please enter 'yes', 'no', or 'other'"
+                            echo "    Please enter 'y', 'n', or 'other'"
                             continue
                             ;;
                     esac
@@ -3560,8 +3550,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
                         break
                     else
                         echo "    ⚠️  Interface '$manual_interface' not found on $node"
-                        read -p "    Use it anyway? (yes/no) [no]: " use_anyway
-                        if [[ "$use_anyway" =~ ^[Yy] ]]; then
+                        if prompt_yn "    Use it anyway?" "n"; then
                             BACKUP_INTERFACES[$i]="$manual_interface"
                             echo "    ⚠️  Interface set to: $manual_interface (unverified)"
                             break
@@ -3713,12 +3702,11 @@ echo "Note: The script will prompt for:"
 echo "  - SSL certificate and private key"
 echo "  - Backend service URLs and ports"
 if [[ -z "$INSTALL_KEEPALIVED" ]]; then
-    echo "  - Keepalived installation (yes/no)"
+    echo "  - Keepalived installation (y/n)"
 fi
 echo ""
 
-read -p "Proceed with installation? [y/N]: " PROCEED_INSTALL
-if [[ ! "$PROCEED_INSTALL" =~ ^[Yy]$ ]]; then
+if ! prompt_yn "Proceed with installation?" "n"; then
     echo "Installation cancelled by user."
     cleanup
     exit 0
@@ -4024,10 +4012,8 @@ if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     echo "      ✗ Requires working proxy for all system updates"
     echo ""
     
-    read -p "Disable Docker repository? (yes/no) [yes]: " DISABLE_DOCKER_REPO
-    DISABLE_DOCKER_REPO=${DISABLE_DOCKER_REPO:-yes}
-    
-    if [[ "$DISABLE_DOCKER_REPO" =~ ^[Yy] ]]; then
+    if prompt_yn "Disable Docker repository?" "y"; then
+        DISABLE_DOCKER_REPO="yes"
         log "Disabling Docker repository..."
         
         if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -4144,8 +4130,7 @@ if [[ -z "$CERT_FILE" ]]; then
     echo "$SSL_CERT"
     echo "------------------------------"
     
-    read -p "Does this look correct? (yes/no) [no]: " confirm
-        if [[ "${confirm,,}" == "yes" || "${confirm,,}" == "y" ]]; then
+    if prompt_yn "Does this look correct?" "n"; then
             break
         else
             echo "Please try again..."
@@ -4172,8 +4157,7 @@ if [[ -z "$CERT_FILE" ]]; then
     echo "$SSL_KEY"
     echo "------------------------------"
     
-    read -p "Does this look correct? (yes/no) [no]: " confirm
-        if [[ "${confirm,,}" == "yes" || "${confirm,,}" == "y" ]]; then
+    if prompt_yn "Does this look correct?" "n"; then
             break
         else
             echo "Please try again..."
