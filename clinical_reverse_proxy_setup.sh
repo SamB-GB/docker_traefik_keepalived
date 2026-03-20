@@ -77,7 +77,7 @@ BACKUP_INTERFACES=()
 HL7_ENABLED="no"
 HL7_LISTEN_PORTS=""      # Pipe-separated Traefik listen ports      (e.g. "1050|1051")
 HL7_PORT_BACKENDS=""     # Pipe-separated backend groups per port    (e.g. "host1:1050,host2:1050|host1:1051")
-HL7_PORT_COMMENTS=""     # Pipe-separated comment per port           (e.g. "Main lab|Radiology")
+HL7_PORT_COMMENTS=""     # Pipe-separated comment per port           (e.g. "Berlin|Site1|DCPathos")
 
 # Custom CA certificate for upstream TLS verification
 USE_CUSTOM_CA="no"
