@@ -2302,6 +2302,9 @@ prompt_use_existing_config() {
         echo "Existing configuration file detected!"
         echo "=========================================="
         echo ""
+        echo "Using the existing deployment config will allow you to either reinstall the current deployment"
+        echo "or expand the current deployment"
+        echo ""
         if prompt_yn "Do you want to use the existing configuration?"; then
             log "User chose to use existing configuration."
             load_config
