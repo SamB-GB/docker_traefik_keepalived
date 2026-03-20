@@ -3031,7 +3031,7 @@ prompt_hl7_config() {
     _listen_ports_arr+=("$_primary_port")
     echo "  ✓ Primary port: ${_primary_port}"
     local _primary_comment=""
-    read -p "  Short description for port ${_primary_port} (e.g. Main Lab, Radiology): " _primary_comment
+    read -p "  Short description for port ${_primary_port} (Recommended use site name e.g Berlin): " _primary_comment
     _port_comments_arr+=("${_primary_comment}")
     echo ""
 
