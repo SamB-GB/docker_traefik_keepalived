@@ -3,8 +3,9 @@
 # Enhanced Clinical Traefik Reverse Proxy Setup
 #
 # USAGE:
-#   ./clinicalrp.sh           # Normal installation
-#   ./clinicalrp.sh --clean   # Remove Traefik/Keepalived/Docker
+#   ./clinicalrp.sh                    # Normal installation
+#   ./clinicalrp.sh --clean            # Remove Traefik/Keepalived/Docker
+#   ./clinicalrp.sh --integration-setup  # Add/update HL7 integration on existing install
 
 set -e
 
@@ -71,6 +72,13 @@ BACKUP_NODES=()
 BACKUP_IPS=()
 BACKUP_INTERFACES=()
 
+# HL7 / TCP integration (optional)
+# Set HL7_ENABLED="yes" to pre-configure without interactive prompts
+HL7_ENABLED="no"
+HL7_LISTEN_PORTS=""      # Pipe-separated Traefik listen ports      (e.g. "1050|1051")
+HL7_PORT_BACKENDS=""     # Pipe-separated backend groups per port    (e.g. "host1:1050,host2:1050|host1:1051")
+HL7_PORT_COMMENTS=""     # Pipe-separated comment per port           (e.g. "Main lab|Radiology")
+
 # Custom CA certificate for upstream TLS verification
 USE_CUSTOM_CA="no"
 CUSTOM_CA_CERT_CONTENT=""
@@ -92,7 +100,7 @@ fi
 
 # Get the directory where the script is located
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
-CONFIG_FILE="$SCRIPT_DIR/clinical_traefik.env"
+CONFIG_FILE="/home/haloap/traefik/deployment.config"
 
 # Directory for temporary scripts
 SCRIPTS_DIR="$ACTUAL_HOME/traefik_setup_scripts"
@@ -1413,7 +1421,7 @@ if [[ "$1" == "--clean" ]]; then
     echo "  - Traefik configuration files (/home/haloap/traefik)"
     echo "  - SSL certificates"
     echo "  - Keepalived (if installed)"
-    echo "  - Configuration file (clinical_traefik.env)"
+    echo "  - Configuration file ($CONFIG_FILE)"
     echo ""
     echo "⚠️  WARNING: This operation cannot be undone!"
     echo ""
@@ -1873,12 +1881,363 @@ REMOTECLEANUP
 fi
 
 # ==========================================
-# Configuration Management
+# Integration Setup Mode
 # ==========================================
+
+if [[ "$1" == "--integration-setup" ]]; then
+    validate_os
+    check_execution_context
+
+    echo ""
+    echo "=========================================="
+    echo "Integration Setup Mode"
+    echo "=========================================="
+    echo ""
+    echo "This mode adds or updates an HL7 / TCP integration on an"
+    echo "existing Traefik installation without performing a full"
+    echo "reinstall."
+    echo ""
+
+    # ----------------------------------------
+    # Load existing config
+    # ----------------------------------------
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "❌ ERROR: No existing configuration found at $CONFIG_FILE"
+        echo ""
+        echo "This mode requires a prior installation. Run the script"
+        echo "without arguments to perform a full install first."
+        exit 1
+    fi
+
+    echo "Loading existing configuration..."
+    source "$CONFIG_FILE"
+    echo "✓ Configuration loaded"
+    echo ""
+
+    # ----------------------------------------
+    # Guard: full deployment only
+    # ----------------------------------------
+    if [[ "$DEPLOYMENT_TYPE" != "full" ]]; then
+        echo "❌ ERROR: HL7 integration is only supported on a full"
+        echo "   deployment (not image-site)."
+        echo ""
+        echo "   Current deployment type: $DEPLOYMENT_TYPE"
+        exit 1
+    fi
+
+    # ----------------------------------------
+    # Verify Traefik is installed and running
+    # ----------------------------------------
+    TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
+    TRAEFIK_DYNAMIC_DIR="/home/haloap/traefik/config/dynamic"
+    DOCKER_COMPOSE_FILE="/home/haloap/traefik/docker-compose.yaml"
+
+    if [[ ! -f "$TRAEFIK_CONFIG_FILE" ]]; then
+        echo "❌ ERROR: Traefik config not found at $TRAEFIK_CONFIG_FILE"
+        echo "   Is Traefik installed on this node?"
+        exit 1
+    fi
+
+    # ----------------------------------------
+    # Multi-node: collect sudo password + set SSH opts
+    # ----------------------------------------
+    if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
+        echo "Multi-node deployment detected:"
+        echo "  Master : $MASTER_HOSTNAME ($MASTER_IP)"
+        for i in "${!BACKUP_NODES[@]}"; do
+            echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
+        done
+        echo ""
+        echo "The integration will be applied to all nodes."
+        echo ""
+        read -s -p "Enter YOUR sudo password for remote hosts: " SUDO_PASS
+        echo ""
+        export SUDO_PASS
+        SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+    fi
+
+    # ----------------------------------------
+    # Prompt for HL7 configuration
+    # Extract unique hostnames from service URLs saved in the config
+    # so the user can pick which servers run the HL7 integration
+    # ----------------------------------------
+    _hl7_host_list=""
+    _all_service_urls="${APP_SERVICE_URLS:-},${IDP_SERVICE_URLS:-},${API_SERVICE_URLS:-},${FILEMONITOR_SERVICE_URLS:-},${IMAGE_SERVICE_URLS:-}"
+    while IFS= read -r _uhost; do
+        [[ -z "$_uhost" ]] && continue
+        if [[ -n "$_hl7_host_list" ]]; then
+            _hl7_host_list="${_hl7_host_list},${_uhost}"
+        else
+            _hl7_host_list="${_uhost}"
+        fi
+    done < <(echo "$_all_service_urls" \
+        | tr ',' '\n' \
+        | sed -E 's#^https?://##; s#:[0-9]+$##' \
+        | sort -u \
+        | grep -v '^$')
+    prompt_hl7_config "$_hl7_host_list"
+
+    if [[ "$HL7_ENABLED" != "yes" ]]; then
+        echo ""
+        echo "No HL7 integration configured. Exiting."
+        cleanup
+        exit 0
+    fi
+    # ----------------------------------------
+    echo ""
+    echo "=========================================="
+    echo "Applying HL7 Integration"
+    echo "=========================================="
+    echo ""
+
+    mkdir -p "$TRAEFIK_DYNAMIC_DIR"
+
+    echo -n "Writing hl7.yml... "
+    generate_hl7_conf "$TRAEFIK_DYNAMIC_DIR"
+    echo "✓ Done"
+
+    # ----------------------------------------
+    # Patch traefik.yml: add hl7 entrypoint if absent
+    # ----------------------------------------
+    echo -n "Updating traefik.yml entryPoints... "
+    _tmp_traefik=$(mktemp)
+    cp "$TRAEFIK_CONFIG_FILE" "$_tmp_traefik"
+
+    IFS='|' read -ra _patch_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _patch_comments <<< "$HL7_PORT_COMMENTS"
+    _patch_idx=0
+    for _patch_port in "${_patch_ports[@]}"; do
+        _patch_ep="hl7"
+        [[ $_patch_idx -gt 0 ]] && _patch_ep="hl7-${_patch_port}"
+        _patch_cmt="${_patch_comments[$_patch_idx]:-}"
+        _patch_addr="    address: ':${_patch_port}'"
+        [[ -n "$_patch_cmt" ]] && _patch_addr="${_patch_addr} # ${_patch_cmt}"
+
+        if grep -q "^  ${_patch_ep}:" "$_tmp_traefik"; then
+            # Already present — update address line in place
+            sed -i "/^  ${_patch_ep}:/,/^  [a-z]/{s|address:.*|${_patch_addr}|}" "$_tmp_traefik"
+        else
+            # Inject before the 'ping:' section
+            _tmp2=$(mktemp)
+            awk -v ep="$_patch_ep" -v addr="$_patch_addr" '
+                /^ping:/ && !inserted {
+                    print "  " ep ":"
+                    print addr
+                    print "    transport:"
+                    print "      respondingTimeouts:"
+                    print "        readTimeout: 0"
+                    print "        idleTimeout: 0"
+                    inserted=1
+                }
+                { print }
+            ' "$_tmp_traefik" > "$_tmp2"
+            cp "$_tmp2" "$_tmp_traefik"
+            rm -f "$_tmp2"
+        fi
+        (( ++_patch_idx ))
+    done
+
+    cp "$_tmp_traefik" "$TRAEFIK_CONFIG_FILE"
+    rm -f "$_tmp_traefik"
+    echo "✓ Done"
+
+    # ----------------------------------------
+    # Restart Traefik on master to pick up new entrypoint
+    # ----------------------------------------
+    echo -n "Restarting Traefik container... "
+    cd /home/haloap/traefik
+    if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
+        sg docker -c "docker compose up -d --force-recreate" 2>/dev/null \
+            || { echo "❌ Failed"; exit_on_error "Traefik restart failed"; }
+    else
+        docker compose up -d --force-recreate 2>/dev/null \
+            || { echo "❌ Failed"; exit_on_error "Traefik restart failed"; }
+    fi
+    echo "✓ Done"
+
+    # Wait for Traefik to be healthy
+    echo -n "Verifying Traefik health... "
+    for i in {1..15}; do
+        if curl -fs http://localhost:8800/ping > /dev/null 2>&1; then
+            echo "✓ Healthy"
+            break
+        fi
+        if [[ $i -eq 15 ]]; then
+            echo "⚠️  Warning: health check not responding — check: docker logs traefik"
+        fi
+        sleep 1
+    done
+
+    # ----------------------------------------
+    # Push to backup nodes if multi-node
+    # ----------------------------------------
+    if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
+        echo ""
+        echo "Pushing integration to backup nodes..."
+        echo ""
+
+        # Stage files for transfer
+        cp "${TRAEFIK_DYNAMIC_DIR}/hl7.yml" /tmp/hl7.yml
+
+        for i in "${!BACKUP_NODES[@]}"; do
+            node="${BACKUP_NODES[$i]}"
+            ip="${BACKUP_IPS[$i]}"
+
+            echo "  Updating $node ($ip)..."
+
+            # Create a small remote patch script
+            write_local_file "$SCRIPTS_DIR/integration_patch_${node}.sh" <<REMOTEPATCH
+#!/bin/bash
+set -e
+
+TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
+TRAEFIK_DYNAMIC_DIR="/home/haloap/traefik/config/dynamic"
+HL7_LISTEN_PORTS="${HL7_LISTEN_PORTS}"
+HL7_PORT_COMMENTS="${HL7_PORT_COMMENTS}"
+
+# Install hl7.yml into dynamic directory
+mkdir -p "\$TRAEFIK_DYNAMIC_DIR"
+if [ -f "/tmp/hl7.yml" ]; then
+    cp /tmp/hl7.yml "\${TRAEFIK_DYNAMIC_DIR}/hl7.yml"
+    chmod 640 "\${TRAEFIK_DYNAMIC_DIR}/hl7.yml"
+    echo "  ✓ hl7.yml installed"
+fi
+
+# Patch traefik.yml: add/update all HL7 entrypoints
+_tmp_traefik=\$(mktemp)
+cp "\$TRAEFIK_CONFIG_FILE" "\$_tmp_traefik"
+
+_patch_idx=0
+IFS='|' read -ra _r_ports    <<< "\$HL7_LISTEN_PORTS"
+IFS='|' read -ra _r_comments <<< "\$HL7_PORT_COMMENTS"
+for _r_port in "\${_r_ports[@]}"; do
+    _r_ep="hl7"
+    [ "\$_patch_idx" -gt 0 ] && _r_ep="hl7-\${_r_port}"
+    _r_cmt="\${_r_comments[\$_patch_idx]:-}"
+    _r_addr="    address: ':\${_r_port}'"
+    [ -n "\$_r_cmt" ] && _r_addr="\${_r_addr} # \${_r_cmt}"
+
+    if grep -q "^  \${_r_ep}:" "\$_tmp_traefik"; then
+        sed -i "/^  \${_r_ep}:/,/^  [a-z]/{s|address:.*|\${_r_addr}|}" "\$_tmp_traefik"
+        echo "  ✓ traefik.yml entrypoint \${_r_ep} updated"
+    else
+        _tmp2=\$(mktemp)
+        awk -v ep="\$_r_ep" -v addr="\$_r_addr" '
+            /^ping:/ && !inserted {
+                print "  " ep ":"
+                print addr
+                print "    transport:"
+                print "      respondingTimeouts:"
+                print "        readTimeout: 0"
+                print "        idleTimeout: 0"
+                inserted=1
+            }
+            { print }
+        ' "\$_tmp_traefik" > "\$_tmp2"
+        cp "\$_tmp2" "\$_tmp_traefik"
+        rm -f "\$_tmp2"
+        echo "  ✓ traefik.yml entrypoint \${_r_ep} added"
+    fi
+    _patch_idx=\$(( _patch_idx + 1 ))
+done
+
+cp "\$_tmp_traefik" "\$TRAEFIK_CONFIG_FILE"
+rm -f "\$_tmp_traefik"
+
+# Restart Traefik
+cd /home/haloap/traefik
+docker compose up -d --force-recreate
+echo "  ✓ Traefik restarted"
+
+# Verify health
+for i in \$(seq 1 15); do
+    if curl -fs http://localhost:8800/ping > /dev/null 2>&1; then
+        echo "  ✓ Traefik healthy"
+        break
+    fi
+    if [ "\$i" -eq 15 ]; then
+        echo "  ⚠️  Warning: health check not responding"
+    fi
+    sleep 1
+done
+REMOTEPATCH
+
+            chmod 644 "$SCRIPTS_DIR/integration_patch_${node}.sh"
+
+            ensure_SCRIPTS_DIR "$ip"
+            copy_to_remote "/tmp/hl7.yml" "$ip" "/tmp/hl7.yml"
+            copy_to_remote "$SCRIPTS_DIR/integration_patch_${node}.sh" \
+                "$ip" "$SCRIPTS_DIR/integration_patch.sh"
+
+            execute_remote_script "$ip" "$SCRIPTS_DIR/integration_patch.sh"
+
+            rm -f "$SCRIPTS_DIR/integration_patch_${node}.sh"
+            echo "  ✓ $node updated"
+        done
+
+        rm -f /tmp/hl7.yml
+        cleanup_remote_scripts_dirs
+    fi
+
+    # ----------------------------------------
+    # Save updated config
+    # ----------------------------------------
+    echo ""
+    echo -n "Saving configuration... "
+    save_config
+    echo "✓ Done"
+
+    # ----------------------------------------
+    # Summary
+    # ----------------------------------------
+    echo ""
+    echo "=========================================="
+    echo "✓✓✓ INTEGRATION SETUP COMPLETE ✓✓✓"
+    echo "=========================================="
+    echo ""
+    echo "HL7 Integration:"
+    IFS='|' read -ra _isrv_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _isrv_backends <<< "$HL7_PORT_BACKENDS"
+    IFS='|' read -ra _isrv_comments <<< "$HL7_PORT_COMMENTS"
+    _iidx=0
+    for _ip in "${_isrv_ports[@]}"; do
+        _icmt="${_isrv_comments[$_iidx]:-}"
+        [[ -n "$_icmt" ]] && echo "  Port $(( _iidx + 1 )) : :${_ip} # ${_icmt}" || echo "  Port $(( _iidx + 1 )) : :${_ip}"
+        IFS=',' read -ra _isrvs <<< "${_isrv_backends[$_iidx]}"
+        for _isrv in "${_isrvs[@]}"; do
+            echo "    Backend : ${_isrv}"
+        done
+        (( ++_iidx ))
+    done
+    echo ""
+    echo "Files updated:"
+    echo "  - ${TRAEFIK_DYNAMIC_DIR}/hl7.yml"
+    echo "  - $TRAEFIK_CONFIG_FILE"
+    echo "  - $CONFIG_FILE"
+    if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Applied to backup nodes:"
+        for i in "${!BACKUP_NODES[@]}"; do
+            echo "    - ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]})"
+        done
+    fi
+    echo ""
+    echo "Verification:"
+    IFS='|' read -ra _iv_ports <<< "$HL7_LISTEN_PORTS"
+    for _iv_port in "${_iv_ports[@]}"; do
+        echo "  ss -tlnp | grep :${_iv_port}"
+    done
+    echo "  docker logs traefik"
+    echo "=========================================="
+    echo ""
+
+    cleanup
+    exit 0
+fi
 
 INITIAL_DEPLOYMENT_TYPE=""
 
-# Function to load existing values from clinical_traefik.env
+# Function to load existing values from deployment.config
 load_config() {
     local _PS_SAVE="$PROXY_STRATEGY"
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -1942,6 +2301,9 @@ prompt_use_existing_config() {
         echo "=========================================="
         echo "Existing configuration file detected!"
         echo "=========================================="
+        echo ""
+        echo "Using the existing deployment config will allow you to either reinstall the current deployment"
+        echo "or expand the current deployment"
         echo ""
         if prompt_yn "Do you want to use the existing configuration?"; then
             log "User chose to use existing configuration."
@@ -2419,10 +2781,434 @@ prompt_single_entry() {
     exec 4<&-
 }
 
+# ==========================================
+# HL7 / TCP Integration Functions
+# ==========================================
+
+# Prompt for optional HL7 TCP integration
+# ==========================================
+# HL7 / TCP Integration Functions
+# ==========================================
+
+# Helper: collect backend servers for one port group.
+# Args: $1 = listen port for this group (used in prompts)
+#       $2 = available-hosts comma string (may be empty → manual)
+#       $3 = "primary" | "additional" (controls question wording)
+# Writes result to _hl7_group_backends (caller reads this)
+_hl7_collect_backends() {
+    local _listen_port="$1"
+    local _available_hosts="${2:-}"
+    local _kind="${3:-primary}"
+    _hl7_group_backends=""
+
+    local -a _host_array=()
+    if [[ -n "$_available_hosts" ]]; then
+        IFS=',' read -ra _host_array <<< "$_available_hosts"
+    fi
+
+    if [[ ${#_host_array[@]} -gt 0 ]]; then
+        # ---- Host picker ----
+        echo "  The following hosts were configured as backend servers"
+        echo "  during the service setup. Select the ones running the"
+        echo "  HL7 integration."
+        echo ""
+
+        local _hl7_backend_port=""
+        local -a _selected_hosts=()
+
+        while true; do
+            echo "  Available hosts:"
+            local _n=1
+            for _h in "${_host_array[@]}"; do
+                echo "    ${_n}. ${_h}"
+                (( ++_n ))
+            done
+            echo ""
+
+            read -p "  Enter the number(s) of the HL7 host(s), comma-separated (e.g. 1,2): " _selection
+            echo ""
+
+            _selected_hosts=()
+            local _valid=true
+            IFS=',' read -ra _picks <<< "$_selection"
+            for _pick in "${_picks[@]}"; do
+                _pick="${_pick// /}"
+                if [[ ! "$_pick" =~ ^[0-9]+$ ]] || (( _pick < 1 || _pick > ${#_host_array[@]} )); then
+                    echo "  Error: '${_pick}' is not a valid option. Choose numbers between 1 and ${#_host_array[@]}."
+                    _valid=false
+                    break
+                fi
+                _selected_hosts+=("${_host_array[$(( _pick - 1 ))]}")
+            done
+
+            [[ "$_valid" == false ]] && continue
+
+            if [[ ${#_selected_hosts[@]} -eq 0 ]]; then
+                echo "  Error: No hosts selected."
+                continue
+            fi
+
+            # Backend port question — wording differs for additional ports
+            echo ""
+            echo " ----------------------------------------"
+            echo " Backend port"
+            echo " ----------------------------------------"
+            echo ""
+            _hl7_backend_port=""
+            if [[ "$_kind" == "additional" ]]; then
+                while true; do
+                    read -p "  The listening port configured in the API service for HL7 port ${_listen_port} [default: ${_listen_port}]: " _hl7_backend_port
+                    _hl7_backend_port="${_hl7_backend_port:-$_listen_port}"
+                    if [[ "$_hl7_backend_port" =~ ^[0-9]+$ ]] && (( _hl7_backend_port >= 1 && _hl7_backend_port <= 65535 )); then
+                        break
+                    fi
+                    echo "  Error: Enter a valid port number (1-65535)."
+                done
+            else
+                while true; do
+                    read -p "  The listening port configured in the API service for HL7 [default: ${_listen_port}]: " _hl7_backend_port
+                    _hl7_backend_port="${_hl7_backend_port:-$_listen_port}"
+                    if [[ "$_hl7_backend_port" =~ ^[0-9]+$ ]] && (( _hl7_backend_port >= 1 && _hl7_backend_port <= 65535 )); then
+                        break
+                    fi
+                    echo "  Error: Enter a valid port number (1-65535)."
+                done
+            fi
+            echo ""
+
+            # Confirm
+            echo " ----------------------------------------"
+            echo " Confirm selection"
+            echo " ----------------------------------------"
+            echo ""
+            echo "  You selected:"
+            for _sh in "${_selected_hosts[@]}"; do
+                echo "    - ${_sh}:${_hl7_backend_port}"
+            done
+            echo ""
+
+            if prompt_yn "  Is this correct?" "y"; then
+                local _bsrv
+                for _sh in "${_selected_hosts[@]}"; do
+                    if [[ -n "$_hl7_group_backends" ]]; then
+                        _hl7_group_backends="${_hl7_group_backends},${_sh}:${_hl7_backend_port}"
+                    else
+                        _hl7_group_backends="${_sh}:${_hl7_backend_port}"
+                    fi
+                done
+                break
+            fi
+            echo ""
+        done
+
+    else
+        # ---- Manual entry fallback ----
+        echo "  Enter the hostname/IP and port of each server running the"
+        echo "  HL7 integration. You can add multiple servers for high availability."
+        echo ""
+
+        local server_count=0
+        while true; do
+            (( server_count++ )) || true
+            echo "  --- Backend Server ${server_count} ---"
+
+            local _host=""
+            while true; do
+                read -p "  Hostname or IP address: " _host
+                [[ -n "$_host" ]] && break
+                echo "  Error: Hostname/IP cannot be empty."
+            done
+
+            local _port=""
+            while true; do
+                if [[ "$_kind" == "additional" ]]; then
+                    read -p "  The listening port configured in the API service for HL7 port ${_listen_port} [default: ${_listen_port}]: " _port
+                else
+                    read -p "  Port [default: ${_listen_port}]: " _port
+                fi
+                _port="${_port:-$_listen_port}"
+                if [[ "$_port" =~ ^[0-9]+$ ]] && (( _port >= 1 && _port <= 65535 )); then
+                    break
+                fi
+                echo "  Error: Enter a valid port number (1-65535)."
+            done
+
+            if [[ -n "$_hl7_group_backends" ]]; then
+                _hl7_group_backends="${_hl7_group_backends},${_host}:${_port}"
+            else
+                _hl7_group_backends="${_host}:${_port}"
+            fi
+
+            echo "  ✓ Added: ${_host}:${_port}"
+            echo ""
+
+            prompt_yn "  Add another backend server?" "n" || break
+            echo ""
+        done
+    fi
+}
+
+# Usage: prompt_hl7_config [comma-separated-host-list]
+prompt_hl7_config() {
+    local _available_hosts="${1:-}"
+
+    # ----------------------------------------
+    # Re-run / existing config detection
+    # ----------------------------------------
+    if [[ "$HL7_ENABLED" == "yes" && -n "$HL7_LISTEN_PORTS" && -n "$HL7_PORT_BACKENDS" ]]; then
+        echo ""
+        echo "=========================================="
+        echo "HL7 / TCP Integration (Optional)"
+        echo "=========================================="
+        echo ""
+        echo "Existing HL7 integration configuration detected:"
+        local _pi=1
+        IFS='|' read -ra _existing_ports <<< "$HL7_LISTEN_PORTS"
+        IFS='|' read -ra _existing_backends <<< "$HL7_PORT_BACKENDS"
+        for _ep in "${_existing_ports[@]}"; do
+            echo "  Port ${_pi}: Traefik :${_ep}  →  ${_existing_backends[$(( _pi - 1 ))]}"
+            (( ++_pi ))
+        done
+        echo ""
+        if prompt_yn "Use existing HL7 configuration?" "y"; then
+            return 0
+        fi
+        HL7_ENABLED="no"
+        HL7_LISTEN_PORTS=""
+        HL7_PORT_BACKENDS=""
+        HL7_PORT_COMMENTS=""
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "HL7 / TCP Integration (Optional)"
+    echo "=========================================="
+    echo ""
+    echo "An HL7 integration allows Traefik to forward raw TCP traffic"
+    echo "(e.g. HL7 v2 messages) to one or more backend servers on a"
+    echo "custom port. Multiple servers provide high availability —"
+    echo "if one becomes unavailable, new connections are routed to"
+    echo "the remaining servers."
+    echo ""
+
+    if ! prompt_yn "Configure an HL7 / TCP integration?" "n"; then
+        HL7_ENABLED="no"
+        log "HL7 integration skipped"
+        return 0
+    fi
+
+    HL7_ENABLED="yes"
+    HL7_LISTEN_PORTS=""
+    HL7_PORT_BACKENDS=""
+    HL7_PORT_COMMENTS=""
+    local -a _port_comments_arr=()
+
+    # ----------------------------------------
+    # Collect one or more Traefik listen ports
+    # ----------------------------------------
+    echo ""
+    echo " ----------------------------------------"
+    echo " Step 1: Traefik HL7 listen port(s)"
+    echo " ----------------------------------------"
+    echo ""
+    echo "  This is the port Traefik will open to receive HL7 traffic."
+    echo "  You will be able to add additional ports if you have a deployment that utilises multiple"
+    echo "  ports for HL7 messages."
+    echo ""
+
+    local -a _listen_ports_arr=()
+
+    # Primary port
+    local _primary_port=""
+    while true; do
+        read -p "  Traefik HL7 listen port [default: 1050]: " _primary_port
+        _primary_port="${_primary_port:-1050}"
+        if [[ "$_primary_port" =~ ^[0-9]+$ ]] && (( _primary_port >= 1 && _primary_port <= 65535 )); then
+            break
+        fi
+        echo "  Error: Enter a valid port number (1-65535)."
+    done
+    _listen_ports_arr+=("$_primary_port")
+    echo "  ✓ Primary port: ${_primary_port}"
+    local _primary_comment=""
+    read -p "  Short description for port ${_primary_port} (Recommended use site name e.g Berlin): " _primary_comment
+    _port_comments_arr+=("${_primary_comment}")
+    echo ""
+
+    # Additional ports
+    if prompt_yn "  Would you like to add additional HL7 ports?" "n"; then
+        echo ""
+        while true; do
+            local _extra_port=""
+            while true; do
+                read -p "  Additional Traefik HL7 listen port: " _extra_port
+                if [[ "$_extra_port" =~ ^[0-9]+$ ]] && (( _extra_port >= 1 && _extra_port <= 65535 )); then
+                    # Check for duplicates
+                    local _dup=false
+                    for _existing_p in "${_listen_ports_arr[@]}"; do
+                        [[ "$_existing_p" == "$_extra_port" ]] && _dup=true && break
+                    done
+                    if [[ "$_dup" == true ]]; then
+                        echo "  Error: Port ${_extra_port} is already configured."
+                        continue
+                    fi
+                    break
+                fi
+                echo "  Error: Enter a valid port number (1-65535)."
+            done
+            _listen_ports_arr+=("$_extra_port")
+            echo "  ✓ Added port: ${_extra_port}"
+            local _extra_comment=""
+            read -p "  Short description for port ${_extra_port} (e.g. Main Lab, Radiology): " _extra_comment
+            _port_comments_arr+=("${_extra_comment}")
+            echo ""
+            prompt_yn "  Add another HL7 port?" "n" || break
+            echo ""
+        done
+    fi
+
+    # Build HL7_LISTEN_PORTS and HL7_PORT_COMMENTS strings
+    HL7_LISTEN_PORTS=$(IFS='|'; echo "${_listen_ports_arr[*]}")
+    HL7_PORT_COMMENTS=$(IFS='|'; echo "${_port_comments_arr[*]}")
+
+    # ----------------------------------------
+    # For each port: collect backend servers
+    # ----------------------------------------
+    local _port_idx=1
+    for _lport in "${_listen_ports_arr[@]}"; do
+        echo ""
+        echo " ----------------------------------------"
+        if [[ ${#_listen_ports_arr[@]} -eq 1 ]]; then
+            echo " Step 2: Backend server(s)"
+        elif [[ $_port_idx -eq 1 ]]; then
+            echo " Step 2: Backend server(s) for primary port :${_lport}"
+        else
+            echo " Step 2.${_port_idx}: Backend server(s) for additional port :${_lport}"
+        fi
+        echo " ----------------------------------------"
+        echo ""
+
+        local _kind="primary"
+        [[ $_port_idx -gt 1 ]] && _kind="additional"
+
+        _hl7_collect_backends "$_lport" "$_available_hosts" "$_kind"
+
+        if [[ -n "$HL7_PORT_BACKENDS" ]]; then
+            HL7_PORT_BACKENDS="${HL7_PORT_BACKENDS}|${_hl7_group_backends}"
+        else
+            HL7_PORT_BACKENDS="${_hl7_group_backends}"
+        fi
+
+        (( ++_port_idx ))
+    done
+
+    # ----------------------------------------
+    # Summary
+    # ----------------------------------------
+    echo ""
+    echo "HL7 integration summary:"
+    IFS='|' read -ra _sum_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _sum_backends <<< "$HL7_PORT_BACKENDS"
+    IFS='|' read -ra _sum_comments <<< "$HL7_PORT_COMMENTS"
+    local _si=0
+    for _sp in "${_sum_ports[@]}"; do
+        local _label="Port $(( _si + 1 ))"
+        [[ $_si -eq 0 ]] && _label="Primary port"
+        echo "  ${_label}:"
+        echo "    Description    : ${_sum_comments[$_si]}"
+        echo "    Traefik listen : :${_sp}"
+        echo "    Backend(s)     : ${_sum_backends[$_si]}"
+        (( ++_si ))
+    done
+    echo ""
+    log "HL7 integration configured: ports=${HL7_LISTEN_PORTS} backends=${HL7_PORT_BACKENDS}"
+}
+
+# Generate dynamic/hl7.yml — one router+service block per port
+generate_hl7_conf() {
+    local dynamic_dir="$1"
+
+    if [[ "$HL7_ENABLED" != "yes" ]]; then
+        return 0
+    fi
+
+    local hl7_file="${dynamic_dir}/hl7.yml"
+    log "Generating hl7.yml at ${hl7_file}..."
+
+    IFS='|' read -ra _ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _backends <<< "$HL7_PORT_BACKENDS"
+    IFS='|' read -ra _comments <<< "$HL7_PORT_COMMENTS"
+
+    # File header
+    echo "tcp:" > "$hl7_file"
+    echo "  routers:" >> "$hl7_file"
+
+    local _idx=0
+    for _port in "${_ports[@]}"; do
+        local _router_name _service_name _ep_name
+        if [[ $_idx -eq 0 ]]; then
+            _ep_name="hl7"
+            _router_name="hl7-router"
+            _service_name="hl7-service"
+        else
+            _ep_name="hl7-${_port}"
+            _router_name="hl7-router-${_port}"
+            _service_name="hl7-service-${_port}"
+        fi
+
+        cat >> "$hl7_file" <<EOF
+    ${_router_name}:
+      entryPoints:
+        - ${_ep_name}
+      rule: "HostSNI(\`*\`)"
+      service: ${_service_name}
+      tls: false
+EOF
+        (( ++_idx ))
+    done
+
+    echo "  services:" >> "$hl7_file"
+
+    _idx=0
+    for _port in "${_ports[@]}"; do
+        local _service_name _comment
+        if [[ $_idx -eq 0 ]]; then
+            _service_name="hl7-service"
+        else
+            _service_name="hl7-service-${_port}"
+        fi
+        _comment="${_comments[$_idx]:-}"
+
+        if [[ -n "$_comment" ]]; then
+            echo "    ${_service_name}: # ${_comment}" >> "$hl7_file"
+        else
+            echo "    ${_service_name}:" >> "$hl7_file"
+        fi
+
+        cat >> "$hl7_file" <<EOF
+      loadBalancer:
+        servers:
+EOF
+        IFS=',' read -ra _srvs <<< "${_backends[$_idx]}"
+        for _srv in "${_srvs[@]}"; do
+            echo "          - address: \"${_srv}\"" >> "$hl7_file"
+        done
+
+        (( ++_idx ))
+    done
+
+    chmod 640 "$hl7_file"
+    log "hl7.yml generated (${#_ports[@]} port(s)) at ${hl7_file}"
+}
+
 # Function to generate clinical_conf.yml based on deployment type (full or image-site) and prompts for service hostnames, protocols and ports using prompt_single_entry function
 generate_clinical_conf() {
-    local config_file="/home/haloap/traefik/config/clinical_conf.yml"
+    local dynamic_dir="/home/haloap/traefik/config/dynamic"
+    local config_file="${dynamic_dir}/clinical_conf.yml"
     local fresh_configuration=false
+
+    # Ensure the dynamic directory exists
+    mkdir -p "$dynamic_dir"
 
     # Check for deployment type change
     if [[ "$DEPLOYMENT_TYPE" != "$INITIAL_DEPLOYMENT_TYPE" ]]; then
@@ -2523,7 +3309,7 @@ EOF
           Strict-Transport-Security: 'max-age=31536000; includeSubDomains; preload'
           X-Content-Type-Options: 'nosniff'
           Server: ''
-          X-Frame-Options : 'SAMEORIGIN'
+          X-Frame-Options: 'SAMEORIGIN'
         browserXssFilter: true
     compress:
       compress: {}
@@ -2656,7 +3442,7 @@ EOF
             # Assign accumulated app_urls to app-service in service_urls after all batches
             service_urls["app-service"]="$app_urls"
         else
-            log "Using existing service configurations from clinical_traefik.env"
+            log "Using existing service configurations from deployment.config"
             app_urls="${service_urls["app-service"]}"
         fi
 
@@ -2854,7 +3640,7 @@ EOF
           Strict-Transport-Security: 'max-age=31536000; includeSubDomains; preload'
           X-Content-Type-Options: 'nosniff'
           Server: ''
-          X-Frame-Options : 'SAMEORIGIN'
+          X-Frame-Options: 'SAMEORIGIN'
         browserXssFilter: true
     compress:
       compress: {}
@@ -3072,7 +3858,7 @@ save_config() {
     SSL_CERT_CONTENT=$(cat "$CERT_FILE")
     SSL_KEY_CONTENT=$(cat "$KEY_FILE")
 
-    # Save all configuration values to clinical_traefik.env
+    # Save all configuration values to deployment.config
     cat > "$CONFIG_FILE" <<EOF
 DEPLOYMENT_TYPE="$DEPLOYMENT_TYPE"
 CERT_DIR="$CERT_DIR"
@@ -3088,6 +3874,10 @@ VRID="$VRID"
 AUTH_PASS="$AUTH_PASS"
 NETWORK_INTERFACE="$NETWORK_INTERFACE"
 MULTI_NODE_DEPLOYMENT="$MULTI_NODE_DEPLOYMENT"
+HL7_ENABLED="$HL7_ENABLED"
+HL7_LISTEN_PORTS="$HL7_LISTEN_PORTS"
+HL7_PORT_BACKENDS="$HL7_PORT_BACKENDS"
+HL7_PORT_COMMENTS="$HL7_PORT_COMMENTS"
 EOF
 
     # Save multi-node configuration if applicable
@@ -3686,13 +4476,22 @@ echo "Installation Plan:"
 echo "  1. Install prerequisites (curl, wget, ipcalc, etc.)"
 echo "  2. Install Docker CE"
 echo "  3. Configure SSL certificates"
-echo "  4. Deploy Traefik reverse proxy"
+echo "  4. Configure backend service URLs and ports"
+if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
+    echo "  5. Configure HL7 / TCP integration (optional)"
+    _next_step=6
+else
+    _next_step=5
+fi
+echo "  ${_next_step}. Deploy Traefik reverse proxy"
+(( _next_step++ ))
 
 if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
-    echo "  5. Install and configure Keepalived (MASTER on this node)"
-    echo "  6. Deploy to ${#BACKUP_NODES[@]} backup node(s)"
+    echo "  ${_next_step}. Install and configure Keepalived (MASTER on this node)"
+    (( _next_step++ ))
+    echo "  ${_next_step}. Deploy to ${#BACKUP_NODES[@]} backup node(s)"
 elif [[ -z "$INSTALL_KEEPALIVED" ]]; then
-    echo "  5. Keepalived installation (will prompt)"
+    echo "  ${_next_step}. Keepalived installation (will prompt)"
 fi
 
 echo ""
@@ -3701,6 +4500,9 @@ echo ""
 echo "Note: The script will prompt for:"
 echo "  - SSL certificate and private key"
 echo "  - Backend service URLs and ports"
+if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
+    echo "  - HL7 / TCP integration (optional, full install only)"
+fi
 if [[ -z "$INSTALL_KEEPALIVED" ]]; then
     echo "  - Keepalived installation (y/n)"
 fi
@@ -4086,7 +4888,7 @@ if [[ -z "$CERT_FILE" ]]; then
     # Create directory structure
     log "Creating certificate directory..."
     sudo mkdir -p "$CERT_DIR"
-    sudo mkdir -p /home/haloap/traefik/config
+    sudo mkdir -p /home/haloap/traefik/config/dynamic
     sudo mkdir -p /home/haloap/traefik/logs
     
     # Set proper ownership - REMOVE the || true to catch failures!
@@ -4195,6 +4997,7 @@ echo ""
 # Create Docker & Traefik directories with proper ownership
 log "Creating Docker and Traefik directories..."
 sudo mkdir -p /home/haloap/traefik/{certs,config,logs}
+sudo mkdir -p /home/haloap/traefik/config/dynamic
 sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap 2>/dev/null || true
 
 # Verify ownership
@@ -4237,7 +5040,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/traefik.yml:/traefik.yml:ro
-      - ./config/clinical_conf.yml:/clinical_conf.yml:ro
+      - ./config/dynamic:/dynamic:ro
       - ./certs/cert.crt:/certs/cert.crt:ro
       - ./certs/server.key:/certs/server.key:ro
       - ./logs:/var/log
@@ -4259,6 +5062,81 @@ fi
 
 backup_file "$TRAEFIK_CONFIG_FILE"
 
+# NOTE: traefik.yml is written after prompt_hl7_config so the HL7 entrypoint
+# can be included conditionally based on the user's answer.
+
+# Create the dynamic config directory and generate config files
+log "Creating dynamic config directory and configuration files..."
+TRAEFIK_DYNAMIC_DIR="/home/haloap/traefik/config/dynamic"
+TRAEFIK_DYNAMIC_FILE="${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
+
+# Ensure dynamic dir is not a stale file from old layout
+if [[ -f "${TRAEFIK_DYNAMIC_DIR}" ]]; then
+    log "Removing stale file at dynamic dir path: ${TRAEFIK_DYNAMIC_DIR}"
+    sudo rm -f "${TRAEFIK_DYNAMIC_DIR}" || exit_on_error "Failed to remove stale path ${TRAEFIK_DYNAMIC_DIR}"
+fi
+
+# Ensure clinical_conf.yml is not a directory from previous failed runs
+if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
+    log "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
+    sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || exit_on_error "Failed to remove directory $TRAEFIK_DYNAMIC_FILE"
+fi
+
+# Remove legacy clinical_conf.yml directory from the old single-file layout
+# (Docker creates a directory if the bind-mount source file didn't exist)
+_legacy_conf="/home/haloap/traefik/config/clinical_conf.yml"
+if [[ -d "$_legacy_conf" ]]; then
+    log "Removing legacy directory from old layout: $_legacy_conf"
+    sudo rm -rf "$_legacy_conf" || exit_on_error "Failed to remove legacy directory $_legacy_conf"
+fi
+
+mkdir -p "$TRAEFIK_DYNAMIC_DIR" || exit_on_error "Failed to create dynamic config directory"
+backup_file "$TRAEFIK_DYNAMIC_FILE"
+
+echo ""
+echo "=========================================="
+echo "Configure Traefik"
+echo "=========================================="
+echo ""
+
+# Call the function to generate the clinical_conf.yml services section
+# (HL7 prompt follows after so we can offer host selection from entered URLs)
+generate_clinical_conf
+
+# Prompt for optional HL7 / TCP integration (full deployment only)
+# Extract unique hostnames from service URLs entered during generate_clinical_conf
+# so the user can pick which servers run the HL7 integration
+if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
+    _hl7_host_list=""
+    _all_service_urls="${APP_SERVICE_URLS},${IDP_SERVICE_URLS},${API_SERVICE_URLS},${FILEMONITOR_SERVICE_URLS},${IMAGE_SERVICE_URLS}"
+    # Strip protocols, extract host portion only (drop port), deduplicate
+    while IFS= read -r _uhost; do
+        [[ -z "$_uhost" ]] && continue
+        if [[ -n "$_hl7_host_list" ]]; then
+            _hl7_host_list="${_hl7_host_list},${_uhost}"
+        else
+            _hl7_host_list="${_uhost}"
+        fi
+    done < <(echo "$_all_service_urls" \
+        | tr ',' '\n' \
+        | sed -E 's#^https?://##; s#:[0-9]+$##' \
+        | sort -u \
+        | grep -v '^$')
+    prompt_hl7_config "$_hl7_host_list"
+else
+    # Ensure HL7 is disabled for image-site deployments
+    HL7_ENABLED="no"
+    HL7_LISTEN_PORTS=""
+    HL7_PORT_BACKENDS=""
+fi
+
+# Generate hl7.yml if HL7 integration is enabled (full deployment only)
+if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
+    generate_hl7_conf "$TRAEFIK_DYNAMIC_DIR"
+fi
+
+# Write traefik.yml now that HL7_ENABLED is definitively set
+log "Writing traefik.yml configuration file..."
 tee "$TRAEFIK_CONFIG_FILE" > /dev/null <<EOF
 entryPoints:
   http:
@@ -4291,6 +5169,32 @@ entryPoints:
         allowEncodedHash: true        # #
   ping:
     address: ':8800'
+EOF
+
+# Append HL7 entrypoints now that HL7_ENABLED is confirmed from user input
+if [[ "$HL7_ENABLED" == "yes" ]]; then
+    _ep_idx=0
+    IFS='|' read -ra _ep_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _ep_comments <<< "$HL7_PORT_COMMENTS"
+    for _ep_port in "${_ep_ports[@]}"; do
+        _ep_name="hl7"
+        [[ $_ep_idx -gt 0 ]] && _ep_name="hl7-${_ep_port}"
+        _ep_comment="${_ep_comments[$_ep_idx]:-}"
+        _ep_addr_line="    address: ':${_ep_port}'"
+        [[ -n "$_ep_comment" ]] && _ep_addr_line="${_ep_addr_line} # ${_ep_comment}"
+        cat >> "$TRAEFIK_CONFIG_FILE" <<EOF
+  ${_ep_name}:
+${_ep_addr_line}
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
+EOF
+        (( ++_ep_idx ))
+    done
+fi
+
+cat >> "$TRAEFIK_CONFIG_FILE" <<EOF
 ping:
   entryPoint: 'ping'
 
@@ -4307,33 +5211,18 @@ providers:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
   file:
-    filename: /clinical_conf.yml
+    directory: /dynamic
+    watch: true
 EOF
-
-# Create a complete clinical_conf.yml configuration file
-log "Creating clinical_conf.yml configuration file..."
-TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
-
-# Ensure clinical_conf.yml is not a directory from previous failed runs
-if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
-    log "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
-    sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || exit_on_error "Failed to remove directory $TRAEFIK_DYNAMIC_FILE"
-fi
-
-backup_file "$TRAEFIK_DYNAMIC_FILE"
-
-echo ""
-echo "=========================================="
-echo "Configure Traefik"
-echo "=========================================="
-echo ""
-
-# Call the function to generate the clinical_conf.yml services section
-generate_clinical_conf
 
 # Write custom CA certificate and update docker-compose volume mount if configured
 if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
     log "Writing custom CA certificate to $CERT_DIR/customca.crt..."
+    # Guard: remove if it was incorrectly created as a directory in a previous run
+    if [[ -d "$CERT_DIR/customca.crt" ]]; then
+        log "Removing incorrectly created directory: $CERT_DIR/customca.crt"
+        sudo rm -rf "$CERT_DIR/customca.crt" || exit_on_error "Failed to remove directory $CERT_DIR/customca.crt"
+    fi
     echo "$CUSTOM_CA_CERT_CONTENT" | tee "$CERT_DIR/customca.crt" > /dev/null || exit_on_error "Failed to write custom CA certificate"
     chmod 644 "$CERT_DIR/customca.crt" || exit_on_error "Failed to set permissions on custom CA certificate"
     log "Custom CA certificate written successfully"
@@ -4885,7 +5774,7 @@ fi
 
 echo "=== Installing on $(hostname) ==="
 
-CONFIG_FILE="/tmp/clinical_traefik.env"
+CONFIG_FILE="/tmp/deployment.config"
 
 # Source the configuration
 if [ -f "$CONFIG_FILE" ]; then
@@ -5086,10 +5975,12 @@ fi
 
 # Create Traefik directories
 sudo mkdir -p /home/haloap/traefik/{certs,config,logs}
+sudo mkdir -p /home/haloap/traefik/config/dynamic
 sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" /home/haloap
 
 TRAEFIK_CONFIG_FILE="/home/haloap/traefik/config/traefik.yml"
-TRAEFIK_DYNAMIC_FILE="/home/haloap/traefik/config/clinical_conf.yml"
+TRAEFIK_DYNAMIC_DIR="/home/haloap/traefik/config/dynamic"
+TRAEFIK_DYNAMIC_FILE="${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
 DOCKER_COMPOSE_FILE="/home/haloap/traefik/docker-compose.yaml"
 
 # Ensure traefik.yml is not a directory
@@ -5098,11 +5989,26 @@ if [[ -d "$TRAEFIK_CONFIG_FILE" ]]; then
     sudo rm -rf "$TRAEFIK_CONFIG_FILE" || { echo "Failed to remove directory"; exit 1; }
 fi
 
+# Ensure dynamic dir is not a stale file
+if [[ -f "${TRAEFIK_DYNAMIC_DIR}" ]]; then
+    echo "Removing stale file at dynamic dir path: ${TRAEFIK_DYNAMIC_DIR}"
+    sudo rm -f "${TRAEFIK_DYNAMIC_DIR}" || { echo "Failed to remove stale path"; exit 1; }
+fi
+
 # Ensure clinical_conf.yml is not a directory
 if [[ -d "$TRAEFIK_DYNAMIC_FILE" ]]; then
     echo "Removing incorrectly created directory: $TRAEFIK_DYNAMIC_FILE"
     sudo rm -rf "$TRAEFIK_DYNAMIC_FILE" || { echo "Failed to remove directory"; exit 1; }
 fi
+
+# Remove legacy clinical_conf.yml directory from the old single-file layout
+if [[ -d "/home/haloap/traefik/config/clinical_conf.yml" ]]; then
+    echo "Removing legacy directory from old layout: /home/haloap/traefik/config/clinical_conf.yml"
+    sudo rm -rf "/home/haloap/traefik/config/clinical_conf.yml" || { echo "Failed to remove legacy directory"; exit 1; }
+fi
+
+# Create dynamic config directory
+mkdir -p "$TRAEFIK_DYNAMIC_DIR" || { echo "Failed to create dynamic config directory"; exit 1; }
 
 # Ensure docker-compose.yaml is not a directory
 if [[ -d "$DOCKER_COMPOSE_FILE" ]]; then
@@ -5152,7 +6058,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/traefik.yml:/traefik.yml:ro
-      - ./config/clinical_conf.yml:/clinical_conf.yml:ro
+      - ./config/dynamic:/dynamic:ro
       - ./certs/cert.crt:/certs/cert.crt:ro
       - ./certs/server.key:/certs/server.key:ro
       - ./logs:/var/log
@@ -5197,6 +6103,35 @@ entryPoints:
         allowEncodedHash: true
   ping:
     address: ':8800'
+TRAEFIKCONF
+
+# Append HL7 entrypoint if integration is enabled (placeholder replaced by sed below)
+HL7_ENABLED_FLAG="HL7_ENABLED_PLACEHOLDER"
+HL7_LISTEN_PORTS_VAL="HL7_PORTS_PLACEHOLDER"
+HL7_PORT_COMMENTS_VAL="HL7_COMMENTS_PLACEHOLDER"
+if [ "$HL7_ENABLED_FLAG" = "yes" ]; then
+    _idx=0
+    IFS='|' read -ra _b_ports    <<< "$HL7_LISTEN_PORTS_VAL"
+    IFS='|' read -ra _b_comments <<< "$HL7_PORT_COMMENTS_VAL"
+    for _b_port in "${_b_ports[@]}"; do
+        _b_ep_name="hl7"
+        [ "$_idx" -gt 0 ] && _b_ep_name="hl7-${_b_port}"
+        _b_comment="${_b_comments[$_idx]:-}"
+        _b_addr="    address: ':${_b_port}'"
+        [ -n "$_b_comment" ] && _b_addr="${_b_addr} # ${_b_comment}"
+        cat >> /home/haloap/traefik/config/traefik.yml <<HLEOF
+  ${_b_ep_name}:
+${_b_addr}
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
+HLEOF
+        _idx=$(( _idx + 1 ))
+    done
+fi
+
+cat >> /home/haloap/traefik/config/traefik.yml <<'TRAEFIKCONF2'
 ping:
   entryPoint: 'ping'
 
@@ -5213,12 +6148,18 @@ providers:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
   file:
-    filename: /clinical_conf.yml
-TRAEFIKCONF
+    directory: /dynamic
+    watch: true
+TRAEFIKCONF2
 
-# Copy clinical_conf.yml from config
+# Copy dynamic config files from /tmp
 if [ -f "/tmp/clinical_conf.yml" ]; then
-    cp /tmp/clinical_conf.yml /home/haloap/traefik/config/clinical_conf.yml
+    cp /tmp/clinical_conf.yml "${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
+    echo "✓ clinical_conf.yml installed into dynamic directory"
+fi
+if [ -f "/tmp/hl7.yml" ]; then
+    cp /tmp/hl7.yml "${TRAEFIK_DYNAMIC_DIR}/hl7.yml"
+    echo "✓ hl7.yml installed into dynamic directory"
 fi
 
 # Set ownership
@@ -5369,11 +6310,30 @@ fi
         sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__DISABLE_DOCKER_REPO__|${DISABLE_DOCKER_REPO}|g" "$SCRIPTS_DIR/install_backup_${node}.sh"
+        # Substitute HL7 placeholders — values contain '|' so cannot use sed.
+        # Pass values via environment variables to avoid all quoting/delimiter issues.
+        HL7_ENABLED_VAL="$HL7_ENABLED" \
+        HL7_PORTS_VAL="$HL7_LISTEN_PORTS" \
+        HL7_COMMENTS_VAL="$HL7_PORT_COMMENTS" \
+        python3 - "$SCRIPTS_DIR/install_backup_${node}.sh" <<'PYEOF'
+import os, sys
+path = sys.argv[1]
+content = open(path).read()
+content = content.replace('HL7_ENABLED_PLACEHOLDER',  os.environ['HL7_ENABLED_VAL'])
+content = content.replace('HL7_PORTS_PLACEHOLDER',    os.environ['HL7_PORTS_VAL'])
+content = content.replace('HL7_COMMENTS_PLACEHOLDER', os.environ['HL7_COMMENTS_VAL'])
+open(path, 'w').write(content)
+PYEOF
         chmod 644 "$SCRIPTS_DIR/install_backup_${node}.sh"
         
-        # Also need to copy clinical_conf.yml to remote
-        if [ -f "/home/haloap/traefik/config/clinical_conf.yml" ]; then
-            cp /home/haloap/traefik/config/clinical_conf.yml /tmp/clinical_conf.yml
+        # Stage dynamic config files for transfer
+        # clinical_conf.yml
+        if [ -f "${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml" ]; then
+            cp "${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml" /tmp/clinical_conf.yml
+        fi
+        # hl7.yml (only present when HL7 is enabled)
+        if [ -f "${TRAEFIK_DYNAMIC_DIR}/hl7.yml" ]; then
+            cp "${TRAEFIK_DYNAMIC_DIR}/hl7.yml" /tmp/hl7.yml
         fi
         
         # Ensure remote scripts directory exists
@@ -5381,9 +6341,12 @@ fi
         
         # Copy files to backup node
         echo "Copying files to $node..."
-        copy_to_remote "$CONFIG_FILE" "$ip" "/tmp/clinical_traefik.env"
+        copy_to_remote "$CONFIG_FILE" "$ip" "/tmp/deployment.config"
         if [ -f "/tmp/clinical_conf.yml" ]; then
             copy_to_remote "/tmp/clinical_conf.yml" "$ip" "/tmp/clinical_conf.yml"
+        fi
+        if [ -f "/tmp/hl7.yml" ]; then
+            copy_to_remote "/tmp/hl7.yml" "$ip" "/tmp/hl7.yml"
         fi
         copy_to_remote "$SCRIPTS_DIR/install_backup_${node}.sh" "$ip" "$SCRIPTS_DIR/install_backup.sh"
         
@@ -5397,6 +6360,7 @@ fi
         # Cleanup local temp files
         rm -f "$SCRIPTS_DIR/install_backup_${node}.sh"
         rm -f /tmp/clinical_conf.yml
+        rm -f /tmp/hl7.yml
         
         # Verify deployment
         echo ""
@@ -5494,7 +6458,11 @@ echo "  - Config: $CONFIG_FILE"
 echo "  - Installation Log: $LOGFILE"
 echo "  - Docker Compose: $DOCKER_COMPOSE_FILE"
 echo "  - Traefik Config: $TRAEFIK_CONFIG_FILE"
-echo "  - Dynamic Config: $TRAEFIK_DYNAMIC_FILE"
+echo "  - Dynamic Config Dir: $TRAEFIK_DYNAMIC_DIR"
+echo "    - clinical_conf.yml: ${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
+if [[ "$HL7_ENABLED" == "yes" ]]; then
+    echo "    - hl7.yml: ${TRAEFIK_DYNAMIC_DIR}/hl7.yml"
+fi
 echo "  - Certificates: $CERT_DIR"
 
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
@@ -5536,6 +6504,19 @@ if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
     echo "  - Virtual IP: https://$VIRTUAL_IP"
 fi
 
+if [[ "$HL7_ENABLED" == "yes" ]]; then
+    IFS='|' read -ra _hl7_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _hl7_comments <<< "$HL7_PORT_COMMENTS"
+    IFS='|' read -ra _hl7_backends <<< "$HL7_PORT_BACKENDS"
+    _hl7_idx=0
+    for _hl7_p in "${_hl7_ports[@]}"; do
+        _hl7_cmt="${_hl7_comments[$_hl7_idx]:-}"
+        [[ -n "$_hl7_cmt" ]] && _hl7_cmt=" (${_hl7_cmt})"
+        echo "  - HL7 TCP :${_hl7_p}${_hl7_cmt} → $(hostname -I | awk '{print $1}'):${_hl7_p}"
+        (( ++_hl7_idx ))
+    done
+fi
+
 echo ""
 echo "Verification Commands:"
 echo "  Check Docker status:"
@@ -5547,6 +6528,26 @@ echo ""
 echo "  Check Traefik health:"
 echo "    curl http://localhost:8800/ping"
 echo ""
+
+if [[ "$HL7_ENABLED" == "yes" ]]; then
+    echo "  Verify HL7 entrypoint(s) (Traefik should be listening):"
+    IFS='|' read -ra _vcmd_ports    <<< "$HL7_LISTEN_PORTS"
+    IFS='|' read -ra _vcmd_backends <<< "$HL7_PORT_BACKENDS"
+    IFS='|' read -ra _vcmd_comments <<< "$HL7_PORT_COMMENTS"
+    _vcmd_idx=0
+    for _vcmd_port in "${_vcmd_ports[@]}"; do
+        _vcmd_cmt="${_vcmd_comments[$_vcmd_idx]:-}"
+        [[ -n "$_vcmd_cmt" ]] && echo "    # ${_vcmd_cmt} (port ${_vcmd_port})"
+        echo "    ss -tlnp | grep :${_vcmd_port}"
+        echo "    # Or test connectivity to backend(s):"
+        IFS=',' read -ra _vcmd_srvs <<< "${_vcmd_backends[$_vcmd_idx]}"
+        for _vsrv in "${_vcmd_srvs[@]}"; do
+            echo "    curl -v telnet://${_vsrv}"
+        done
+        echo ""
+        (( ++_vcmd_idx ))
+    done
+fi
 
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
     echo "  Check Keepalived status:"
