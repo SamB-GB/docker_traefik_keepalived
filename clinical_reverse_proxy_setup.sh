@@ -11,7 +11,7 @@
 #       Running as sudo ensures /opt/indica is owned by root:root and SSH keys are
 #       resolved correctly from the invoking user's home directory.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 set -e
 
@@ -96,6 +96,10 @@ DIAG_AUTH_TOKEN=""       # Base64 encoded Basic auth token
 USE_CUSTOM_CA="no"
 CUSTOM_CA_CERT_CONTENT=""
 
+# Component server /etc/hosts entries (pipe-separated hostname:ip pairs)
+# e.g. "HNUKAP24COM01:10.0.40.200|HNUKAP24APL01:10.0.40.201"
+HOSTS_ENTRIES=""
+
 # Logging setup
 LOGFILE="/var/log/installation.log"
 
@@ -122,6 +126,8 @@ fi
 # Get the directory where the script is located
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
 CONFIG_FILE="/opt/indica/traefik/deployment.config"
+TRAEFIK_ROOT="/opt/indica/traefik"
+AUDIT_LOG="/opt/indica/traefik/audit.log"
 
 # Directory for temporary scripts
 SCRIPTS_DIR="$ACTUAL_HOME/traefik_setup_scripts"
@@ -794,6 +800,23 @@ write_local_file() {
     fi
 }
 
+audit_log() {
+    local _op="$1"
+    local _desc="$2"
+    local _ts
+    _ts=$(date +'%Y-%m-%d %H:%M:%S')
+    local _entry
+    _entry="[${_ts}] [$(printf '%-14s' "$_op")] ${CURRENT_USER:-unknown} — ${_desc}"
+
+    # Ensure audit log directory exists
+    mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+    chown -R root:root "${TRAEFIK_ROOT}" 2>/dev/null || true
+
+    echo "$_entry" >> "$AUDIT_LOG" 2>/dev/null || \
+        bash -c "echo '$_entry' >> '$AUDIT_LOG'" 2>/dev/null || true
+}
+
+
 # Validate OS and version
 validate_os() {
     echo ""
@@ -892,12 +915,16 @@ validate_os() {
 }
 
 check_execution_context() {
-    echo ""
-    echo ""
-    echo ":: Validating Execution Context"
-    echo "──────────────────────────────────────────────────"
-    echo ""
-    echo ""
+    local _quiet="${1:-false}"
+
+    if [[ "$_quiet" != "true" ]]; then
+        echo ""
+        echo ""
+        echo ":: Validating Execution Context"
+        echo "──────────────────────────────────────────────────"
+        echo ""
+        echo ""
+    fi
 
     # Check 1: Must be run with sudo (EUID 0) but not logged in directly as root
     if [ "$EUID" -ne 0 ]; then
@@ -925,10 +952,12 @@ check_execution_context() {
         exit 1
     fi
 
-    echo "✓ Script is being run as: ${CURRENT_USER} (via sudo)"
-    echo "✓ Home directory: $ACTUAL_HOME"
-    echo "✓ SSH keys: $ACTUAL_HOME/.ssh/id_rsa"
-    echo "✓ Execution context validated"
+    if [[ "$_quiet" != "true" ]]; then
+        echo "✓ Script is being run as: ${CURRENT_USER} (via sudo)"
+        echo "✓ Home directory: $ACTUAL_HOME"
+        echo "✓ SSH keys: $ACTUAL_HOME/.ssh/id_rsa"
+        echo "✓ Execution context validated"
+    fi
 }
 
 # Check repository connectivity
@@ -1066,6 +1095,7 @@ check_single_node() {
     local node_ip="$3"
     
     local REPO_CHECK_FAILED=0
+    DOCKER_AUTH_BLOCKED=false
     local FAILED_REPOS=()
     
     # Configure proxy for connectivity checks
@@ -1131,9 +1161,11 @@ check_single_node() {
 
     if echo "$AUTH_TEST" | grep -q "200\|400\|401"; then
         echo "✓ Reachable"
+        DOCKER_AUTH_BLOCKED=false
     else
         echo "❌ FAILED (image pulls will fail — auth endpoint blocked)"
         REPO_CHECK_FAILED=1
+        DOCKER_AUTH_BLOCKED=true
         FAILED_REPOS+=("Docker auth (auth.docker.io)")
     fi
     
@@ -1356,6 +1388,7 @@ echo ""
 # The full prerequisites list (ipcalc, nano, etc.) is installed later;
 # this section only covers what is needed for the script to bootstrap.
 
+if [[ "$1" != "--status" ]]; then
 echo ""
 echo "Checking essential prerequisites..."
 
@@ -1396,15 +1429,240 @@ elif command -v dnf &>/dev/null; then
     fi
 fi
 echo ""
+fi
 
-validate_os
-check_execution_context
-validate_proxy_config
-setup_proxy_strategy || exit_on_error "Failed to setup proxy strategy"
+if [[ "$1" == "--status" ]]; then
+    # For --status just validate sudo context silently then run
+    validate_os >/dev/null 2>&1 || true
+    check_execution_context true
+    setup_proxy_strategy >/dev/null 2>&1 || true
+else
+    validate_os
+    check_execution_context
+    validate_proxy_config
+    setup_proxy_strategy || exit_on_error "Failed to setup proxy strategy"
+fi
 
 # ==========================================
 # Cleanup Mode
 # ==========================================
+
+clean_orphaned_nodes() {
+    echo ""
+    echo ""
+    echo ":: Clean Orphaned Backup Nodes"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo "  An orphaned node is a backup node that was previously part of"
+    echo "  this deployment but is no longer in the configuration — e.g."
+    echo "  after a Replace Node operation or decommission."
+    echo ""
+    echo "  This will connect to each node and remove Traefik, Keepalived,"
+    echo "  and associated files."
+    echo ""
+
+    local _uninstall_kv _uninstall_docker
+    if prompt_yn "  Uninstall Keepalived on orphaned nodes?" "y"; then
+        _uninstall_kv=true
+    else
+        _uninstall_kv=false
+    fi
+
+    if prompt_yn "  Uninstall Docker on orphaned nodes?" "n"; then
+        echo ""
+        echo "  ⚠️  WARNING: This will remove Docker and ALL containers/images!"
+        if prompt_yn "  Are you absolutely sure?" "n"; then
+            _uninstall_docker=true
+        else
+            _uninstall_docker=false
+        fi
+    else
+        _uninstall_docker=false
+    fi
+
+    echo ""
+    read -s -p "  Enter sudo password for orphaned nodes: " _orphan_sudo_pass
+    echo ""
+    export SUDO_PASS="$_orphan_sudo_pass"
+    SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no}"
+
+    local _orphan_count=0
+    local _orphan_user="$CURRENT_USER"
+    local _ssh_key_opt=""
+    if [[ -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
+        _ssh_key_opt="-i $ACTUAL_HOME/.ssh/id_rsa"
+    fi
+    SSH_OPTS="-o StrictHostKeyChecking=no ${_ssh_key_opt}"
+
+    # If no SSH key exists, offer to generate one and copy to nodes
+    if [[ ! -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
+        echo ""
+        echo "  ⚠  No SSH key found at $ACTUAL_HOME/.ssh/id_rsa"
+        echo "  SSH key auth is required for remote operations."
+        echo ""
+        if prompt_yn "  Generate an SSH key now?" "y"; then
+            sudo -u "$SUDO_USER" ssh-keygen -t rsa -b 4096 -N "" \
+                -f "$ACTUAL_HOME/.ssh/id_rsa" 2>/dev/null
+            if [[ -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
+                _ssh_key_opt="-i $ACTUAL_HOME/.ssh/id_rsa"
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                echo "  ✓ SSH key generated"
+            else
+                echo "  ✗ Key generation failed — cannot proceed"
+                return 1
+            fi
+        else
+            echo "  Cannot proceed without an SSH key."
+            return 1
+        fi
+    fi
+
+    echo ""
+    read -p "  Remote SSH username for orphaned nodes [${CURRENT_USER}]: " _input_user
+    [[ -n "$_input_user" ]] && _orphan_user="$_input_user"
+    echo ""
+
+    while true; do
+        echo ""
+        local _oip _oname
+        read -p "  Enter IP address of orphaned node (or 0 to finish): " _oip
+        if [[ "$_oip" == "0" || -z "$_oip" ]]; then break; fi
+
+        if ! [[ "$_oip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "  Invalid IP address."
+            continue
+        fi
+
+        read -p "  Hostname/label for ${_oip} (for display only): " _oname
+        _oname="${_oname:-orphan_${_oip//./_}}"
+
+        echo ""
+        echo -n "  Testing SSH connectivity to ${_oname} (${_oip}) as ${_orphan_user}... "
+
+        if sudo -u "$SUDO_USER" ssh $_ssh_key_opt \
+            -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            -l "$_orphan_user" "$_oip" "echo ok" >/dev/null 2>&1; then
+            echo "✓"
+        else
+            echo "✗ key auth failed"
+            echo ""
+            echo "  The SSH key is not yet authorised on ${_oip}."
+            if prompt_yn "  Copy SSH key to ${_orphan_user}@${_oip} now?" "y"; then
+                echo ""
+                sudo -u "$SUDO_USER" ssh-copy-id \
+                    -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
+                    -o StrictHostKeyChecking=no \
+                    "${_orphan_user}@${_oip}" \
+                    && echo "  ✓ Key copied" \
+                    || { echo "  ✗ Failed to copy key — skipping node"; continue; }
+                # Re-test
+                if ! sudo -u "$SUDO_USER" ssh $_ssh_key_opt \
+                    -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                    -l "$_orphan_user" "$_oip" "echo ok" >/dev/null 2>&1; then
+                    echo "  ✗ Still cannot connect — skipping node"
+                    continue
+                fi
+                echo "  ✓ Connected"
+            else
+                if ! prompt_yn "  Skip this node?" "y"; then
+                    continue
+                fi
+                continue
+            fi
+        fi
+
+        # Build cleanup script
+        local _cleanup_script="$SCRIPTS_DIR/cleanup_orphan_${_oname}.sh"
+        write_local_file "$_cleanup_script" <<'ORPHANCLEANUP'
+#!/bin/bash
+set -e
+echo ""
+echo ":: Cleaning orphaned node: $(hostname)"
+echo "──────────────────────────────────────────────────"
+
+# Stop and remove Traefik container
+echo -n "Stopping Traefik container... "
+docker stop traefik 2>/dev/null || true
+docker rm traefik 2>/dev/null || true
+echo "✓"
+
+# Remove Traefik files
+echo -n "Removing /opt/indica/traefik... "
+rm -rf /opt/indica/traefik 2>/dev/null || true
+rm -rf /home/haloap/traefik 2>/dev/null || true
+echo "✓"
+
+# Remove keepalived if flagged
+if [[ "UNINSTALL_KEEPALIVED_FLAG" == "true" ]]; then
+    echo -n "Stopping Keepalived... "
+    systemctl stop keepalived 2>/dev/null || true
+    systemctl disable keepalived 2>/dev/null || true
+    echo "✓"
+    echo -n "Removing Keepalived... "
+    if command -v apt-get &>/dev/null; then
+        apt-get -y purge keepalived 2>/dev/null || true
+        apt-get -y autoremove 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dnf -y remove keepalived 2>/dev/null || true
+    fi
+    rm -f /etc/keepalived/keepalived.conf
+    rm -f /bin/indica_service_check.sh 2>/dev/null || true
+    echo "✓"
+fi
+
+# Remove Docker if flagged
+if [[ "UNINSTALL_DOCKER_FLAG" == "true" ]]; then
+    echo -n "Stopping Docker... "
+    systemctl stop docker 2>/dev/null || true
+    systemctl disable docker 2>/dev/null || true
+    echo "✓"
+    echo -n "Removing Docker... "
+    if command -v apt-get &>/dev/null; then
+        apt-get -y purge docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
+        apt-get -y autoremove 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dnf -y remove docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+    fi
+    rm -rf /var/lib/docker 2>/dev/null || true
+    rm -rf /var/lib/containerd 2>/dev/null || true
+    echo "✓"
+fi
+
+echo ""
+echo "✓ Cleanup complete on $(hostname)"
+ORPHANCLEANUP
+
+        chmod 644 "$_cleanup_script"
+        sed -i "s/UNINSTALL_KEEPALIVED_FLAG/${_uninstall_kv}/g" "$_cleanup_script"
+        sed -i "s/UNINSTALL_DOCKER_FLAG/${_uninstall_docker}/g" "$_cleanup_script"
+
+        echo -n "  Cleaning ${_oname} (${_oip})... "
+        local _saved_current_user="$CURRENT_USER"
+        CURRENT_USER="$_orphan_user"
+        ensure_SCRIPTS_DIR "$_oip" || true
+        copy_to_remote "$_cleanup_script" "$_oip" "$SCRIPTS_DIR/cleanup_orphan.sh" || true
+        local _out
+        _out=$(execute_remote_script "$_oip" "$SCRIPTS_DIR/cleanup_orphan.sh" 2>&1) \
+            && echo "✓" \
+            || { echo "⚠️  completed with warnings"; echo "$_out" | grep -v "^Connection to\|^Shared" | sed 's/^/    /'; }
+        CURRENT_USER="$_saved_current_user"
+        unset SSHPASS
+
+        rm -f "$_cleanup_script"
+        audit_log "ORPHAN_CLEAN" "Cleaned orphaned node ${_oname} (${_oip})"
+        _orphan_count=$(( _orphan_count + 1 ))
+
+        if ! prompt_yn "  Clean another orphaned node?" "n"; then break; fi
+    done
+
+    echo ""
+    if (( _orphan_count > 0 )); then
+        echo "  ✓ Cleaned ${_orphan_count} orphaned node(s)"
+    else
+        echo "  No nodes cleaned."
+    fi
+    echo ""
+}
 
 if [[ "$1" == "--clean" ]]; then
     # ===== LOAD CONFIG FIRST (before any cleanup) =====
@@ -1466,7 +1724,13 @@ if [[ "$1" == "--clean" ]]; then
             fi
         fi
     fi
-    
+
+    # ===== ORPHANED NODES =====
+    echo ""
+    if prompt_yn "Do you have any orphaned backup nodes to clean?" "n"; then
+        clean_orphaned_nodes
+    fi
+
     # ===== CONFIRM CLEANUP =====
     echo ""
     echo ""
@@ -1998,6 +2262,27 @@ load_config() {
             log "Preserved proxy strategy from runtime: ${PROXY_STRATEGY}"
         fi
 
+        # Restore /etc/hosts entries saved from previous install
+        if [[ -n "$HOSTS_ENTRIES" ]]; then
+            log "Restoring /etc/hosts entries from deployment.config..."
+            local _restored=0
+            IFS='|' read -ra _hentries <<< "$HOSTS_ENTRIES"
+            for _hentry in "${_hentries[@]}"; do
+                local _hname="${_hentry%%:*}"
+                local _hip="${_hentry##*:}"
+                if [[ -n "$_hname" && -n "$_hip" ]]; then
+                    if ! grep -qE "^\s*${_hip}\s+${_hname}" /etc/hosts 2>/dev/null; then
+                        echo "${_hip}    ${_hname}" >> /etc/hosts
+                        log "Restored /etc/hosts: ${_hip} → ${_hname}"
+                        _restored=$(( _restored + 1 ))
+                    fi
+                fi
+            done
+            if (( _restored > 0 )); then
+                log "Restored ${_restored} /etc/hosts entr(ies)"
+            fi
+        fi
+
         # Backup existing certificate and key files
         backup_file "$CERT_FILE"
         backup_file "$KEY_FILE"
@@ -2149,7 +2434,22 @@ _extend_restart_traefik_all_nodes() {
 
     # Local node
     echo -n "  Local node... "
-    (cd /opt/indica/traefik && docker_cmd compose up -d --force-recreate 2>&1) || {
+    if [[ ! -f "/opt/indica/traefik/docker-compose.yaml" ]]; then
+        echo "✗ docker-compose.yaml not found"
+        echo ""
+        if prompt_yn "  Recreate docker-compose.yaml?" "y"; then
+            recreate_docker_compose
+            # Re-add CA mount if CA cert is present
+            if [[ -f "/opt/indica/traefik/certs/customca.crt" ]]; then
+                sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' \
+                    /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+            fi
+        else
+            echo "  Cannot restart Traefik without docker-compose.yaml"
+            return 1
+        fi
+    fi
+    docker_cmd compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate 2>&1 || {
         echo "✗ FAILED"
         echo ""
         echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -2287,6 +2587,45 @@ extend_update_ssl() {
 # Extend Mode — Option 2: Update CA Certificate
 # ==========================================
 
+# Recreate docker-compose.yaml from template if missing or corrupt
+recreate_docker_compose() {
+    local _compose="/opt/indica/traefik/docker-compose.yaml"
+    local _use_ca="${1:-no}"  # pass "yes" to include customca volume mount
+
+    echo -n "  Recreating docker-compose.yaml... "
+    mkdir -p /opt/indica/traefik
+
+    cat > "$_compose" <<EOF
+services:
+  traefik:
+    image: docker.io/library/traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - label=type:container_runtime_t
+    cap_add:
+      - NET_BIND_SERVICE
+    network_mode: "host"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik.yml:/traefik.yml:ro
+      - ./config/dynamic:/dynamic:ro
+      - ./certs/cert.crt:/certs/cert.crt:ro
+      - ./certs/server.key:/certs/server.key:ro
+      - ./logs:/var/log
+EOF
+
+    if [[ "$_use_ca" == "yes" ]]; then
+        echo "      - ./certs/customca.crt:/certs/customca.crt:ro" >> "$_compose"
+    fi
+
+    chmod 640 "$_compose"
+    chown root:root "$_compose"
+    echo "✓"
+}
+
 extend_update_ca() {
     echo ""
     echo ""
@@ -2306,22 +2645,40 @@ extend_update_ca() {
     prompt_custom_ca
 
     if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
+        mkdir -p "$(dirname "$_ca_file")"
+        mkdir -p "$(dirname "$_ca_file")"
         echo "$CUSTOM_CA_CERT_CONTENT" > "${_ca_file}"
         chmod 644 "${_ca_file}"
         echo "✓ CA certificate written locally"
 
         # Add volume mount to docker-compose.yaml if not already present
         local _compose="/opt/indica/traefik/docker-compose.yaml"
-        if [[ -f "$_compose" ]] && ! grep -q "customca.crt" "$_compose"; then
-            sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' "$_compose"
-            echo "✓ Custom CA volume mount added to docker-compose.yaml"
+        if [[ -f "$_compose" ]]; then
+            if ! grep -q "customca.crt" "$_compose"; then
+                sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' "$_compose"
+                if grep -q "customca.crt" "$_compose"; then
+                    echo "✓ Custom CA volume mount added to docker-compose.yaml"
+                else
+                    echo "⚠️  Could not add volume mount automatically — add manually:"
+                    echo "     - ./certs/customca.crt:/certs/customca.crt:ro"
+                fi
+            else
+                echo "✓ Custom CA volume mount already present in docker-compose.yaml"
+            fi
+        else
+            echo "⚠️  docker-compose.yaml not found"
+            echo ""
+            if prompt_yn "  docker-compose.yaml is missing. Recreate it now?" "y"; then
+                recreate_docker_compose "yes"
+            else
+                echo "  ⚠️  Cannot restart Traefik without docker-compose.yaml"
+            fi
         fi
 
         # Add serversTransport to clinical_conf.yml if not already present
         local _clinical_conf="/opt/indica/traefik/config/dynamic/clinical_conf.yml"
         if [[ -f "$_clinical_conf" ]]; then
             if ! grep -q "serversTransports" "$_clinical_conf"; then
-                # Append serversTransports block
                 cat >> "$_clinical_conf" <<'CACONF'
 
   serversTransports:
@@ -2332,10 +2689,13 @@ CACONF
                 echo "✓ serversTransports block added to clinical_conf.yml"
             fi
             if ! grep -q "serversTransport: internalCA" "$_clinical_conf"; then
-                # Add serversTransport reference to each loadBalancer
                 sed -i '/        healthCheck:/i\        serversTransport: internalCA' "$_clinical_conf"
                 echo "✓ serversTransport reference added to load balancers"
             fi
+        else
+            echo "⚠️  clinical_conf.yml not found — serversTransport not configured"
+            echo "    This is expected if no component servers have been added yet."
+            echo "    Add component servers first, then re-run Update CA Certificate."
         fi
 
         # Push to backup nodes
@@ -3302,10 +3662,13 @@ extend_edit_components() {
                         local _np="${BASH_REMATCH[1]}" _nh="${BASH_REMATCH[2]}"
                         echo ""
                         if prompt_yn "  Use same host (${_nh}) and protocol (${_np}) for all other services on default ports?" "y"; then
+                            # DNS check once for the shared host
+                            check_host_resolution "$_nh"
                             for i in "${!_svc_names[@]}"; do
                                 if [[ "${_svc_names[$i]}" == "app-service" ]]; then continue; fi
                                 local _v="${_svc_vars[$i]}" _port="${_svc_ports[$i]}"
                                 local _u="${_np}://${_nh}:${_port}"
+                                check_port_connectivity "$_nh" "$_port"
                                 declare -g "$_v"="${!_v:+${!_v},}${_u}"
                                 echo "  ✓ Added ${_u} → ${_svc_names[$i]}"
                                 _ec_pending_log+=("+ Add  ${_svc_names[$i]}  ${_u}")
@@ -3745,6 +4108,9 @@ extend_edit_components() {
                     if [[ -z "$_new_host" ]]; then echo "  Cannot be empty."; fi
                 done
 
+                # DNS check for new hostname
+                check_host_resolution "$_new_host"
+
                 local _ai=0
                 for _hsvc in "${_host_svc_arr[@]}"; do
                     local _old_u="${_host_urls[$_ai]}"
@@ -3754,6 +4120,9 @@ extend_edit_components() {
                     _scheme=$(echo "$_old_u" | grep -oE '^https?')
                     _port_part=$(echo "$_old_u" | grep -oE ':[0-9]+$')
                     local _new_u="${_scheme}://${_new_host}${_port_part}"
+                    # Port check for each service
+                    local _port_num="${_port_part#:}"
+                    check_port_connectivity "$_new_host" "$_port_num"
                     local _updated
                     _updated=$(_ec_replace_url "${!_hv}" "$_old_u" "$_new_u")
                     declare -g "$_hv"="$_updated"
@@ -5002,6 +5371,40 @@ echo ""
 echo ""
 echo ""
 
+# ── Handle existing installations ──────────────────────────────────────────
+
+# Migrate /home/haloap/traefik → /opt/indica/traefik if needed
+if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
+    echo ":: Migrating legacy /home/haloap/traefik → /opt/indica/traefik"
+    (cd /home/haloap/traefik && docker compose down 2>/dev/null) || true
+    mkdir -p /opt/indica
+    mv /home/haloap/traefik /opt/indica/traefik
+    sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/deployment.config 2>/dev/null || true
+    sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/config/traefik.yml 2>/dev/null || true
+    sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+    find /opt/indica/traefik/config/dynamic -name "*.yml" \
+        -exec sed -i 's|/home/haloap|/opt/indica|g' {} \; 2>/dev/null || true
+    echo "✓ Migrated"
+fi
+
+# Back up existing /opt/indica/traefik before reinstalling
+if [[ -d "/opt/indica/traefik" ]]; then
+    _date=$(date +'%d_%b_%y' | tr '[:lower:]' '[:upper:]')
+    _time=$(date +'%H_%M_%S')
+    _backup_dir="/opt/indica/traefik/backups/${_date}/${_time}/files"
+    echo ":: Backing up existing installation → ${_backup_dir}"
+    mkdir -p "${_backup_dir}"
+    find /opt/indica/traefik -maxdepth 1 \
+        ! -path /opt/indica/traefik \
+        ! -path /opt/indica/traefik/backups \
+        ! -path "/opt/indica/traefik/backups/*" \
+        -exec mv {} "${_backup_dir}/" \; 2>/dev/null || true
+    echo "✓ Backed up"
+    # Stop existing container
+    docker stop traefik 2>/dev/null || true
+    docker rm traefik 2>/dev/null || true
+fi
+
 # Proxy configuration
 PROXY="__PROXY__"
 PROXY_STRATEGY="__PROXY_STRATEGY__"
@@ -5131,16 +5534,16 @@ fi
 # Install Docker
 echo "Installing Docker..."
 if command -v apt-get &>/dev/null; then
-    if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
-        echo "Adding Docker repository..."
-        install -m 0755 -d /etc/apt/keyrings
-        curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
-            https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | \
-            gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
-    fi
+    echo "Adding Docker repository..."
+    install -m 0755 -d /etc/apt/keyrings
+    rm -f /etc/apt/keyrings/docker.gpg
+    curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
+        https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | \
+        gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
     echo "Installing Docker packages..."
     sudo -E apt-get $APT_PROXY_OPT_PROXY install -y docker-ce docker-ce-cli containerd.io
 elif command -v dnf &>/dev/null; then
@@ -6463,10 +6866,10 @@ show_status() {
                 local _bt
                 _bt=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
                     -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
-                    "docker ps --filter name=traefik --filter status=running \
-                     --format '{{.Names}}' 2>/dev/null || sg docker -c \
-                     \"docker ps --filter name=traefik --filter status=running \
-                     --format '{{.Names}}'\") 2>/dev/null" 2>/dev/null) || true
+                    "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
+                     sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
+                     sudo docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null" \
+                    2>/dev/null) || true
                 if echo "$_bt" | grep -q traefik; then
                     _bstatus="✓ Running"
                 else
@@ -6573,6 +6976,13 @@ show_status() {
     echo "  ✓ Status check complete"
     echo ""
 }
+
+# ==========================================
+# Clean Orphaned Backup Nodes
+# ==========================================
+# Connects to nodes no longer in deployment.config and runs cleanup.
+# Used from both the existing deployment menu and --clean.
+
 
 handle_extend_mode() {
     while true; do
@@ -6739,7 +7149,10 @@ prompt_use_existing_config() {
                         _btraefik=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=3 \
                             -o StrictHostKeyChecking=no \
                             -l "$CURRENT_USER" "$_bip" \
-                            "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null" 2>/dev/null) || true
+                            "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
+                             sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
+                             sudo docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null" \
+                            2>/dev/null) || true
                         if echo "$_btraefik" | grep -q traefik; then
                             _bstatus="Traefik running  ✓"
                         else
@@ -6779,16 +7192,17 @@ prompt_use_existing_config() {
         echo "    [2] Status Check — view health of current deployment"
         echo "    [3] Change — update certificates, servers, nodes or HL7"
         echo "    [4] Uninstall  — remove everything from all nodes"
+        echo "    [5] Clean Orphaned Nodes — remove Traefik from decommissioned nodes"
         echo "    ─────────────────────────────────────────────────────"
-        echo "    [5] Cancel"
+        echo "    [6] Cancel"
         echo ""
 
         local _choice
         while true; do
-            read -p "Enter choice [1-5]: " _choice
+            read -p "Enter choice [1-6]: " _choice
             case "$_choice" in
-                1|2|3|4|5) break ;;
-                *) echo "  Please enter 1, 2, 3, 4, or 5." ;;
+                1|2|3|4|5|6) break ;;
+                *) echo "  Please enter 1, 2, 3, 4, 5, or 6." ;;
             esac
         done
 
@@ -6883,6 +7297,11 @@ prompt_use_existing_config() {
                 fi
                 ;;
             5)
+                echo ""
+                log "User selected: Clean Orphaned Nodes"
+                clean_orphaned_nodes
+                ;;
+            6)
                 echo "Operation cancelled."
                 cleanup
                 exit 0
@@ -6905,6 +7324,13 @@ prompt_deployment_type() {
     local default_hint=""
     if [[ -n "$INITIAL_DEPLOYMENT_TYPE" ]]; then
         default_hint="(Detected: $INITIAL_DEPLOYMENT_TYPE)"
+    fi
+
+    # On reinstall, skip the prompt entirely and reuse existing type
+    if [[ -n "$INITIAL_DEPLOYMENT_TYPE" ]]; then
+        DEPLOYMENT_TYPE="$INITIAL_DEPLOYMENT_TYPE"
+        echo "  ✓ Deployment type: ${DEPLOYMENT_TYPE} (from existing config)"
+        return 0
     fi
 
     while true; do
@@ -6983,22 +7409,6 @@ _backup_get_dir() {
 
 # Write an entry to the audit log
 # Usage: audit_log "OPERATION" "description"
-audit_log() {
-    local _op="$1"
-    local _desc="$2"
-    local _ts
-    _ts=$(date +'%Y-%m-%d %H:%M:%S')
-    local _entry
-    _entry="[${_ts}] [$(printf '%-14s' "$_op")] ${CURRENT_USER:-unknown} — ${_desc}"
-
-    # Ensure audit log directory exists
-    mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
-    chown -R root:root "${TRAEFIK_ROOT}" 2>/dev/null || true
-
-    echo "$_entry" >> "$AUDIT_LOG" 2>/dev/null || \
-        bash -c "echo '$_entry' >> '$AUDIT_LOG'" 2>/dev/null || true
-}
-
 # Snapshot the current config/ directory to the timed backup dir
 # Usage: snapshot_config "OPERATION_TYPE" "description"
 snapshot_config() {
@@ -7168,7 +7578,7 @@ prompt_multi_node_deployment() {
     # Check if we already have multi-node config loaded
     if [[ -n "$MULTI_NODE_DEPLOYMENT" && "$MULTI_NODE_DEPLOYMENT" == "yes" ]]; then
         echo "Existing multi-node configuration detected:"
-        echo "  Master: $MASTER_HOSTNAME ($MASTER_IP)"
+        echo "  Master: $MASTER_HOSTNAME ($MASTER_IP) - Interface: ${NETWORK_INTERFACE:-auto}"
         for i in "${!BACKUP_NODES[@]}"; do
             echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Interface: ${BACKUP_INTERFACES[$i]:-auto}"
         done
@@ -7345,6 +7755,130 @@ prompt_multi_node_deployment() {
 # Service Configuration
 # ==========================================
 
+# ==========================================
+# DNS / hosts file check
+# ==========================================
+
+# Check if a hostname resolves. If not, offer to add it to /etc/hosts.
+# Stores new entries in HOSTS_ENTRIES (pipe-separated hostname:ip) and
+# pushes to backup nodes if multi-node.
+# Usage: check_host_resolution <hostname>
+check_host_resolution() {
+    local _host="$1"
+    # Ensure fd3 (output) and fd4 (input) are open — may not be if called outside prompt_single_entry
+    { true >&3; } 2>/dev/null || exec 3>/dev/tty
+    { true <&4; } 2>/dev/null || exec 4</dev/tty
+
+    # Skip check for bare IP addresses — nothing to resolve
+    if [[ "$_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+
+    echo "" >&3
+    echo -n "  Checking DNS resolution for ${_host}... " >&3
+
+    if getent hosts "$_host" >/dev/null 2>&1; then
+        local _resolved_ip
+        _resolved_ip=$(getent hosts "$_host" | awk '{print $1}' | head -1)
+        echo "✓ Resolves to ${_resolved_ip}" >&3
+        return 0
+    fi
+
+    echo "✗ Cannot resolve ${_host}" >&3
+    echo "" >&3
+
+    if ! prompt_yn "  Add ${_host} to /etc/hosts?" "y"; then
+        echo "  Skipping — connectivity check may fail." >&3
+        return 0
+    fi
+
+    # Prompt for IP
+    local _ip=""
+    while true; do
+        read -p "  Enter IP address for ${_host}: " _ip <&4
+        if [[ "$_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            break
+        fi
+        echo "  Invalid IP address. Please enter a valid IPv4 address." >&3
+    done
+
+    # Check for existing entry with different IP
+    local _existing_ip
+    _existing_ip=$(grep -E "^\s*[0-9].*\s+${_host}\s*$" /etc/hosts 2>/dev/null | awk '{print $1}' | head -1)
+    if [[ -n "$_existing_ip" && "$_existing_ip" != "$_ip" ]]; then
+        echo "  ⚠  ${_host} already in /etc/hosts with IP ${_existing_ip}" >&3
+        if prompt_yn "  Update to ${_ip}?" "y"; then
+            sed -i "/\s${_host}\s*$/d" /etc/hosts
+        else
+            echo "  Keeping existing entry (${_existing_ip})." >&3
+            return 0
+        fi
+    fi
+
+    # Add to /etc/hosts
+    echo "${_ip}    ${_host}" >> /etc/hosts
+    echo "  ✓ Added ${_host} → ${_ip} to /etc/hosts" >&3
+
+    # Store in HOSTS_ENTRIES (avoid duplicates)
+    local _new_entry="${_host}:${_ip}"
+    if [[ -z "$HOSTS_ENTRIES" ]]; then
+        HOSTS_ENTRIES="$_new_entry"
+    elif ! echo "$HOSTS_ENTRIES" | grep -q "^${_host}:\|${_host}:"; then
+        HOSTS_ENTRIES="${HOSTS_ENTRIES}|${_new_entry}"
+    else
+        # Update existing entry
+        HOSTS_ENTRIES=$(echo "$HOSTS_ENTRIES" | sed "s|${_host}:[^|]*|${_new_entry}|")
+    fi
+
+    # Push to backup nodes
+    if [[ "${MULTI_NODE_DEPLOYMENT:-no}" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
+        # Ensure we have sudo password for remote /etc/hosts write
+        if [[ -z "${SUDO_PASS:-}" ]]; then
+            echo "" >&3
+            read -s -p "  Enter sudo password for backup nodes (to update /etc/hosts): " SUDO_PASS <&4
+            echo "" >&3
+            export SUDO_PASS
+        fi
+        for i in "${!BACKUP_NODES[@]}"; do
+            local _bip="${BACKUP_IPS[$i]}"
+            local _bn="${BACKUP_NODES[$i]}"
+            echo -n "  Pushing to ${_bn} (${_bip})... " >&3
+            local _ssh_key="-i $ACTUAL_HOME/.ssh/id_rsa"
+            [[ ! -f "$ACTUAL_HOME/.ssh/id_rsa" ]] && _ssh_key=""
+            local _hosts_cmd="grep -qE '^\s*${_ip}\s+${_host}' /etc/hosts || echo '${_ip}    ${_host}' | sudo -S tee -a /etc/hosts >/dev/null"
+            if run_remote_sudo "$_bip" "$_hosts_cmd" 2>/dev/null; then
+                echo "✓" >&3
+            else
+                echo "⚠  failed — add manually: echo '${_ip}    ${_host}' >> /etc/hosts" >&3
+            fi
+        done
+    fi
+
+    echo "" >&3
+}
+
+# ==========================================
+# Port connectivity check
+# ==========================================
+
+# Attempt TCP connection to host:port. Warns on failure but never blocks.
+# Usage: check_port_connectivity <host> <port>
+check_port_connectivity() {
+    local _host="$1"
+    local _port="$2"
+    # Ensure fd3 is open
+    { true >&3; } 2>/dev/null || exec 3>/dev/tty
+
+    echo -n "  Checking port connectivity (${_host}:${_port})... " >&3
+    if timeout 3 bash -c "cat < /dev/null > /dev/tcp/${_host}/${_port}" 2>/dev/null; then
+        echo "✓ Port ${_port} is reachable" >&3
+    else
+        echo "✗ Port ${_port} is not responding" >&3
+        echo "  ⚠  The service may not be running yet, or a firewall rule may be blocking access." >&3
+        echo "  Continuing anyway..." >&3
+    fi
+}
+
 prompt_single_entry() {
     local service_name="$1"
     local default_port="$2"
@@ -7398,6 +7932,12 @@ prompt_single_entry() {
         fi
         break
     done
+
+    # DNS resolution check — offer /etc/hosts entry if unresolvable
+    check_host_resolution "$host"
+
+    # Port connectivity check — warning only
+    check_port_connectivity "$host" "$port"
 
     echo "$protocol://$host:$port"
 
@@ -8568,12 +9108,16 @@ EOF
                   protocol="${BASH_REMATCH[1]}"
                   host="${BASH_REMATCH[2]}"
 
-              # Generate URLs for other services
+                  # DNS check once for the shared host (may already be done for app-service)
+                  check_host_resolution "$host"
+
+              # Generate URLs for other services and check port connectivity
               for service in "${services_order[@]}"; do
               [[ $service == "app-service" ]] && continue
               port="${service_ports[$service]}"
             
               new_entry="${protocol}://${host}:${port}"
+              check_port_connectivity "$host" "$port"
             
               batch_entries[$service]+=",$new_entry"
               done
@@ -9065,6 +9609,7 @@ DIAG_URL="$DIAG_URL"
 DIAG_AUTH_ADDRESS="$DIAG_AUTH_ADDRESS"
 DIAG_PASSWORD="$DIAG_PASSWORD"
 DIAG_AUTH_TOKEN="$DIAG_AUTH_TOKEN"
+HOSTS_ENTRIES="$HOSTS_ENTRIES"
 EOF
 
     # Save multi-node configuration if applicable
@@ -9127,15 +9672,16 @@ READMETXT
 
         for i in "${!BACKUP_NODES[@]}"; do
             local _bip="${BACKUP_IPS[$i]}"
+            # mkdir on remote needs sudo since /opt/indica is root:root
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                    "mkdir -p ${_backup_dest}" 2>/dev/null || true
+                echo "$SUDO_PASS" | sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
+                    "sudo -S mkdir -p ${_backup_dest}" 2>/dev/null || true
             else
                 ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                    "mkdir -p ${_backup_dest}" 2>/dev/null || true
+                    "sudo -S mkdir -p ${_backup_dest}" <<< "$SUDO_PASS" 2>/dev/null || true
             fi
-            copy_to_remote "$CONFIG_FILE"  "$_bip" "${_backup_dest}/deployment.config"    2>/dev/null || true
-            copy_to_remote "$_readme_tmp"  "$_bip" "${_backup_dest}/RECOVERY_README.txt"  2>/dev/null || true
+            copy_to_remote_root "$CONFIG_FILE"  "$_bip" "${_backup_dest}/deployment.config"
+            copy_to_remote_root "$_readme_tmp"  "$_bip" "${_backup_dest}/RECOVERY_README.txt"
         done
         rm -f "$_readme_tmp"
         log "deployment.config backup pushed to backup nodes → ${_backup_dest}"
@@ -9161,12 +9707,19 @@ fi
 # Migrate legacy clinical_traefik.env → deployment.config
 # ==========================================
 
-# Check for legacy env file in the script directory or current directory
+# Check for legacy env file in the script directory, current directory,
+# invoking user's home directory, or old install locations
 _legacy_env=""
 if [[ -f "${SCRIPT_DIR}/clinical_traefik.env" ]]; then
     _legacy_env="${SCRIPT_DIR}/clinical_traefik.env"
 elif [[ -f "${PWD}/clinical_traefik.env" ]]; then
     _legacy_env="${PWD}/clinical_traefik.env"
+elif [[ -f "${ACTUAL_HOME}/clinical_traefik.env" ]]; then
+    _legacy_env="${ACTUAL_HOME}/clinical_traefik.env"
+elif [[ -f "/home/haloap/traefik/clinical_traefik.env" ]]; then
+    _legacy_env="/home/haloap/traefik/clinical_traefik.env"
+elif [[ -f "/home/haloap/clinical_traefik.env" ]]; then
+    _legacy_env="/home/haloap/clinical_traefik.env"
 fi
 
 if [[ -n "$_legacy_env" && ! -f "$CONFIG_FILE" ]]; then
@@ -9199,6 +9752,7 @@ if [[ -n "$_legacy_env" && ! -f "$CONFIG_FILE" ]]; then
         grep -q '^DIAG_AUTH_ADDRESS=' "$CONFIG_FILE" || _add_vars+=('DIAG_AUTH_ADDRESS=""')
         grep -q '^DIAG_PASSWORD=' "$CONFIG_FILE"     || _add_vars+=('DIAG_PASSWORD=""')
         grep -q '^DIAG_AUTH_TOKEN=' "$CONFIG_FILE"   || _add_vars+=('DIAG_AUTH_TOKEN=""')
+        grep -q '^HOSTS_ENTRIES=' "$CONFIG_FILE"     || _add_vars+=('HOSTS_ENTRIES=""')
 
         for _var in "${_add_vars[@]}"; do
             echo "$_var" >> "$CONFIG_FILE"
@@ -9225,9 +9779,62 @@ fi
 # Migrate legacy /home/haloap install → /opt/indica
 # ==========================================
 
-if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
+# Case 1: Both directories exist — previous migration was incomplete
+# Salvage any missing files from /home/haloap/traefik into /opt/indica/traefik
+if [[ -d "/home/haloap/traefik" && -d "/opt/indica/traefik" ]]; then
     echo ""
-    echo ":: Legacy Installation Detected"
+    echo ":: Incomplete Migration Detected"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo "  Both /home/haloap/traefik and /opt/indica/traefik exist."
+    echo "  The previous migration was incomplete — salvaging missing files."
+    echo ""
+
+    for _f in docker-compose.yaml docker-compose.yml; do
+        if [[ ! -f "/opt/indica/traefik/docker-compose.yaml" && -f "/home/haloap/traefik/${_f}" ]]; then
+            cp "/home/haloap/traefik/${_f}" "/opt/indica/traefik/docker-compose.yaml"
+            sed -i 's|/home/haloap|/opt/indica|g' "/opt/indica/traefik/docker-compose.yaml" 2>/dev/null || true
+            echo "  ✓ Recovered ${_f} → /opt/indica/traefik/docker-compose.yaml"
+        fi
+    done
+
+    for _f in cert.crt server.key customca.crt; do
+        if [[ ! -f "/opt/indica/traefik/certs/${_f}" && -f "/home/haloap/traefik/certs/${_f}" ]]; then
+            mkdir -p /opt/indica/traefik/certs
+            cp "/home/haloap/traefik/certs/${_f}" "/opt/indica/traefik/certs/${_f}"
+            echo "  ✓ Recovered certs/${_f}"
+        fi
+    done
+
+    if [[ ! -f "/opt/indica/traefik/config/traefik.yml" && -f "/home/haloap/traefik/config/traefik.yml" ]]; then
+        mkdir -p /opt/indica/traefik/config
+        cp /home/haloap/traefik/config/traefik.yml /opt/indica/traefik/config/traefik.yml
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/config/traefik.yml 2>/dev/null || true
+        echo "  ✓ Recovered config/traefik.yml"
+    fi
+
+    if [[ -d "/home/haloap/traefik/config/dynamic" ]]; then
+        mkdir -p /opt/indica/traefik/config/dynamic
+        for _yml in /home/haloap/traefik/config/dynamic/*.yml; do
+            [[ -f "$_yml" ]] || continue
+            _dest="/opt/indica/traefik/config/dynamic/$(basename "$_yml")"
+            if [[ ! -f "$_dest" ]]; then
+                cp "$_yml" "$_dest"
+                sed -i 's|/home/haloap|/opt/indica|g' "$_dest" 2>/dev/null || true
+                echo "  ✓ Recovered config/dynamic/$(basename "$_yml")"
+            fi
+        done
+    fi
+
+    chown -R root:root /opt/indica/traefik 2>/dev/null || true
+    echo ""
+    echo "  ✓ Recovery complete. /home/haloap/traefik left in place as backup."
+    echo "    Remove manually once confirmed: sudo rm -rf /home/haloap/traefik"
+    echo ""
+fi
+
+# Case 2: Only /home/haloap/traefik exists — full migration needed
+if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
     echo "──────────────────────────────────────────────────"
     echo ""
     echo "  An existing installation was found at /home/haloap/traefik."
@@ -9255,6 +9862,30 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
             -exec sed -i 's|/home/haloap|/opt/indica|g' {} \; 2>/dev/null || true
         echo "✓"
 
+        # Handle docker-compose file variants from older installs
+        # Some versions used .yml extension or stored it in the parent directory
+        echo -n "  Checking docker-compose file... "
+        if [[ ! -f "/opt/indica/traefik/docker-compose.yaml" ]]; then
+            if [[ -f "/opt/indica/traefik/docker-compose.yml" ]]; then
+                # Rename .yml → .yaml
+                mv /opt/indica/traefik/docker-compose.yml /opt/indica/traefik/docker-compose.yaml
+                sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+                echo "✓ (renamed from docker-compose.yml)"
+            elif [[ -f "/home/haloap/docker-compose.yaml" ]]; then
+                cp /home/haloap/docker-compose.yaml /opt/indica/traefik/docker-compose.yaml
+                sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+                echo "✓ (copied from /home/haloap/)"
+            elif [[ -f "/home/haloap/docker-compose.yml" ]]; then
+                cp /home/haloap/docker-compose.yml /opt/indica/traefik/docker-compose.yaml
+                sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+                echo "✓ (copied from /home/haloap/)"
+            else
+                echo "⚠  not found — will be recreated if needed"
+            fi
+        else
+            echo "✓"
+        fi
+
         echo -n "  Setting ownership to root:root... "
         chown -R root:root /opt/indica/traefik
         chmod -R 755 /opt/indica/traefik
@@ -9263,6 +9894,147 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
 
         # Update CONFIG_FILE
         CONFIG_FILE="/opt/indica/traefik/deployment.config"
+
+        # If deployment.config missing but clinical_traefik.env exists, migrate it
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            _legacy_env_old=""
+            if [[ -f "/opt/indica/traefik/clinical_traefik.env" ]]; then
+                _legacy_env_old="/opt/indica/traefik/clinical_traefik.env"
+            elif [[ -f "/home/haloap/clinical_traefik.env" ]]; then
+                _legacy_env_old="/home/haloap/clinical_traefik.env"
+            fi
+
+            if [[ -n "$_legacy_env_old" ]]; then
+                echo -n "  Migrating clinical_traefik.env → deployment.config... "
+                cp "$_legacy_env_old" "$CONFIG_FILE"
+                sed -i 's|/home/haloap|/opt/indica|g' "$CONFIG_FILE"
+                echo "✓"
+            else
+                _recovery_file="/opt/indica/traefik/RECOVERY_INFO.txt"
+                _traefik_dir="/opt/indica/traefik"
+
+                echo ""
+                echo "  Generating recovery information..."
+                echo ""
+
+                {
+                    echo "═══════════════════════════════════════════════════════════════"
+                    echo "  RECOVERY INFORMATION"
+                    echo "  Generated : $(date +'%Y-%m-%d %H:%M:%S')"
+                    echo "  Source    : ${_traefik_dir} (migrated from /home/haloap/traefik)"
+                    echo "═══════════════════════════════════════════════════════════════"
+                    echo ""
+
+                    # ── SSL Certificate ──
+                    echo "── SSL Certificate ─────────────────────────────────────────────"
+                    if [[ -f "${_traefik_dir}/certs/cert.crt" ]]; then
+                        _subj _expiry _issuer
+                        _subj=$(openssl x509 -noout -subject -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | sed 's/subject=//')
+                        _expiry=$(openssl x509 -noout -enddate -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | cut -d= -f2)
+                        _issuer=$(openssl x509 -noout -issuer -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | sed 's/issuer=//')
+                        echo "  Subject  : ${_subj}"
+                        echo "  Expires  : ${_expiry}"
+                        echo "  Issuer   : ${_issuer}"
+                        echo ""
+                        echo "  Certificate (PEM):"
+                        cat "${_traefik_dir}/certs/cert.crt"
+                        echo ""
+                        echo "  Private Key (PEM):"
+                        cat "${_traefik_dir}/certs/server.key" 2>/dev/null || echo "  (server.key not readable)"
+                        echo ""
+                        if [[ -f "${_traefik_dir}/certs/customca.crt" ]]; then
+                            echo "  Custom CA Certificate (PEM):"
+                            cat "${_traefik_dir}/certs/customca.crt"
+                            echo ""
+                        fi
+                    else
+                        echo "  Certificate file not found."
+                        echo ""
+                    fi
+
+                    # ── Component Servers ──
+                    echo "── Component Servers ───────────────────────────────────────────"
+                    _clinical_conf="${_traefik_dir}/config/dynamic/clinical_conf.yml"
+                    if [[ -f "$_clinical_conf" ]]; then
+                        grep -E "url:|address:" "$_clinical_conf" 2>/dev/null \
+                            | sed 's/^[[:space:]]*/  /' \
+                            | sed 's/- url:/  URL    :/' \
+                            | sed 's/address:/  Address:/' \
+                            || echo "  (could not parse clinical_conf.yml)"
+                    else
+                        echo "  clinical_conf.yml not found."
+                    fi
+                    echo ""
+
+                    # ── HL7 Ports ──
+                    echo "── HL7 Configuration ───────────────────────────────────────────"
+                    _traefik_yml="${_traefik_dir}/config/traefik.yml"
+                    if [[ -f "$_traefik_yml" ]]; then
+                        _hl7_ports
+                        _hl7_ports=$(grep -E "^  hl7" "$_traefik_yml" 2>/dev/null | sed 's/://' | sed 's/^  /  Port: /')
+                        if [[ -n "$_hl7_ports" ]]; then
+                            echo "$_hl7_ports"
+                        else
+                            echo "  No HL7 entrypoints found."
+                        fi
+                    else
+                        echo "  traefik.yml not found."
+                    fi
+                    echo ""
+
+                    # ── Keepalived ──
+                    echo "── Keepalived / Virtual IP ─────────────────────────────────────"
+                    if [[ -f "/etc/keepalived/keepalived.conf" ]]; then
+                        _vip _vrid _iface _priority
+                        _vip=$(grep -oP '(?<=virtual_ipaddress \{)[^}]*' /etc/keepalived/keepalived.conf 2>/dev/null | tr -d ' \n' || \
+                               grep "virtual_ipaddress" -A2 /etc/keepalived/keepalived.conf 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+                        _vrid=$(grep -oP '(?<=virtual_router_id )\d+' /etc/keepalived/keepalived.conf 2>/dev/null)
+                        _iface=$(grep -oP '(?<=interface )\S+' /etc/keepalived/keepalived.conf 2>/dev/null | head -1)
+                        _priority=$(grep -oP '(?<=priority )\d+' /etc/keepalived/keepalived.conf 2>/dev/null | head -1)
+                        echo "  Virtual IP  : ${_vip:-not found}"
+                        echo "  VRID        : ${_vrid:-not found}"
+                        echo "  Interface   : ${_iface:-not found}"
+                        echo "  Priority    : ${_priority:-not found}"
+                    else
+                        echo "  /etc/keepalived/keepalived.conf not found."
+                        echo "  (Single-node deployment or Keepalived not installed)"
+                    fi
+                    echo ""
+
+                    # ── Docker image ──
+                    echo "── Traefik Docker Image ────────────────────────────────────────"
+                    if [[ -f "${_traefik_dir}/docker-compose.yaml" ]]; then
+                        _image
+                        _image=$(grep -oP '(?<=image: ).*' "${_traefik_dir}/docker-compose.yaml" 2>/dev/null | head -1)
+                        echo "  Image       : ${_image:-not found}"
+                    fi
+                    echo ""
+
+                    echo "═══════════════════════════════════════════════════════════════"
+                    echo "  Use the above values when re-running this script."
+                    echo "  Recovery file saved to: ${_recovery_file}"
+                    echo "═══════════════════════════════════════════════════════════════"
+
+                } | tee "$_recovery_file"
+
+                chmod 600 "$_recovery_file"
+
+                echo ""
+                echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                echo "  !! WARNING — No configuration file found                 !!"
+                echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                echo ""
+                echo "  Recovery information has been saved to:"
+                echo "    ${_recovery_file}"
+                echo ""
+                echo "  Re-run this script to perform a fresh install using the"
+                echo "  values above. Your existing files are intact."
+                echo ""
+
+                audit_log "MIGRATION" "Migrated /home/haloap/traefik → /opt/indica/traefik — no config found, recovery info saved to ${_recovery_file}"
+                exit 0
+            fi
+        fi
 
         # Migrate backup nodes if multi-node
         if [[ -f "$CONFIG_FILE" ]]; then
@@ -9304,6 +10076,20 @@ sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/config/traefik.yml 2>/
 sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
 find /opt/indica/traefik/config/dynamic -name "*.yml" \
     -exec sed -i 's|/home/haloap|/opt/indica|g' {} \; 2>/dev/null || true
+
+# Handle docker-compose file variants from older installs
+if [[ ! -f "/opt/indica/traefik/docker-compose.yaml" ]]; then
+    if [[ -f "/opt/indica/traefik/docker-compose.yml" ]]; then
+        mv /opt/indica/traefik/docker-compose.yml /opt/indica/traefik/docker-compose.yaml
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+    elif [[ -f "/home/haloap/docker-compose.yaml" ]]; then
+        cp /home/haloap/docker-compose.yaml /opt/indica/traefik/docker-compose.yaml
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+    elif [[ -f "/home/haloap/docker-compose.yml" ]]; then
+        cp /home/haloap/docker-compose.yml /opt/indica/traefik/docker-compose.yaml
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
+    fi
+fi
 chown -R root:root /opt/indica/traefik
 chmod -R 755 /opt/indica/traefik
 chmod 600 /opt/indica/traefik/certs/server.key 2>/dev/null || true
@@ -9570,7 +10356,18 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     
     echo "Master Node Configuration ($MASTER_HOSTNAME - $MASTER_IP):"
     echo ""
-    
+
+    # On reinstall, show current interface and offer to keep it
+    if [[ -n "$NETWORK_INTERFACE" ]]; then
+        echo "  Current interface: $NETWORK_INTERFACE"
+        if prompt_yn "  Keep existing interface ($NETWORK_INTERFACE)?" "y"; then
+            echo "  ✓ Master interface: $NETWORK_INTERFACE"
+        else
+            NETWORK_INTERFACE=""
+        fi
+    fi
+
+    if [[ -z "$NETWORK_INTERFACE" ]]; then
     # Attempt auto-detection for master
     echo "Attempting to detect network interface..."
     master_detected_interface=$(ip -o addr show | grep "inet $MASTER_IP" | awk '{print $2}' | head -1)
@@ -9651,8 +10448,10 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         done
     fi
     
+    fi  # end if [[ -z "$NETWORK_INTERFACE" ]]
+
     echo ""
-    
+
     # ==========================================
     # Configure Backup Node Interfaces
     # ==========================================
@@ -9664,9 +10463,19 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         for i in "${!BACKUP_NODES[@]}"; do
             node="${BACKUP_NODES[$i]}"
             ip="${BACKUP_IPS[$i]}"
-            
+            _existing_iface="${BACKUP_INTERFACES[$i]:-}"
+
             echo "  Configuring $node ($ip):"
-            
+
+            # On reinstall, show current interface and offer to keep it
+            if [[ -n "$_existing_iface" ]]; then
+                echo "    Current interface: ${_existing_iface}"
+                if prompt_yn "    Keep existing interface (${_existing_iface})?" "y"; then
+                    echo "    ✓ Interface: ${_existing_iface}"
+                    continue
+                fi
+            fi
+
             # Attempt auto-detection
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
                 detected_interface=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
@@ -9850,6 +10659,7 @@ log "Detected package manager: $PKG_MANAGER"
 ### START Repository Connectivity Check
 
 check_repository_connectivity
+REPO_CONNECTIVITY_OK=$( [ $? -eq 0 ] && echo true || echo false )
 
 ### END Repository Connectivity Check
 ######################################################
@@ -10776,12 +11586,24 @@ _traefik_image_local=false
 if docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "traefik"; then
     _existing_image=$(docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep traefik | head -1)
     log "Found existing local Traefik image: ${_existing_image}"
-    echo ""
-    echo "  Found existing local Traefik image: ${_existing_image}"
-    if prompt_yn "  Use existing local image instead of pulling?" "y"; then
-        sed -i "s|image:.*|image: ${_existing_image}|" "$DOCKER_COMPOSE_FILE"
-        _traefik_image_local=true
-        log "Using local image: ${_existing_image}"
+
+    if [[ "$REPO_CONNECTIVITY_OK" == false || "$DOCKER_AUTH_BLOCKED" == true ]]; then
+        # Restricted network or auth blocked — offer local image as it may be the only option
+        echo ""
+        echo "  Found existing local Traefik image: ${_existing_image}"
+        if [[ "$DOCKER_AUTH_BLOCKED" == true ]]; then
+            echo "  ⚠️  Docker auth (auth.docker.io) is blocked — image pulls will fail."
+        else
+            echo "  ⚠️  Repository connectivity checks failed — internet access may be restricted."
+        fi
+        if prompt_yn "  Use existing local image instead of pulling?" "y"; then
+            sed -i "s|image:.*|image: ${_existing_image}|" "$DOCKER_COMPOSE_FILE"
+            _traefik_image_local=true
+            log "Using local image: ${_existing_image}"
+        fi
+    else
+        # Full connectivity — always pull latest, ignore local cache
+        log "Repository connectivity OK — will pull latest image from Docker Hub"
     fi
 fi
 
