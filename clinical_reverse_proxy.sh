@@ -3,17 +3,66 @@
 # Enhanced Clinical Traefik Reverse Proxy Setup
 #
 # USAGE:
-#   sudo ./clinicalrp.sh                         # Normal installation
-#   sudo ./clinicalrp.sh --clean                 # Remove Traefik/Keepalived/Docker
-#   sudo ./clinicalrp.sh --status                # Quick health check of current deployment
+#   sudo ./clinicalrp.sh                          # Interactive menu (install or generate bundle)
+#   sudo ./clinicalrp.sh --clean                  # Remove Traefik/Keepalived/Docker
+#   sudo ./clinicalrp.sh --status                 # Quick health check of current deployment
+#
+# OFFLINE MODE:
+#   sudo ./clinicalrp.sh --prepare-offline        # Skip menu, build bundle directly
+#   sudo ./clinicalrp.sh --offline                # Force offline install from bundle (auto-detected)
+#   sudo ./clinicalrp.sh --online                 # Force online install (ignore any local bundle)
+#   sudo ./clinicalrp.sh --package-source=PATH    # Use specific bundle path (file or directory)
+#   sudo ./clinicalrp.sh --archive-format=zip     # Use zip instead of tar.gz when preparing
+#   sudo ./clinicalrp.sh --force-os-mismatch      # Skip the bundle/target OS compatibility check
+#
+# When invoked with no flags, an interactive menu offers:
+#   [1] Install Reverse Proxy             (deploy on this machine, online or offline)
+#   [2] Generate Offline Install Bundle   (download packages + Traefik image)
+#   [3] Cancel
 #
 # NOTE: Must be run with sudo from your own user account — never log in as root directly.
 #       Running as sudo ensures /opt/indica is owned by root:root and SSH keys are
 #       resolved correctly from the invoking user's home directory.
+#
+#       --prepare-offline (or option [2] from the menu) is intended to run on a
+#       separate internet-connected machine of the same OS family/codename as the
+#       target. It does not configure SSH, Keepalived or Traefik; it only downloads
+#       packages and saves the Traefik image into a transferrable archive. The
+#       resulting archive is auto-detected on the target (~/, /opt, /tmp).
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 set -e
+
+# ==========================================
+# Root check (fail-loud, not silent)
+# ==========================================
+# The script needs root to write to /etc/apt, /etc/yum.repos.d, /opt/indica,
+# /var/log, and to run apt-get/dnf. Without sudo every system call fails and,
+# with `set -e`, the script silently aborts on the first one. We catch that
+# up front with a clear message instead.
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    cat >&2 <<'ROOTERR'
+
+❌ This script must be run with sudo.
+
+   Re-run as:
+     sudo ./clinical_reverse_proxy.sh [flags]
+
+   Examples:
+     sudo ./clinical_reverse_proxy.sh                  # Normal install
+     sudo ./clinical_reverse_proxy.sh --prepare-offline
+     sudo ./clinical_reverse_proxy.sh --offline
+     sudo ./clinical_reverse_proxy.sh --status
+     sudo ./clinical_reverse_proxy.sh --clean
+
+   Don't log in as root directly — use sudo from your own user account so
+   SSH keys and ownership of /opt/indica are resolved correctly.
+
+ROOTERR
+    exit 1
+fi
 
 # ==========================================
 # Standardised y/n prompt helper
@@ -99,6 +148,63 @@ CUSTOM_CA_CERT_CONTENT=""
 # Component server /etc/hosts entries (pipe-separated hostname:ip pairs)
 # e.g. "HNUKAP24COM01:10.0.40.200|HNUKAP24APL01:10.0.40.201"
 HOSTS_ENTRIES=""
+
+# ==========================================
+# OFFLINE INSTALLATION CONFIGURATION
+# ==========================================
+# Set via command-line flags; documented in the header USAGE block.
+# All values may also be overridden by environment variables.
+
+# Path to the offline bundle (file or directory).
+#   "auto"   = scan $ACTUAL_HOME, /opt, /tmp for traefik-rp-packages-*.tar.gz / .zip
+#   /path    = use this archive or directory directly
+OFFLINE_PACKAGE_SOURCE="${OFFLINE_PACKAGE_SOURCE:-auto}"
+
+# Where to extract archives (cleaned up via trap).
+OFFLINE_EXTRACT_DIR="${OFFLINE_EXTRACT_DIR:-/tmp/traefik_rp_offline_$$}"
+
+# Installation mode: auto (default), online, offline.
+OFFLINE_MODE="${OFFLINE_MODE:-auto}"
+
+# Archive format for --prepare-offline: tar.gz (default) or zip.
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-tar.gz}"
+
+# When the bundle was built on a different OS codename than the target, hard-fail
+# unless this is set to "yes" (via --force-os-mismatch).
+FORCE_OS_MISMATCH="${FORCE_OS_MISMATCH:-no}"
+
+# ==========================================
+# OFFLINE MODE ARGUMENT PARSING
+# ==========================================
+# Parse offline-related flags up front. We do NOT shift positional args so that
+# the existing $1 checks for --clean / --status / --extend continue to work.
+
+PREPARE_OFFLINE=false
+SKIP_MAIN_EXECUTION=false
+
+for arg in "$@"; do
+    case $arg in
+        --offline)
+            OFFLINE_MODE="offline"
+            ;;
+        --online)
+            OFFLINE_MODE="online"
+            ;;
+        --prepare-offline)
+            PREPARE_OFFLINE=true
+            SKIP_MAIN_EXECUTION=true
+            ;;
+        --package-source=*)
+            OFFLINE_PACKAGE_SOURCE="${arg#*=}"
+            ;;
+        --archive-format=*)
+            ARCHIVE_FORMAT="${arg#*=}"
+            ;;
+        --force-os-mismatch)
+            FORCE_OS_MISMATCH="yes"
+            ;;
+    esac
+done
 
 # Logging setup
 LOGFILE="/var/log/installation.log"
@@ -817,6 +923,963 @@ audit_log() {
 }
 
 
+# ==========================================
+# OFFLINE INSTALLATION HELPERS
+# ==========================================
+# Lightweight helpers used by --prepare-offline and the offline install path.
+# They mirror the patterns in mysql_master_slave_deb_setup.sh so the two
+# scripts behave identically when handling bundle archives.
+
+# Detect OS family + package extension. validate_os already populates OS_ID
+# and OS_VERSION (digits only); this expands them into OS_FAMILY/PACKAGE_EXT/
+# OS_CODENAME so the offline functions can build distro-aware bundle names.
+detect_os_type() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_TYPE="${ID:-unknown}"
+        OS_VERSION_FULL="${VERSION_ID:-unknown}"
+        OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        OS_PRETTY="${PRETTY_NAME:-$OS_TYPE}"
+
+        case "$OS_TYPE" in
+            ubuntu|debian)
+                OS_FAMILY="debian"
+                PACKAGE_EXT="deb"
+                ;;
+            rhel|centos|rocky|almalinux|ol)
+                OS_FAMILY="rhel"
+                PACKAGE_EXT="rpm"
+                # RHEL family doesn't expose a codename — use the major version.
+                if [ -z "$OS_CODENAME" ]; then
+                    OS_CODENAME="${OS_VERSION_FULL%%.*}"
+                fi
+                ;;
+            *)
+                OS_FAMILY="unknown"
+                PACKAGE_EXT="unknown"
+                ;;
+        esac
+    else
+        OS_FAMILY="unknown"
+        PACKAGE_EXT="unknown"
+    fi
+    # `: "${VAR:=default}"` is set-e safe — `:` is a no-op that always returns 0.
+    : "${OS_CODENAME:=linux}"
+    return 0
+}
+
+# Boolean: is this path an archive we know how to extract?
+is_archive_file() {
+    local file="$1"
+    [ -f "$file" ] && [[ "$file" =~ \.(tar\.gz|tgz|zip)$ ]]
+}
+
+# Extract an archive into a destination directory.
+extract_archive_file() {
+    local archive="$1"
+    local dest_dir="$2"
+
+    echo "Extracting archive: $(basename "$archive")"
+    mkdir -p "$dest_dir"
+
+    case "$archive" in
+        *.tar.gz|*.tgz)
+            tar -xzf "$archive" -C "$dest_dir" 2>/dev/null || return 1
+            ;;
+        *.zip)
+            command -v unzip >/dev/null 2>&1 || {
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq unzip 2>/dev/null || return 1
+                elif command -v dnf >/dev/null 2>&1; then
+                    dnf -y --setopt=skip_if_unavailable=True install unzip 2>/dev/null || return 1
+                fi
+            }
+            unzip -q "$archive" -d "$dest_dir" 2>/dev/null || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    echo "✓ Archive extracted successfully"
+    return 0
+}
+
+# Find the directory inside an extracted archive that actually contains the
+# .deb / .rpm files. The archive may have a wrapping directory or a "packages"
+# subdirectory — both are accepted.
+find_package_dir() {
+    local base_dir="$1"
+
+    # Direct match
+    if ls "$base_dir"/*."${PACKAGE_EXT:-deb}" >/dev/null 2>&1; then
+        echo "$base_dir"
+        return 0
+    fi
+
+    # Standard layout: <wrapper>/packages/*.deb
+    if [ -d "$base_dir/packages" ] && \
+       ls "$base_dir/packages"/*."${PACKAGE_EXT:-deb}" >/dev/null 2>&1; then
+        echo "$base_dir/packages"
+        return 0
+    fi
+
+    # Wrapper directory contains packages/
+    local wrapper
+    wrapper=$(find "$base_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [ -n "$wrapper" ]; then
+        if ls "$wrapper/packages"/*."${PACKAGE_EXT:-deb}" >/dev/null 2>&1; then
+            echo "$wrapper/packages"
+            return 0
+        fi
+        if ls "$wrapper"/*."${PACKAGE_EXT:-deb}" >/dev/null 2>&1; then
+            echo "$wrapper"
+            return 0
+        fi
+    fi
+
+    # Last resort: deep search
+    local pkg_dir
+    pkg_dir=$(find "$base_dir" -type f -name "*.${PACKAGE_EXT:-deb}" 2>/dev/null | head -1 | xargs -r dirname 2>/dev/null)
+    if [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then
+        echo "$pkg_dir"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find the wrapper directory of an extracted bundle (the one that holds
+# manifest.txt + packages/ + images/). Falls back to the package dir's parent.
+find_bundle_root() {
+    local base_dir="$1"
+
+    if [ -f "$base_dir/manifest.txt" ]; then
+        echo "$base_dir"
+        return 0
+    fi
+
+    local wrapper
+    wrapper=$(find "$base_dir" -mindepth 1 -maxdepth 2 -name manifest.txt -type f 2>/dev/null | head -1)
+    if [ -n "$wrapper" ]; then
+        dirname "$wrapper"
+        return 0
+    fi
+
+    # No manifest — fall back to the package dir's parent so callers can still
+    # locate images/ if it happens to live alongside packages/.
+    local pkg_dir=""
+    pkg_dir=$(find_package_dir "$base_dir" 2>/dev/null) || true
+    if [ -n "$pkg_dir" ]; then
+        dirname "$pkg_dir"
+    fi
+    return 0
+}
+
+# Search common locations for a bundle archive and update OFFLINE_PACKAGE_SOURCE
+# in place. Returns 0 if found, 1 otherwise. Quiet on failure so callers can
+# decide what to do (auto mode falls through to online).
+auto_detect_offline_package() {
+    if [ "$OFFLINE_PACKAGE_SOURCE" = "auto" ]; then
+        local found_archive=""
+        for location in "$ACTUAL_HOME" "/opt" "/tmp"; do
+            [ -d "$location" ] || continue
+            found_archive=$(find "$location" -maxdepth 1 \
+                \( -name "traefik-rp-packages-*.tar.gz" -o -name "traefik-rp-packages-*.zip" \) \
+                2>/dev/null | sort -r | head -1)
+            if [ -n "$found_archive" ]; then
+                OFFLINE_PACKAGE_SOURCE="$found_archive"
+                return 0
+            fi
+        done
+        return 1
+    fi
+    return 0
+}
+
+# Resolve OFFLINE_PACKAGE_SOURCE to a directory containing .deb/.rpm files.
+# Extracts the archive into OFFLINE_EXTRACT_DIR if needed. Echoes the path on
+# success; non-zero exit on failure.
+get_offline_pkg_directory() {
+    local source="$OFFLINE_PACKAGE_SOURCE"
+
+    detect_os_type 2>/dev/null || true
+
+    # Already a directory?
+    if [ -d "$source" ]; then
+        local pkg_dir
+        pkg_dir=$(find_package_dir "$source")
+        if [ -n "$pkg_dir" ]; then
+            echo "$pkg_dir"
+            return 0
+        fi
+        return 1
+    fi
+
+    # Archive?
+    if is_archive_file "$source"; then
+        # Already extracted in this session?
+        if [ -d "$OFFLINE_EXTRACT_DIR" ]; then
+            local existing
+            existing=$(find_package_dir "$OFFLINE_EXTRACT_DIR" 2>/dev/null)
+            if [ -n "$existing" ]; then
+                echo "$existing"
+                return 0
+            fi
+        fi
+        extract_archive_file "$source" "$OFFLINE_EXTRACT_DIR" || return 1
+        local pkg_dir
+        pkg_dir=$(find_package_dir "$OFFLINE_EXTRACT_DIR")
+        if [ -n "$pkg_dir" ]; then
+            echo "$pkg_dir"
+            return 0
+        fi
+        return 1
+    fi
+
+    # Try implicit extensions
+    if [ -f "${source}.tar.gz" ]; then
+        OFFLINE_PACKAGE_SOURCE="${source}.tar.gz"
+        get_offline_pkg_directory
+        return $?
+    elif [ -f "${source}.zip" ]; then
+        OFFLINE_PACKAGE_SOURCE="${source}.zip"
+        get_offline_pkg_directory
+        return $?
+    fi
+
+    return 1
+}
+
+# Boolean: are offline packages actually available right now?
+check_offline_pkgs_available() {
+    if [ "$OFFLINE_PACKAGE_SOURCE" = "auto" ]; then
+        auto_detect_offline_package || return 1
+    fi
+    [ -e "$OFFLINE_PACKAGE_SOURCE" ] || return 1
+    local pkg_dir
+    pkg_dir=$(get_offline_pkg_directory 2>/dev/null)
+    [ $? -eq 0 ] && [ -n "$pkg_dir" ]
+}
+
+# Clean up extraction directory. Safe to call multiple times.
+cleanup_offline_temp() {
+    if [ -n "${OFFLINE_EXTRACT_DIR:-}" ] && \
+       [ -d "$OFFLINE_EXTRACT_DIR" ] && \
+       [[ "$OFFLINE_EXTRACT_DIR" == /tmp/* ]]; then
+        rm -rf "$OFFLINE_EXTRACT_DIR" 2>/dev/null || true
+    fi
+}
+
+# Read manifest.txt and verify the bundle's OS_CODENAME matches the target.
+# Hard-fails unless FORCE_OS_MISMATCH=yes. Echoes a single line: the bundle's
+# pinned Traefik image reference (or empty if not recorded).
+verify_bundle_compatibility() {
+    local bundle_root="$1"
+    local manifest="$bundle_root/manifest.txt"
+
+    if [ ! -f "$manifest" ]; then
+        echo "⚠️  Bundle has no manifest.txt — compatibility cannot be verified" >&2
+        if [ "$FORCE_OS_MISMATCH" != "yes" ]; then
+            echo "    Re-run with --force-os-mismatch to proceed anyway" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    detect_os_type 2>/dev/null || true
+
+    local b_family b_codename b_arch b_image
+    b_family=$(grep -E '^OS_FAMILY=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    b_codename=$(grep -E '^OS_CODENAME=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    b_arch=$(grep -E '^ARCH=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    b_image=$(grep -E '^TRAEFIK_IMAGE=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+
+    local target_arch
+    target_arch=$(uname -m)
+
+    local mismatch=""
+    [ -n "$b_family"   ] && [ "$b_family"   != "$OS_FAMILY"   ] && mismatch="${mismatch}  family:    bundle=${b_family}, target=${OS_FAMILY}\n"
+    [ -n "$b_codename" ] && [ "$b_codename" != "$OS_CODENAME" ] && mismatch="${mismatch}  codename:  bundle=${b_codename}, target=${OS_CODENAME}\n"
+    [ -n "$b_arch"     ] && [ "$b_arch"     != "$target_arch" ] && mismatch="${mismatch}  arch:      bundle=${b_arch}, target=${target_arch}\n"
+
+    if [ -n "$mismatch" ]; then
+        echo "" >&2
+        echo "❌ Bundle / target OS mismatch:" >&2
+        printf "$mismatch" >&2
+        if [ "$FORCE_OS_MISMATCH" != "yes" ]; then
+            echo "" >&2
+            echo "    The bundle was built for a different OS. .deb/.rpm files may not install." >&2
+            echo "    Re-run with --force-os-mismatch to proceed at your own risk." >&2
+            return 1
+        fi
+        echo "    Continuing anyway because --force-os-mismatch is set." >&2
+    fi
+
+    echo "$b_image"
+    return 0
+}
+
+# Decide and announce which mode the install will run in.
+# Returns: 0 = offline, 1 = online (so callers can branch on the exit status).
+determine_install_mode() {
+    case "$OFFLINE_MODE" in
+        offline)
+            if ! check_offline_pkgs_available; then
+                echo "❌ ERROR: --offline requested but no bundle was found." >&2
+                echo "   Searched: $ACTUAL_HOME, /opt, /tmp" >&2
+                echo "   Run --prepare-offline first, or pass --package-source=PATH." >&2
+                exit 1
+            fi
+            echo "Mode: OFFLINE  →  bundle: $OFFLINE_PACKAGE_SOURCE"
+            return 0
+            ;;
+        online)
+            echo "Mode: ONLINE (forced via --online)"
+            return 1
+            ;;
+        auto|*)
+            if check_offline_pkgs_available; then
+                echo "Mode: AUTO  →  OFFLINE  (bundle detected: $OFFLINE_PACKAGE_SOURCE)"
+                return 0
+            fi
+            echo "Mode: AUTO  →  ONLINE  (no bundle found)"
+            return 1
+            ;;
+    esac
+}
+
+# Always clean up extracted bundles on exit.
+trap cleanup_offline_temp EXIT INT TERM
+
+
+# ==========================================
+# OFFLINE PACKAGE PREPARATION
+# ==========================================
+# Build a self-contained bundle on a machine WITH internet that can later be
+# transferred to an air-gapped target. Bundle layout:
+#
+#   traefik-rp-packages-<codename>-<arch>-<date>/
+#   ├── manifest.txt         # OS family/codename/arch/date + Traefik image info
+#   ├── packages/            # all .deb or .rpm files
+#   │   └── *.deb|*.rpm
+#   ├── images/
+#   │   └── traefik.tar.gz   # docker save | gzip
+#   └── repo/                # docker.gpg (deb) or docker-ce.repo (rhel)
+#
+# Always pulls docker.io/library/traefik:latest fresh (per project convention)
+# and records the resolved digest in the manifest so the offline install can
+# verify it loaded the same image.
+
+prepare_offline_packages() {
+    echo ""
+    echo ""
+    echo ""
+    echo ":: Preparing Offline Bundle"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo ""
+
+    # Detect OS + package manager up front (the main flow does this much later).
+    detect_os_type
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    else
+        echo "❌ ERROR: only apt and dnf are supported for --prepare-offline."
+        exit 1
+    fi
+
+    if [ "$OS_FAMILY" = "unknown" ]; then
+        echo "❌ ERROR: unsupported OS family for --prepare-offline."
+        exit 1
+    fi
+
+    local target_arch
+    target_arch=$(uname -m)
+
+    echo "OS:             $OS_PRETTY"
+    echo "OS family:      $OS_FAMILY"
+    echo "OS codename:    $OS_CODENAME"
+    echo "Architecture:   $target_arch"
+    echo "Package mgr:    $PKG_MANAGER"
+    echo "Archive format: $ARCHIVE_FORMAT"
+    echo ""
+
+    # Working directory layout matches what the install side expects.
+    local work_dir="/tmp/traefik_rp_offline_prep_$$"
+    local archive_basename="traefik-rp-packages-${OS_CODENAME}-${target_arch}-$(date +%Y%m%d)"
+    local bundle_dir="${work_dir}/${archive_basename}"
+    local pkg_dir="${bundle_dir}/packages"
+    local img_dir="${bundle_dir}/images"
+    local repo_dir="${bundle_dir}/repo"
+
+    rm -rf "$work_dir"
+    mkdir -p "$pkg_dir" "$img_dir" "$repo_dir"
+
+    # ----------------------------------------------------------------------
+    # Step 1/5: Bootstrap the prep machine. This makes --prepare-offline
+    # work on a freshly-installed VM with nothing but the OS:
+    #   - install apt-transport-https / software-properties-common (Debian)
+    #     or dnf-plugins-core (RHEL) so we can add the Docker repo and use
+    #     `dnf download --resolve` later.
+    #   - configure the Docker repo + GPG key.
+    #   - install Docker (CE) on the prep machine if it isn't already, so
+    #     `docker pull` and `docker save` work in step 3.
+    #   - start and enable the Docker daemon.
+    # All of this is idempotent — re-running on a machine that already has
+    # everything is a no-op.
+    # ----------------------------------------------------------------------
+    echo "Step 1/5: Bootstrapping prep machine..."
+
+    # Install our own minimum prereqs first. The script-level early prereqs
+    # check is sometimes skipped (e.g. when a stale bundle archive exists in
+    # the user's home from a previous run, the auto-detect code skips the
+    # online prereqs install on the assumption this is an offline target).
+    # So this step belt-and-braces: install what we need to add the Docker
+    # repo and call gpg/curl, even if the early check ran or didn't.
+    if [ "$OS_FAMILY" = "debian" ]; then
+        local _prep_missing=""
+        for _pkg in lsb-release ca-certificates gnupg curl wget; do
+            dpkg -l "$_pkg" 2>/dev/null | grep -q "^ii" || _prep_missing="$_prep_missing $_pkg"
+        done
+        if [ -n "$_prep_missing" ]; then
+            echo "  Installing prep prerequisites:$_prep_missing"
+            apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} update -qq || true
+            apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} install -y -qq $_prep_missing \
+                || { echo "❌ Failed to install:$_prep_missing"; exit 1; }
+        fi
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        local _prep_missing=""
+        for _pkg in ca-certificates curl wget gnupg2; do
+            rpm -q "$_pkg" &>/dev/null || _prep_missing="$_prep_missing $_pkg"
+        done
+        if [ -n "$_prep_missing" ]; then
+            echo "  Installing prep prerequisites:$_prep_missing"
+            dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} -y install $_prep_missing \
+                || { echo "❌ Failed to install:$_prep_missing"; exit 1; }
+        fi
+    fi
+
+    if [ "$OS_FAMILY" = "debian" ]; then
+        # Note: we deliberately do NOT install apt-transport-https or
+        # software-properties-common here — they aren't actually used by the
+        # rest of the script and on minimal Debian installs (e.g. netinst
+        # without a full mirror) software-properties-common may not even be
+        # available. lsb-release/ca-certificates/gnupg/curl/wget were
+        # installed by the prep prerequisites block above.
+
+        # Add Docker repo + GPG key (idempotent).
+        install -m 0755 -d /etc/apt/keyrings
+        if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
+            echo "  Adding Docker GPG key..."
+            curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -fsSL \
+                "https://download.docker.com/linux/${OS_TYPE}/gpg" \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+                || { echo "❌ Failed to download Docker GPG key"; exit 1; }
+            chmod a+r /etc/apt/keyrings/docker.gpg
+        fi
+        cp /etc/apt/keyrings/docker.gpg "$repo_dir/docker.gpg"
+
+        if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+            echo "  Adding Docker apt source..."
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_TYPE} ${OS_CODENAME} stable" \
+                > /etc/apt/sources.list.d/docker.list
+        fi
+        apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} update \
+            || { echo "❌ Failed to refresh apt indexes"; exit 1; }
+
+        # Install Docker on the prep machine if not already installed (needed
+        # for `docker pull` + `docker save` in step 3).
+        if ! command -v docker >/dev/null 2>&1; then
+            echo "  Docker not found on prep machine — installing..."
+            apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} install -y \
+                docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
+                || { echo "❌ Failed to install Docker on prep machine"; exit 1; }
+        fi
+
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        # dnf-plugins-core provides `dnf download --resolve` which we use in
+        # step 2 to pull dependency-resolved RPMs into the bundle.
+        if ! rpm -q dnf-plugins-core &>/dev/null; then
+            echo "  Installing dnf-plugins-core..."
+            dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} -y install dnf-plugins-core \
+                || { echo "❌ Failed to install dnf-plugins-core"; exit 1; }
+        fi
+
+        # Add Docker repo (idempotent).
+        if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
+            echo "  Adding Docker repo..."
+            curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -fsSL \
+                "https://download.docker.com/linux/centos/docker-ce.repo" \
+                -o /etc/yum.repos.d/docker-ce.repo \
+                || { echo "❌ Failed to download docker-ce.repo"; exit 1; }
+        fi
+        cp /etc/yum.repos.d/docker-ce.repo "$repo_dir/docker-ce.repo"
+        dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True clean all >/dev/null 2>&1 || true
+
+        # Install Docker on the prep machine if not already installed.
+        if ! command -v docker >/dev/null 2>&1; then
+            echo "  Docker not found on prep machine — installing..."
+            # container-selinux is a hard dep of docker-ce on RHEL family.
+            if ! rpm -q container-selinux &>/dev/null; then
+                dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
+                    -y install container-selinux 2>/dev/null \
+                    || dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
+                        -y install container-selinux --nobest 2>/dev/null || true
+            fi
+            dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
+                -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
+                || { echo "❌ Failed to install Docker on prep machine"; exit 1; }
+        fi
+    fi
+
+    # Make sure the Docker daemon is running so we can pull/save the image.
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start  docker >/dev/null 2>&1 || true
+    sleep 2
+
+    if ! docker info >/dev/null 2>&1; then
+        echo ""
+        echo "❌ Docker daemon failed to start on the prep machine."
+        echo "   Investigate with:"
+        echo "     systemctl status docker"
+        echo "     journalctl -u docker -n 50"
+        exit 1
+    fi
+
+    echo "✓ Prep machine ready (helper tools, Docker repo, Docker daemon running)"
+    echo ""
+
+    # ----------------------------------------------------------------------
+    # Step 2/5: Build the package list and download every dep into the bundle.
+    # ----------------------------------------------------------------------
+    echo "Step 2/5: Downloading packages and dependencies..."
+
+    if [ "$OS_FAMILY" = "debian" ]; then
+        # Note: apt-transport-https is a no-op transitional package on apt 1.5+
+        # (HTTPS is built in), and software-properties-common is only needed
+        # for `add-apt-repository` which the install side never calls. Both
+        # excluded so this works on minimal Debian installs that may not
+        # include them in their default sources.
+        local apt_packages=(
+            ca-certificates curl
+            gnupg lsb-release
+            wget nano ipcalc
+            keepalived
+            docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+        )
+
+        # apt-get download into the package dir. We use --download-only with
+        # --reinstall so already-installed packages are still fetched, then
+        # collect everything the resolver pulled in from /var/cache/apt/archives.
+        export DEBIAN_FRONTEND=noninteractive
+
+        # Wipe the apt download partial cache so leftover bytes don't leak
+        # into the bundle.
+        rm -f /var/cache/apt/archives/partial/* 2>/dev/null || true
+
+        # First pass: tell apt to download the lot (with deps) so the
+        # resolver does the heavy lifting. --reinstall ensures we get debs
+        # even for packages already installed on the prep box.
+        if ! apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} \
+            install -y --download-only --reinstall \
+            -o Dir::Cache::Archives="$pkg_dir" \
+            "${apt_packages[@]}" 2>&1 | tee /tmp/apt_download.log | grep -E "^(Get:|Fetched|E:)"; then
+            echo "⚠️  apt-get install --download-only had warnings (see /tmp/apt_download.log)"
+        fi
+
+        # Some apt versions ignore Dir::Cache::Archives when --download-only is
+        # combined with --reinstall. As a belt-and-braces step, also copy
+        # whatever ended up in the system cache.
+        cp /var/cache/apt/archives/*.deb "$pkg_dir/" 2>/dev/null || true
+
+        # If anything is still missing, fall back to per-package apt-get download
+        # which writes to CWD.
+        ( cd "$pkg_dir" && for pkg in "${apt_packages[@]}"; do
+            ls -1 "${pkg}"_*.deb >/dev/null 2>&1 || \
+                apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} download "$pkg" 2>/dev/null || true
+        done )
+
+        # Strip duplicates the daft way (apt cache may have older versions).
+        ( cd "$pkg_dir" && ls *.deb >/dev/null 2>&1 ) || {
+            echo "❌ ERROR: no .deb files were downloaded."
+            exit 1
+        }
+
+        local pkg_count
+        pkg_count=$(ls -1 "$pkg_dir"/*.deb 2>/dev/null | wc -l)
+        echo "✓ Downloaded $pkg_count .deb packages"
+
+    elif [ "$OS_FAMILY" = "rhel" ]; then
+        local dnf_packages=(
+            ca-certificates curl gnupg2 wget nano iproute python3 jq
+            dnf-plugins-core
+            container-selinux
+            keepalived
+            docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+        )
+
+        # dnf download --resolve pulls each package and ALL of its dependencies
+        # into the destination directory.
+        if ! dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
+            download --resolve --alldeps --destdir="$pkg_dir" \
+            "${dnf_packages[@]}" 2>&1 | tee /tmp/dnf_download.log; then
+            echo "⚠️  dnf download had warnings (see /tmp/dnf_download.log)"
+        fi
+
+        ( cd "$pkg_dir" && ls *.rpm >/dev/null 2>&1 ) || {
+            echo "❌ ERROR: no .rpm files were downloaded."
+            exit 1
+        }
+
+        local pkg_count
+        pkg_count=$(ls -1 "$pkg_dir"/*.rpm 2>/dev/null | wc -l)
+        echo "✓ Downloaded $pkg_count .rpm packages"
+    fi
+    echo ""
+
+    # ----------------------------------------------------------------------
+    # Step 3/5: Pull and save the Traefik image. Always pulls :latest fresh.
+    # Docker is guaranteed to be running here (Step 1 bootstrapped it).
+    # ----------------------------------------------------------------------
+    local traefik_image="docker.io/library/traefik:latest"
+    local traefik_digest=""
+    local traefik_version=""
+
+    echo "Step 3/5: Pulling and saving Traefik image..."
+    echo "  Image: $traefik_image"
+
+    if ! docker pull "$traefik_image" 2>&1 | tail -5; then
+        echo "❌ ERROR: failed to pull $traefik_image"
+        echo "   Check network/proxy and that Docker Hub is reachable from this host."
+        exit 1
+    fi
+
+    traefik_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$traefik_image" 2>/dev/null || true)
+    traefik_version=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.version"}}' "$traefik_image" 2>/dev/null || true)
+    [ -z "$traefik_version" ] && \
+        traefik_version=$(docker run --rm "$traefik_image" version 2>/dev/null | awk '/^Version:/ {print $2; exit}')
+    [ -z "$traefik_version" ] && traefik_version="unknown"
+
+    echo "  Version: $traefik_version"
+    echo "  Digest:  ${traefik_digest:-unknown}"
+
+    echo "  Saving to images/traefik.tar.gz..."
+    if ! docker save "$traefik_image" | gzip > "$img_dir/traefik.tar.gz"; then
+        echo "❌ ERROR: docker save failed"
+        exit 1
+    fi
+    echo "  ✓ Image saved ($(du -h "$img_dir/traefik.tar.gz" | cut -f1))"
+    echo ""
+
+    # ----------------------------------------------------------------------
+    # Step 4/5: Manifest.
+    # ----------------------------------------------------------------------
+    echo "Step 4/5: Writing manifest..."
+    cat > "$bundle_dir/manifest.txt" <<MANIFEST
+# Clinical Reverse Proxy offline bundle manifest
+# Generated $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+BUNDLE_VERSION="1"
+BUILDER_VERSION="${VERSION}"
+OS_FAMILY="${OS_FAMILY}"
+OS_TYPE="${OS_TYPE}"
+OS_CODENAME="${OS_CODENAME}"
+OS_VERSION="${OS_VERSION_FULL}"
+OS_PRETTY="${OS_PRETTY}"
+ARCH="${target_arch}"
+PACKAGE_EXT="${PACKAGE_EXT}"
+PACKAGE_COUNT="${pkg_count:-0}"
+TRAEFIK_IMAGE="${traefik_image}"
+TRAEFIK_VERSION="${traefik_version:-}"
+TRAEFIK_DIGEST="${traefik_digest:-}"
+HAS_IMAGE_TARBALL="$( [ -f "$img_dir/traefik.tar.gz" ] && echo yes || echo no )"
+BUILD_DATE="$(date +%Y-%m-%d)"
+BUILD_HOST="$(hostname)"
+MANIFEST
+    echo "✓ manifest.txt written"
+    echo ""
+
+    # ----------------------------------------------------------------------
+    # Step 5/5: Pack everything up.
+    # ----------------------------------------------------------------------
+    echo "Step 5/5: Building archive..."
+    sync
+    sleep 1
+
+    local output_dir="${ACTUAL_HOME}"
+    [ -d "$output_dir" ] || output_dir="/tmp"
+
+    local archive_file
+    case "$ARCHIVE_FORMAT" in
+        tar.gz)
+            archive_file="${output_dir}/${archive_basename}.tar.gz"
+            tar --warning=no-file-changed -czf "$archive_file" -C "$work_dir" "$archive_basename" \
+                2>&1 | grep -v "file changed as we read it" || true
+            ;;
+        zip)
+            command -v zip >/dev/null 2>&1 || {
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq zip
+                elif command -v dnf >/dev/null 2>&1; then
+                    dnf -y --setopt=skip_if_unavailable=True install zip
+                fi
+            }
+            archive_file="${output_dir}/${archive_basename}.zip"
+            ( cd "$work_dir" && zip -qr "$archive_file" "$archive_basename" )
+            ;;
+        *)
+            echo "❌ Unknown archive format: $ARCHIVE_FORMAT (expected tar.gz or zip)"
+            exit 1
+            ;;
+    esac
+
+    if [ ! -f "$archive_file" ]; then
+        echo "❌ ERROR: archive was not created at $archive_file"
+        exit 1
+    fi
+
+    # Make sure the invoking user (not root) can read/move the archive.
+    chown "$CURRENT_USER:$CURRENT_GROUP" "$archive_file" 2>/dev/null || true
+    chmod 644 "$archive_file" 2>/dev/null || true
+
+    echo "✓ Archive created: $archive_file"
+    echo "  Size: $(du -h "$archive_file" | awk '{print $1}')"
+
+    # Quick integrity check
+    case "$ARCHIVE_FORMAT" in
+        tar.gz)
+            tar -tzf "$archive_file" >/dev/null 2>&1 \
+                && echo "✓ Archive verified" \
+                || { echo "❌ Archive failed verification"; exit 1; }
+            ;;
+        zip)
+            unzip -t "$archive_file" >/dev/null 2>&1 \
+                && echo "✓ Archive verified" \
+                || { echo "❌ Archive failed verification"; exit 1; }
+            ;;
+    esac
+
+    rm -rf "$work_dir"
+
+    echo ""
+    echo "──────────────────────────────────────────────────"
+    echo ":: Offline Bundle Ready"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo "  Archive: $archive_file"
+    echo ""
+    echo "  To install on an air-gapped target:"
+    echo "    1. Copy the archive:    scp \"$archive_file\" user@target:~/"
+    echo "    2. On the target run:   sudo ./$(basename "$0") --offline"
+    echo ""
+    echo "  Or specify the path explicitly:"
+    echo "    sudo ./$(basename "$0") --offline --package-source=\"$archive_file\""
+    echo ""
+    echo "  Multi-node deployments will automatically copy the archive to"
+    echo "  every backup node before installation."
+    echo ""
+}
+
+
+# ==========================================
+# OFFLINE INSTALLATION (master node)
+# ==========================================
+# Installs prereqs + Docker + Keepalived from a pre-built bundle, then loads
+# the Traefik image from the bundle. Replaces the prereq+Docker online flow
+# entirely when --offline is in effect.
+#
+# Sets two globals on success:
+#   OFFLINE_BUNDLE_ROOT  — path to the extracted bundle (manifest.txt parent)
+#   OFFLINE_TRAEFIK_LOADED — "true" if the Traefik image was loaded from bundle
+#
+# These let the rest of the script know that the offline path was followed
+# (e.g. the Docker compose pull flag should switch to --pull never).
+
+OFFLINE_BUNDLE_ROOT=""
+OFFLINE_TRAEFIK_LOADED="false"
+
+install_traefik_stack_offline() {
+    echo ""
+    echo ""
+    echo ""
+    echo ":: Offline Install — Master Node"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+
+    detect_os_type
+    if [ -z "${PKG_MANAGER:-}" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            PKG_MANAGER="apt"
+        elif command -v dnf >/dev/null 2>&1; then
+            PKG_MANAGER="dnf"
+        else
+            exit_on_error "No supported package manager (apt/dnf)"
+        fi
+    fi
+
+    # Resolve archive path / extract.
+    auto_detect_offline_package || true
+    if [ ! -e "$OFFLINE_PACKAGE_SOURCE" ]; then
+        exit_on_error "Offline mode requested but no bundle found at $OFFLINE_PACKAGE_SOURCE"
+    fi
+
+    log "Offline source: $OFFLINE_PACKAGE_SOURCE"
+    local pkg_dir
+    pkg_dir=$(get_offline_pkg_directory)
+    [ -n "$pkg_dir" ] || exit_on_error "Could not locate package directory in bundle"
+
+    local bundle_root
+    bundle_root=$(find_bundle_root "${OFFLINE_EXTRACT_DIR:-$OFFLINE_PACKAGE_SOURCE}")
+    [ -z "$bundle_root" ] && bundle_root="$(dirname "$pkg_dir")"
+    OFFLINE_BUNDLE_ROOT="$bundle_root"
+
+    log "Package directory: $pkg_dir"
+    log "Bundle root:       $bundle_root"
+
+    # OS compatibility check (hard-fails unless --force-os-mismatch).
+    local bundle_image=""
+    if ! bundle_image=$(verify_bundle_compatibility "$bundle_root"); then
+        exit_on_error "Bundle is not compatible with this OS"
+    fi
+    [ -n "$bundle_image" ] && log "Bundle Traefik image: $bundle_image"
+
+    # ----------------------------------------------------------------------
+    # Install all packages from the bundle.
+    # ----------------------------------------------------------------------
+    echo ""
+    echo "Installing packages from bundle..."
+
+    if [ "$PKG_MANAGER" = "apt" ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        # First pass: dpkg-install everything. Some deps may be unsatisfied
+        # mid-pass; the second pass with apt --fix-broken sorts them.
+        dpkg -i "$pkg_dir"/*.deb 2>&1 | tee -a "$LOGFILE" | grep -E "^(Setting up|Selecting|Preparing|dpkg: error)" || true
+
+        # If anything is broken, attempt a fix WITHOUT going online.
+        if ! dpkg -C >/dev/null 2>&1; then
+            log "dpkg reported broken packages — running apt-get install -f offline"
+            # -y --no-download keeps apt from reaching out to the network.
+            apt-get install -f -y --no-download \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" \
+                2>&1 | tee -a "$LOGFILE" || true
+        fi
+
+        # Verify Docker + Keepalived ended up installed.
+        command -v docker     >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
+        command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
+        log "✓ All packages installed from bundle"
+
+    elif [ "$PKG_MANAGER" = "dnf" ]; then
+        # dnf localinstall handles dependency resolution between local rpms.
+        dnf ${DNF_SSL_OPT} -y --disablerepo='*' install "$pkg_dir"/*.rpm 2>&1 \
+            | tee -a "$LOGFILE" || \
+            exit_on_error "Failed to install RPMs from bundle"
+
+        command -v docker     >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
+        command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
+        log "✓ All packages installed from bundle"
+    fi
+
+    # Make sure Docker is up so we can load the image into it.
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start  docker >/dev/null 2>&1 || true
+
+    if ! docker info >/dev/null 2>&1; then
+        echo "❌ Docker daemon is not responding after install."
+        echo "   Try: systemctl status docker  ;  journalctl -u docker -n 50"
+        exit_on_error "Docker daemon failed to start after offline install"
+    fi
+    log "✓ Docker daemon is running"
+
+    # ----------------------------------------------------------------------
+    # Load the Traefik image from the bundle (if present).
+    # ----------------------------------------------------------------------
+    local image_tarball="${bundle_root}/images/traefik.tar.gz"
+    if [ -f "$image_tarball" ]; then
+        echo ""
+        echo "Loading Traefik image from bundle..."
+        echo "  Source: $image_tarball"
+        if gunzip -c "$image_tarball" | docker load 2>&1 | tee -a "$LOGFILE"; then
+            OFFLINE_TRAEFIK_LOADED="true"
+            log "✓ Traefik image loaded from bundle"
+        else
+            exit_on_error "Failed to load Traefik image from bundle"
+        fi
+    else
+        echo "⚠️  Bundle has no Traefik image — image will need to be loaded manually."
+    fi
+
+    echo ""
+    echo "✓ Offline install complete on master node"
+    echo ""
+}
+
+
+# ==========================================
+# OFFLINE PACKAGE TRANSFER (multi-node)
+# ==========================================
+# Pushes the bundle archive to every backup node so they can install offline
+# the same way the master did. Uses the existing copy_to_remote helper.
+# Updates OFFLINE_PACKAGE_SOURCE_REMOTE to the path on the remote node
+# (which is then templated into the REMOTEINSTALL heredoc).
+
+OFFLINE_PACKAGE_SOURCE_REMOTE=""
+
+transfer_offline_packages_to_nodes() {
+    if [ "$INSTALL_MODE_OFFLINE" != "true" ]; then
+        return 0
+    fi
+    if [ "${MULTI_NODE_DEPLOYMENT:-no}" != "yes" ]; then
+        return 0
+    fi
+    if [ ${#BACKUP_IPS[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    auto_detect_offline_package || true
+    if [ ! -f "$OFFLINE_PACKAGE_SOURCE" ]; then
+        exit_on_error "Bundle archive not found: $OFFLINE_PACKAGE_SOURCE"
+    fi
+
+    local archive_name archive_size
+    archive_name=$(basename "$OFFLINE_PACKAGE_SOURCE")
+    archive_size=$(du -h "$OFFLINE_PACKAGE_SOURCE" | awk '{print $1}')
+
+    echo ""
+    echo ""
+    echo ""
+    echo ":: Transferring Offline Bundle to Backup Nodes"
+    echo "──────────────────────────────────────────────────"
+    echo "  Archive: $archive_name ($archive_size)"
+    echo ""
+
+    local i node ip remote_path
+    for i in "${!BACKUP_NODES[@]}"; do
+        node="${BACKUP_NODES[$i]}"
+        ip="${BACKUP_IPS[$i]}"
+        remote_path="${ACTUAL_HOME}/${archive_name}"
+
+        echo -n "  → $node ($ip)... "
+        if copy_to_remote "$OFFLINE_PACKAGE_SOURCE" "$ip" "$remote_path"; then
+            echo "✓"
+        else
+            echo "✗"
+            exit_on_error "Failed to transfer bundle to $node"
+        fi
+    done
+
+    OFFLINE_PACKAGE_SOURCE_REMOTE="${ACTUAL_HOME}/${archive_name}"
+    echo ""
+    echo "✓ Bundle transferred to all backup nodes"
+    echo "  Remote path: $OFFLINE_PACKAGE_SOURCE_REMOTE"
+    echo ""
+}
+
+
 # Validate OS and version
 validate_os() {
     echo ""
@@ -1387,8 +2450,39 @@ echo ""
 # Install essential packages before OS detection and proxy checks.
 # The full prerequisites list (ipcalc, nano, etc.) is installed later;
 # this section only covers what is needed for the script to bootstrap.
+#
+# IMPORTANT: skip this step on air-gapped targets — apt-get update will fail
+# and `set -e` will kill the script. We detect this case in two ways:
+#   - --offline was passed (forced)
+#   - default (auto) mode AND a bundle archive is present in $ACTUAL_HOME,
+#     /opt, or /tmp
+# In either case the bundle's own packages directory provides everything
+# the early prereqs check would have installed.
+#
+# --prepare-offline still runs the prereqs install because it's intended to
+# run on an internet-connected prep machine.
 
-if [[ "$1" != "--status" ]]; then
+_early_skip_for_offline="no"
+if [ "$PREPARE_OFFLINE" != "true" ] && [[ "$1" != "--status" ]] && [[ "$1" != "--clean" ]]; then
+    if [ "$OFFLINE_MODE" = "offline" ]; then
+        _early_skip_for_offline="yes"
+    elif [ "$OFFLINE_MODE" = "auto" ]; then
+        # Lightweight inline bundle check — we can't call
+        # auto_detect_offline_package here because some of its callees rely
+        # on detect_os_type which hasn't run yet. A simple find is enough.
+        for _loc in "$ACTUAL_HOME" "/opt" "/tmp"; do
+            [ -d "$_loc" ] || continue
+            if find "$_loc" -maxdepth 1 \
+                \( -name "traefik-rp-packages-*.tar.gz" -o -name "traefik-rp-packages-*.zip" \) \
+                2>/dev/null | grep -q .; then
+                _early_skip_for_offline="yes"
+                break
+            fi
+        done
+    fi
+fi
+
+if [[ "$1" != "--status" ]] && [ "$_early_skip_for_offline" != "yes" ]; then
 echo ""
 echo "Checking essential prerequisites..."
 
@@ -1401,12 +2495,21 @@ if command -v apt-get &>/dev/null; then
     done
     if [ -n "$_early_missing" ]; then
         echo "Installing essential prerequisites:$_early_missing"
-        apt-get update -qq 2>/dev/null
-        apt-get install -y -qq $_early_missing || {
-            echo "⚠️  Warning: Could not install some prerequisites"
-            echo "   The script will continue but some checks may fail"
+        # Use `|| true` so transient apt-update failures don't kill the
+        # script under `set -e`; install step below has its own ||{...} guard
+        # and surfaces real install failures clearly.
+        apt-get update -qq || {
+            echo "  ⚠️  apt-get update returned a non-zero exit (continuing)"
         }
-        echo "✓ Essential prerequisites installed"
+        if ! apt-get install -y -qq $_early_missing; then
+            echo ""
+            echo "  ⚠️  Could not install some essential prerequisites:$_early_missing"
+            echo "      The script will continue but some checks may fail."
+            echo "      If installation halts shortly, check network / proxy settings."
+            echo ""
+        else
+            echo "✓ Essential prerequisites installed"
+        fi
     else
         echo "✓ All essential prerequisites already installed"
     fi
@@ -1419,16 +2522,24 @@ elif command -v dnf &>/dev/null; then
     done
     if [ -n "$_early_missing" ]; then
         echo "Installing essential prerequisites:$_early_missing"
-        dnf --setopt=skip_if_unavailable=True install -y $_early_missing || {
-            echo "⚠️  Warning: Could not install some prerequisites"
-            echo "   The script will continue but some checks may fail"
-        }
-        echo "✓ Essential prerequisites installed"
+        if ! dnf --setopt=skip_if_unavailable=True install -y $_early_missing; then
+            echo ""
+            echo "  ⚠️  Could not install some essential prerequisites:$_early_missing"
+            echo "      The script will continue but some checks may fail."
+            echo ""
+        else
+            echo "✓ Essential prerequisites installed"
+        fi
     else
         echo "✓ All essential prerequisites already installed"
     fi
 fi
 echo ""
+elif [ "$_early_skip_for_offline" = "yes" ]; then
+    echo ""
+    echo "Offline bundle detected — skipping online prerequisite install."
+    echo "(The bundle's own packages will be installed during the offline install step.)"
+    echo ""
 fi
 
 if [[ "$1" == "--status" ]]; then
@@ -1441,6 +2552,80 @@ else
     check_execution_context
     validate_proxy_config
     setup_proxy_strategy || exit_on_error "Failed to setup proxy strategy"
+fi
+
+# ==========================================
+# Top-Level Action Menu
+# ==========================================
+# Shown only on bare invocations (no flags). Lets the operator pick between
+# installing here vs. building an offline bundle to ship to an air-gapped
+# target. Skipped when:
+#   - the operator has expressed explicit intent via a flag (--clean,
+#     --status, --extend, --prepare-offline, --offline, --online)
+#   - they explicitly invoked --prepare-offline (already handled below)
+# Selection is mapped onto PREPARE_OFFLINE so the rest of the script flow
+# is identical to passing the flag directly.
+
+_first_arg="${1:-}"
+_show_action_menu="yes"
+case "$_first_arg" in
+    --clean|--status|--extend|--prepare-offline|--offline|--online)
+        _show_action_menu="no"
+        ;;
+esac
+# Also skip if any of the offline-mode flags appeared elsewhere (uncommon
+# but possible — e.g. --package-source=... without --offline).
+if [ "$PREPARE_OFFLINE" = "true" ] || [ "$OFFLINE_MODE" != "auto" ]; then
+    _show_action_menu="no"
+fi
+
+if [ "$_show_action_menu" = "yes" ]; then
+    echo ""
+    echo ""
+    echo ":: Select Action"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo "Please choose an action:"
+    echo "  [1] Install Reverse Proxy           (deploy on this machine)"
+    echo "  [2] Generate Offline Install Bundle (download packages + Traefik image)"
+    echo "  [3] Cancel"
+    echo ""
+
+    while true; do
+        read -p "Enter choice [1, 2, or 3]: " _action_choice
+        case "$_action_choice" in
+            1)
+                log "Action selected: Install Reverse Proxy"
+                break
+                ;;
+            2)
+                log "Action selected: Generate Offline Install Bundle"
+                PREPARE_OFFLINE="true"
+                SKIP_MAIN_EXECUTION="true"
+                break
+                ;;
+            3)
+                echo "Cancelled."
+                exit 0
+                ;;
+            *)
+                echo "Invalid input. Please enter 1, 2, or 3."
+                ;;
+        esac
+    done
+fi
+
+# ==========================================
+# --prepare-offline Early Exit
+# ==========================================
+# Build the offline bundle and exit. No SSH keys, no Keepalived, no Traefik
+# configuration are required — this mode just downloads packages and saves
+# the Traefik image. Triggered either by --prepare-offline or by selecting
+# option [2] from the top-level action menu above.
+
+if [ "$PREPARE_OFFLINE" = "true" ]; then
+    prepare_offline_packages
+    exit 0
 fi
 
 # ==========================================
@@ -5332,6 +6517,12 @@ deploy_to_backup_nodes() {
     TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DYNAMIC_DIR:-/opt/indica/traefik/config/dynamic}"
     DISABLE_DOCKER_REPO="${DISABLE_DOCKER_REPO:-no}"
 
+    # If we're in offline mode, push the bundle archive to every backup node
+    # before we start writing per-node install scripts. The remote install
+    # script will then unpack and install from the archive instead of going
+    # online. Safe to call when offline mode isn't active — it's a no-op.
+    transfer_offline_packages_to_nodes
+
     echo ""
     echo ""
     echo ""
@@ -5412,6 +6603,13 @@ INTERNAL_REPO_DOMAINS="__INTERNAL_REPO_DOMAINS__"
 CURL_SSL_OPT="__CURL_SSL_OPT__"
 APT_SSL_OPT="__APT_SSL_OPT__"
 DNF_SSL_OPT="__DNF_SSL_OPT__"
+
+# Offline-mode plumbing — when the master ran with --offline / --auto-detected
+# bundle, the archive has already been transferred to OFFLINE_ARCHIVE_PATH on
+# this node. The block below extracts it and installs everything from local
+# files instead of going to repos / Docker Hub.
+OFFLINE_MODE="__OFFLINE_MODE__"
+OFFLINE_ARCHIVE_PATH="__OFFLINE_ARCHIVE_PATH__"
 
 # Setup proxy based on strategy
 if [ -n "$PROXY" ]; then
@@ -5499,7 +6697,156 @@ export INSTALL_KEEPALIVED="yes"
 export MULTI_NODE_DEPLOYMENT="no"
 export BACKUP_NODE_INSTALL="yes"
 
+# ── Offline install (when the master ran with --offline) ───────────────────
+# OFFLINE_MODE/OFFLINE_ARCHIVE_PATH are filled in by the master before this
+# script is shipped over. When set, we extract the bundle and install
+# everything from local files; the online prereq/Docker-repo/Docker-install
+# blocks below detect this and skip themselves.
+
+OFFLINE_INSTALL_DONE="no"
+OFFLINE_TRAEFIK_LOADED="no"
+
+if [ "$OFFLINE_MODE" = "yes" ]; then
+    if [ ! -f "$OFFLINE_ARCHIVE_PATH" ]; then
+        echo "❌ Offline mode requested but bundle not found at $OFFLINE_ARCHIVE_PATH"
+        exit 1
+    fi
+
+    echo ""
+    echo ":: Offline Install on Backup Node"
+    echo "──────────────────────────────────────────────────"
+    echo "  Bundle: $OFFLINE_ARCHIVE_PATH"
+    echo ""
+
+    _OFFLINE_EXTRACT_DIR="/tmp/traefik_rp_offline_$$"
+    rm -rf "$_OFFLINE_EXTRACT_DIR"
+    mkdir -p "$_OFFLINE_EXTRACT_DIR"
+
+    case "$OFFLINE_ARCHIVE_PATH" in
+        *.tar.gz|*.tgz)
+            tar -xzf "$OFFLINE_ARCHIVE_PATH" -C "$_OFFLINE_EXTRACT_DIR" \
+                || { echo "❌ Failed to extract $OFFLINE_ARCHIVE_PATH"; exit 1; }
+            ;;
+        *.zip)
+            command -v unzip >/dev/null 2>&1 || {
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq unzip 2>/dev/null
+                elif command -v dnf >/dev/null 2>&1; then
+                    dnf -y --setopt=skip_if_unavailable=True install unzip 2>/dev/null
+                fi
+            }
+            unzip -q "$OFFLINE_ARCHIVE_PATH" -d "$_OFFLINE_EXTRACT_DIR" \
+                || { echo "❌ Failed to unzip $OFFLINE_ARCHIVE_PATH"; exit 1; }
+            ;;
+        *)
+            echo "❌ Unsupported archive type: $OFFLINE_ARCHIVE_PATH"
+            exit 1
+            ;;
+    esac
+
+    # Locate the wrapper directory (it contains manifest.txt + packages/ + images/)
+    _BUNDLE_ROOT=""
+    if [ -f "$_OFFLINE_EXTRACT_DIR/manifest.txt" ]; then
+        _BUNDLE_ROOT="$_OFFLINE_EXTRACT_DIR"
+    else
+        _BUNDLE_ROOT=$(find "$_OFFLINE_EXTRACT_DIR" -mindepth 1 -maxdepth 2 \
+            -name manifest.txt -type f 2>/dev/null | head -1 | xargs -r dirname)
+    fi
+    if [ -z "$_BUNDLE_ROOT" ]; then
+        # Best-effort: take the first subdirectory that contains a packages/ dir
+        _BUNDLE_ROOT=$(find "$_OFFLINE_EXTRACT_DIR" -mindepth 1 -maxdepth 2 \
+            -type d -name packages 2>/dev/null | head -1 | xargs -r dirname)
+    fi
+    if [ -z "$_BUNDLE_ROOT" ] || [ ! -d "$_BUNDLE_ROOT" ]; then
+        echo "❌ Could not locate bundle root inside $_OFFLINE_EXTRACT_DIR"
+        exit 1
+    fi
+    _PKG_DIR="$_BUNDLE_ROOT/packages"
+    _IMG_TARBALL="$_BUNDLE_ROOT/images/traefik.tar.gz"
+    [ -d "$_PKG_DIR" ] || { echo "❌ packages/ missing inside bundle"; exit 1; }
+
+    # Hard-fail on OS mismatch (mirrors verify_bundle_compatibility on master)
+    if [ -f "$_BUNDLE_ROOT/manifest.txt" ]; then
+        _b_codename=$(grep -E '^OS_CODENAME=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"')
+        _b_arch=$(grep -E '^ARCH=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"')
+        _t_codename=""
+        if [ -f /etc/os-release ]; then
+            _t_codename=$( . /etc/os-release; echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-${VERSION_ID%%.*}}}")
+        fi
+        _t_arch=$(uname -m)
+        if [ -n "$_b_codename" ] && [ -n "$_t_codename" ] && [ "$_b_codename" != "$_t_codename" ]; then
+            echo "❌ Bundle/target OS codename mismatch: bundle=$_b_codename target=$_t_codename"
+            echo "   This was deployed from a master that did not set --force-os-mismatch."
+            exit 1
+        fi
+        if [ -n "$_b_arch" ] && [ "$_b_arch" != "$_t_arch" ]; then
+            echo "❌ Bundle/target architecture mismatch: bundle=$_b_arch target=$_t_arch"
+            exit 1
+        fi
+    fi
+
+    echo "Installing packages from bundle..."
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        dpkg -i "$_PKG_DIR"/*.deb 2>&1 | grep -E "^(Setting up|Selecting|Preparing|dpkg: error)" || true
+        # Fix any deps with whatever local packages we have (no network)
+        if ! dpkg -C >/dev/null 2>&1; then
+            apt-get install -f -y --no-download \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" 2>/dev/null || true
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf -y --disablerepo='*' install "$_PKG_DIR"/*.rpm 2>&1 || {
+            echo "❌ Failed to install RPMs from bundle"
+            exit 1
+        }
+    else
+        echo "❌ No supported package manager found"
+        exit 1
+    fi
+
+    command -v docker     >/dev/null 2>&1 || { echo "❌ Docker missing after offline install"; exit 1; }
+    command -v keepalived >/dev/null 2>&1 || { echo "❌ Keepalived missing after offline install"; exit 1; }
+
+    # Make sure Docker is running so we can load the image
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start  docker >/dev/null 2>&1 || true
+    sleep 2
+    if ! docker info >/dev/null 2>&1; then
+        echo "❌ Docker daemon is not responding after offline install"
+        exit 1
+    fi
+    echo "✓ Docker + Keepalived installed from bundle"
+
+    if [ -f "$_IMG_TARBALL" ]; then
+        echo "Loading Traefik image from bundle..."
+        if gunzip -c "$_IMG_TARBALL" | docker load; then
+            OFFLINE_TRAEFIK_LOADED="yes"
+            echo "✓ Traefik image loaded"
+        else
+            echo "❌ Failed to load Traefik image from bundle"
+            exit 1
+        fi
+    else
+        echo "⚠️  Bundle has no Traefik image — pull will be attempted later (likely to fail offline)"
+    fi
+
+    OFFLINE_INSTALL_DONE="yes"
+
+    # Schedule cleanup of the extracted bundle when this script exits.
+    trap '[ -d "$_OFFLINE_EXTRACT_DIR" ] && [[ "$_OFFLINE_EXTRACT_DIR" == /tmp/* ]] && rm -rf "$_OFFLINE_EXTRACT_DIR"' EXIT
+
+    # The master also transferred the archive into ~user. Leave it in place
+    # so the operator can re-run if needed; they can delete it manually later.
+    echo ""
+fi
+
 # Install prerequisites
+if [ "$OFFLINE_INSTALL_DONE" = "yes" ]; then
+    echo "Skipping online prereq/Docker install — already installed from offline bundle"
+else
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
     sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
@@ -5569,6 +6916,8 @@ else
 fi
 
 echo "✓ Docker installed successfully"
+
+fi  # end OFFLINE_INSTALL_DONE != yes (prereqs + Docker install)
 
 if ! command -v docker &>/dev/null; then
     echo "ERROR: Docker installation failed - docker command not found"
@@ -5817,12 +7166,17 @@ fi
 sleep 5
 
 # Install Keepalived
-echo "Installing Keepalived..."
-if command -v apt-get &>/dev/null; then
-    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y keepalived
-elif command -v dnf &>/dev/null; then
-    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
-        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
+if [ "$OFFLINE_INSTALL_DONE" = "yes" ]; then
+    echo "Skipping online Keepalived install — already installed from offline bundle"
+    command -v keepalived >/dev/null 2>&1 || { echo "❌ Keepalived missing after offline install"; exit 1; }
+else
+    echo "Installing Keepalived..."
+    if command -v apt-get &>/dev/null; then
+        sudo -E apt-get $APT_PROXY_OPT_PROXY install -y keepalived
+    elif command -v dnf &>/dev/null; then
+        if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived; then
+            sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y keepalived --nobest
+        fi
     fi
 fi
 
@@ -5943,6 +7297,19 @@ REMOTEINSTALL
         sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g"                            "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g"                          "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__DISABLE_DOCKER_REPO__|${DISABLE_DOCKER_REPO}|g"            "$SCRIPTS_DIR/install_backup_${node}.sh"
+
+        # Offline mode: tell the backup-node script whether to install from a
+        # local archive, and where to find it. OFFLINE_PACKAGE_SOURCE_REMOTE
+        # is set by transfer_offline_packages_to_nodes when applicable.
+        if [ "${INSTALL_MODE_OFFLINE:-false}" = "true" ]; then
+            _bn_offline_mode="yes"
+            _bn_offline_path="${OFFLINE_PACKAGE_SOURCE_REMOTE}"
+        else
+            _bn_offline_mode="no"
+            _bn_offline_path=""
+        fi
+        sed -i "s|__OFFLINE_MODE__|${_bn_offline_mode}|g"                       "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|__OFFLINE_ARCHIVE_PATH__|${_bn_offline_path}|g"               "$SCRIPTS_DIR/install_backup_${node}.sh"
 
         # HL7 values contain '|' — use python3 to avoid sed delimiter conflicts
         HL7_ENABLED_VAL="$HL7_ENABLED" \
@@ -10658,8 +12025,24 @@ log "Detected package manager: $PKG_MANAGER"
 ######################################################
 ### START Repository Connectivity Check
 
-check_repository_connectivity
-REPO_CONNECTIVITY_OK=$( [ $? -eq 0 ] && echo true || echo false )
+# Decide which install path we'll take, and flag it for everything downstream.
+# When OFFLINE_MODE is "auto" and a bundle is present this resolves to offline;
+# otherwise it falls through to online.
+INSTALL_MODE_OFFLINE=false
+if determine_install_mode; then
+    INSTALL_MODE_OFFLINE=true
+fi
+
+if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
+    log "Offline install mode — skipping repository connectivity check"
+    REPO_CONNECTIVITY_OK=true
+    DOCKER_AUTH_BLOCKED=false
+    echo ""
+    echo "Repository connectivity check skipped (offline mode)."
+else
+    check_repository_connectivity
+    REPO_CONNECTIVITY_OK=$( [ $? -eq 0 ] && echo true || echo false )
+fi
 
 ### END Repository Connectivity Check
 ######################################################
@@ -10678,7 +12061,12 @@ echo "✓ Operating System: Validated ($OS_ID $OS_VERSION)"
 echo "✓ Execution Context: Validated (sudo by ${CURRENT_USER})"
 echo "✓ Package Manager: $PKG_MANAGER"
 echo "✓ Sudo Access: Verified"
-echo "✓ Repository Access: Verified"
+if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
+    echo "✓ Install mode:  OFFLINE  (bundle: $(basename "$OFFLINE_PACKAGE_SOURCE"))"
+else
+    echo "✓ Install mode:  ONLINE"
+    echo "✓ Repository Access: Verified"
+fi
 
 if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
@@ -10765,7 +12153,18 @@ log "User confirmed proceeding with installation"
 ######################################################
 
 ######################################################
+### Offline branch — when --offline / auto-detected, install everything from
+### the bundle here (packages + Traefik image), then skip the online prereq /
+### Docker / image-pull blocks below.
+
+if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
+    install_traefik_stack_offline
+fi
+
+######################################################
 ### START installing Prerequisites
+
+if [ "$INSTALL_MODE_OFFLINE" != "true" ]; then
 
 echo ""
 echo ""
@@ -10815,12 +12214,16 @@ bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
     LOGFILE='$LOGFILE' \
     install_packages ${PREREQ_PACKAGES[*]}"
 
+fi  # end INSTALL_MODE_OFFLINE != true (Prerequisites)
+
 ### END installing Prerequisites 
 ######################################################
 
 ######################################################
 ### START Docker Dependency Pre-installation
 ######################################################
+
+if [ "$INSTALL_MODE_OFFLINE" != "true" ]; then
 
 if [[ "$PKG_MANAGER" == "dnf" ]]; then
     if ! rpm -q container-selinux &>/dev/null; then
@@ -10854,6 +12257,8 @@ if [[ "$PKG_MANAGER" == "dnf" ]]; then
     fi
 fi
 
+fi  # end INSTALL_MODE_OFFLINE != true (Docker Dependency)
+
 ### END Docker Dependency Pre-installation
 ######################################################
 
@@ -10868,6 +12273,10 @@ echo "────────────────────────�
 echo ""
 echo ""
 echo ""
+
+if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
+    log "Skipping online Docker install — already installed from offline bundle"
+else
 
 # OS-specific Docker installation
 if [[ "$PKG_MANAGER" == "apt" ]]; then
@@ -10935,6 +12344,8 @@ elif [[ "$PKG_MANAGER" == "dnf" ]]; then
         LOGFILE='$LOGFILE' \
         install_packages docker-ce docker-ce-cli containerd.io"
 fi
+
+fi  # end INSTALL_MODE_OFFLINE != true (Docker Installation)
 
 # Verify Docker installation
 docker --version || exit_on_error "Docker installation failed"
@@ -11583,7 +12994,18 @@ try_pull() {
 
 # Check if image already exists locally (pre-loaded on restricted networks)
 _traefik_image_local=false
-if docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "traefik"; then
+
+# In offline mode the image has just been loaded from the bundle by
+# install_traefik_stack_offline. Treat it exactly like a pre-loaded local
+# image so the existing path below skips the pull and switches docker
+# compose to --pull never.
+if [ "$INSTALL_MODE_OFFLINE" = "true" ] && [ "$OFFLINE_TRAEFIK_LOADED" = "true" ]; then
+    _traefik_image_local=true
+    log "Offline mode — Traefik image was loaded from bundle, skipping pull"
+fi
+
+if [ "$_traefik_image_local" = false ] && \
+   docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "traefik"; then
     _existing_image=$(docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep traefik | head -1)
     log "Found existing local Traefik image: ${_existing_image}"
 
@@ -11729,23 +13151,28 @@ echo ""
 echo ""
 
 # Install Keepalived
-log "Installing Keepalived..."
-bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
-    export http_proxy='${http_proxy:-}'; \
-    export https_proxy='${https_proxy:-}'; \
-    export no_proxy='${no_proxy:-}'; \
-    PKG_MANAGER=$PKG_MANAGER \
-    PROXY_HOST='$PROXY_HOST' \
-    PROXY_PORT='$PROXY_PORT' \
-    PROXY_USER='$PROXY_USER' \
-    PROXY_PASSWORD='$PROXY_PASSWORD' \
-    APT_SSL_OPT='$APT_SSL_OPT' \
-    DNF_SSL_OPT='$DNF_SSL_OPT' \
-    DNF_PROXY_OPT='$DNF_PROXY_OPT' \
-    APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
-    PROXY_STRATEGY='$PROXY_STRATEGY' \
-    LOGFILE='$LOGFILE' \
-    install_packages keepalived"
+if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
+    log "Skipping online Keepalived install — already installed from offline bundle"
+    command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived not found after offline install"
+else
+    log "Installing Keepalived..."
+    bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
+        export http_proxy='${http_proxy:-}'; \
+        export https_proxy='${https_proxy:-}'; \
+        export no_proxy='${no_proxy:-}'; \
+        PKG_MANAGER=$PKG_MANAGER \
+        PROXY_HOST='$PROXY_HOST' \
+        PROXY_PORT='$PROXY_PORT' \
+        PROXY_USER='$PROXY_USER' \
+        PROXY_PASSWORD='$PROXY_PASSWORD' \
+        APT_SSL_OPT='$APT_SSL_OPT' \
+        DNF_SSL_OPT='$DNF_SSL_OPT' \
+        DNF_PROXY_OPT='$DNF_PROXY_OPT' \
+        APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
+        PROXY_STRATEGY='$PROXY_STRATEGY' \
+        LOGFILE='$LOGFILE' \
+        install_packages keepalived"
+fi
 
 log "Deferring KeepAlived Startup until configuration file generated"
 
