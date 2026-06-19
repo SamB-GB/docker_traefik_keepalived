@@ -7630,12 +7630,17 @@ fi
 chown -R root:root /opt/indica
 
 echo "Starting Traefik..."
-# Use --pull never if image already exists locally, --pull always otherwise
-if docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "traefik"; then
-    docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate --pull never
-else
-    docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate --pull always
+# Use --pull never only when the exact image the compose file references actually
+# exists locally. grep on 'docker images' can match versioned tags (e.g.
+# traefik:3.x) while traefik:latest is absent, causing compose to fail with
+# "No such image". docker image inspect validates the precise reference.
+_PULL_FLAG="--pull always"
+if [ "$OFFLINE_TRAEFIK_LOADED" = "yes" ] || \
+   docker image inspect docker.io/library/traefik:latest >/dev/null 2>&1 || \
+   docker image inspect traefik:latest >/dev/null 2>&1; then
+    _PULL_FLAG="--pull never"
 fi
+docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate $_PULL_FLAG
 sleep 5
 
 # Install Keepalived
