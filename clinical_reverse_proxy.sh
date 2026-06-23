@@ -3,17 +3,17 @@
 # Enhanced Clinical Traefik Reverse Proxy Setup
 #
 # USAGE:
-#   sudo ./clinicalrp.sh                          # Interactive menu (install or generate bundle)
-#   sudo ./clinicalrp.sh --clean                  # Remove Traefik/Keepalived/Docker
-#   sudo ./clinicalrp.sh --status                 # Quick health check of current deployment
+#   sudo ./clinical_reverse_proxy.sh                          # Interactive menu (install or generate bundle)
+#   sudo ./clinical_reverse_proxy.sh --clean                  # Remove Traefik/Keepalived/Docker
+#   sudo ./clinical_reverse_proxy.sh --status                 # Quick health check of current deployment
 #
 # OFFLINE MODE:
-#   sudo ./clinicalrp.sh --prepare-offline        # Skip menu, build bundle directly
-#   sudo ./clinicalrp.sh --offline                # Force offline install from bundle (auto-detected)
-#   sudo ./clinicalrp.sh --online                 # Force online install (ignore any local bundle)
-#   sudo ./clinicalrp.sh --package-source=PATH    # Use specific bundle path (file or directory)
-#   sudo ./clinicalrp.sh --archive-format=zip     # Use zip instead of tar.gz when preparing
-#   sudo ./clinicalrp.sh --force-os-mismatch      # Skip the bundle/target OS compatibility check
+#   sudo ./clinical_reverse_proxy.sh --prepare-offline        # Skip menu, build bundle directly
+#   sudo ./clinical_reverse_proxy.sh --offline                # Force offline install from bundle (auto-detected)
+#   sudo ./clinical_reverse_proxy.sh --online                 # Force online install (ignore any local bundle)
+#   sudo ./clinical_reverse_proxy.sh --package-source=PATH    # Use specific bundle path (file or directory)
+#   sudo ./clinical_reverse_proxy.sh --archive-format=zip     # Use zip instead of tar.gz when preparing
+#   sudo ./clinical_reverse_proxy.sh --force-os-mismatch      # Skip the bundle/target OS compatibility check
 #
 # When invoked with no flags, an interactive menu offers:
 #   [1] Install Reverse Proxy             (deploy on this machine, online or offline)
@@ -30,7 +30,7 @@
 #       packages and saves the Traefik image into a transferrable archive. The
 #       resulting archive is auto-detected on the target (~/, /opt, /tmp).
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 set -e
 
