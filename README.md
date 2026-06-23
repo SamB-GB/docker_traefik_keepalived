@@ -1,9 +1,9 @@
 # Clinical Traefik Reverse Proxy Setup
 
-An interactive Bash script that installs and configures a [Traefik](https://traefik.io/) reverse proxy for [Halo AP](https://www.indicalab.com/halo/) (Indica Labs), deployed as a Docker container on clinical Linux servers. Supports both single-node and high-availability multi-node deployments with Keepalived VRRP failover, offline (air-gapped) installation, and post-install change management.
+An interactive Bash script that installs and configures a [Traefik](https://traefik.io/) reverse proxy for  Halo AP, deployed as a Docker container on linux based server. Supports both single-node and high-availability multi-node deployments with Keepalived VRRP failover, offline (air-gapped) installation, and post-install change management.
 
 **Script version:** 1.4.1
-
+**Author:** Sam Barr
 ---
 
 ## Table of Contents
@@ -13,6 +13,7 @@ An interactive Bash script that installs and configures a [Traefik](https://trae
 - [Prerequisites](#prerequisites)
 - [Configuration](#configuration)
 - [Usage](#usage)
+  - [Command-Line Options](#command-line-options)
   - [Normal Installation](#normal-installation)
   - [Offline Installation](#offline-installation)
   - [Status Check](#status-check)
@@ -38,10 +39,10 @@ An interactive Bash script that installs and configures a [Traefik](https://trae
 - TLS termination with a user-supplied certificate and key
 - Optional custom CA certificate for upstream HTTPS connections
 - Generates Traefik static and dynamic configuration files for Halo AP services
-- Sticky-session load balancing across multiple upstream Halo AP nodes
+- Sticky session load balancing across multiple upstream Halo AP nodes
 - Optional Keepalived installation for Virtual IP (VRRP) high-availability failover
 - Automated SSH-based deployment to backup nodes in a multi-node HA setup
-- **Offline installation mode** — build a transferable bundle on an internet-connected machine and install on air-gapped targets
+- **Offline installation mode** — build a transferable bundle on an internet-connected machine and install on air-gapped enviroments
 - **Post-install change management** (`--extend` / Change Deployment menu):
   - Update SSL or CA certificate and push to all nodes
   - Add, remove, or replace Traefik HA nodes
@@ -54,7 +55,7 @@ An interactive Bash script that installs and configures a [Traefik](https://trae
 - **Audit log** — every configuration change is appended to `/opt/indica/traefik/audit.log`
 - **Configuration snapshots** — the deployment config is automatically backed up before each change
 - `/etc/hosts` entry management for component server hostname resolution
-- Flexible HTTP proxy support (authenticated or unauthenticated) with smart strategy selection
+- Flexible HTTP proxy support (authenticated or unauthenticated) with smart strategy selection to connect to package repositories
 - Supports both `apt` (Debian/Ubuntu) and `dnf` (RHEL/CentOS/Rocky/AlmaLinux) package managers
 - Idempotent: re-running the script on an existing deployment presents a menu (Reinstall, Status, Change Deployment, Uninstall)
 - Automatic migration of legacy `clinical_traefik.env` configurations to the current `deployment.config` format
@@ -134,6 +135,21 @@ All other settings (deployment type, service URLs, certificates, Keepalived topo
 ---
 
 ## Usage
+
+### Command-Line Options
+
+| Flag | Argument | Description |
+|---|---|---|
+| *(none)* | | Interactive menu — choose Install or Generate Offline Bundle |
+| `--clean` | | Remove Traefik, Keepalived, Docker config, and deployment files |
+| `--status` | | Quick health check of the current deployment (no install) |
+| `--extend` | | Jump directly to the Change Deployment menu |
+| `--prepare-offline` | | Build an offline install bundle (packages + Traefik image) |
+| `--offline` | | Force offline install; fail if no bundle is found |
+| `--online` | | Force online install even if a bundle is present |
+| `--package-source=` | `PATH` | Use a specific bundle file or directory instead of auto-detecting |
+| `--archive-format=` | `tar.gz` \| `zip` | Archive format when building an offline bundle (default: `tar.gz`) |
+| `--force-os-mismatch` | | Skip the OS codename compatibility check for offline bundles |
 
 ### Normal Installation
 
