@@ -2858,6 +2858,12 @@ esac
 if [ "$PREPARE_OFFLINE" = "true" ] || [ "$OFFLINE_MODE" != "auto" ]; then
     _show_action_menu="no"
 fi
+# If an existing deployment is already present, skip the action menu entirely.
+# The existing deployment menu (prompt_use_existing_config) is the right entry
+# point — it covers Reinstall, Change, Status, Uninstall, and Generate Bundle.
+if [[ -f "$CONFIG_FILE" ]]; then
+    _show_action_menu="no"
+fi
 
 if [ "$_show_action_menu" = "yes" ]; then
     echo ""
@@ -9038,16 +9044,17 @@ prompt_use_existing_config() {
         echo "    [3] Change — update certificates, servers, nodes or HL7"
         echo "    [4] Uninstall  — remove everything from all nodes"
         echo "    [5] Clean Orphaned Nodes — remove Traefik from decommissioned nodes"
+        echo "    [6] Generate Offline Install Bundle"
         echo "    ─────────────────────────────────────────────────────"
-        echo "    [6] Cancel"
+        echo "    [7] Exit"
         echo ""
 
         local _choice
         while true; do
-            read -p "Enter choice [1-6]: " _choice
+            read -p "Enter choice [1-7]: " _choice
             case "$_choice" in
-                1|2|3|4|5|6) break ;;
-                *) echo "  Please enter 1, 2, 3, 4, 5, or 6." ;;
+                1|2|3|4|5|6|7) break ;;
+                *) echo "  Please enter 1, 2, 3, 4, 5, 6, or 7." ;;
             esac
         done
 
@@ -9147,6 +9154,13 @@ prompt_use_existing_config() {
                 clean_orphaned_nodes
                 ;;
             6)
+                echo ""
+                log "User selected: Generate Offline Install Bundle"
+                PREPARE_OFFLINE="true"
+                prepare_offline_packages
+                exit 0
+                ;;
+            7)
                 echo "Operation cancelled."
                 cleanup
                 exit 0
