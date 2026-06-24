@@ -30,7 +30,7 @@
 #       packages and saves the Traefik image into a transferrable archive. The
 #       resulting archive is auto-detected on the target (~/, /opt, /tmp).
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 set -e
 
