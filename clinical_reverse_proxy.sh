@@ -4044,29 +4044,35 @@ _extend_restart_traefik_all_nodes() {
             local node="${BACKUP_NODES[$i]}"
             local ip="${BACKUP_IPS[$i]}"
             echo -n "  ${node} (${ip})... "
-            local _restart_result
+            local _restart_result _restart_ok=false
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1) || \
-                _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1)
+                if _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1); then
+                    _restart_ok=true
+                elif _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1); then
+                    _restart_ok=true
+                fi
             else
-                _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1) || \
-                _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1)
+                if _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1); then
+                    _restart_ok=true
+                elif _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1); then
+                    _restart_ok=true
+                fi
             fi
-            if [[ $? -eq 0 ]]; then
+            if [[ "$_restart_ok" == true ]]; then
                 # Quick remote health check
                 local _remote_healthy=false
                 for _i in $(seq 1 5); do
                     local _ping
                     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
                         _ping=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                            "curl -fs http://localhost:8800/ping 2>/dev/null && echo ok" 2>/dev/null)
+                            "curl -fs http://localhost:8800/ping 2>/dev/null && echo ok" 2>/dev/null) || true
                     else
                         _ping=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                            "curl -fs http://localhost:8800/ping 2>/dev/null && echo ok" 2>/dev/null)
+                            "curl -fs http://localhost:8800/ping 2>/dev/null && echo ok" 2>/dev/null) || true
                     fi
                     if echo "$_ping" | grep -q ok; then _remote_healthy=true; break; fi
                     sleep 1
@@ -8365,8 +8371,8 @@ echo "✓ Cleanup complete"
 REPLACECLEANUP
         chmod 644 "$SCRIPTS_DIR/cleanup_replace_${_old_node}.sh"
         ensure_SCRIPTS_DIR "$_old_ip" || true
-        copy_to_remote "$SCRIPTS_DIR/cleanup_replace_${_old_node}.sh" \ || true
-            "$_old_ip" "$SCRIPTS_DIR/cleanup_replace.sh"
+        copy_to_remote "$SCRIPTS_DIR/cleanup_replace_${_old_node}.sh" \
+            "$_old_ip" "$SCRIPTS_DIR/cleanup_replace.sh" || true
         execute_remote_script "$_old_ip" "$SCRIPTS_DIR/cleanup_replace.sh" 2>/dev/null || true
         rm -f "$SCRIPTS_DIR/cleanup_replace_${_old_node}.sh"
         echo "✓"
@@ -10731,8 +10737,8 @@ PLUGINBLOCK
                 local _bip="${BACKUP_IPS[$i]}"
                 echo -n "  Pushing to ${_bn}... "
                 if [[ "$DIAG_ENABLED" == "yes" && -f "$_diag_file" ]]; then
-                    copy_to_remote "$_diag_file" "$_bip" \ || true
-                        "/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml"
+                    copy_to_remote "$_diag_file" "$_bip" \
+                        "/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" || true
                     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
                         sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
                             "chmod 640 /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" 2>/dev/null || true
