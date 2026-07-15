@@ -7642,15 +7642,30 @@ fi
 chown -R root:root /opt/indica
 
 echo "Starting Traefik..."
-# Use --pull never only when the exact image the compose file references actually
-# exists locally. grep on 'docker images' can match versioned tags (e.g.
-# traefik:3.x) while traefik:latest is absent, causing compose to fail with
-# "No such image". docker image inspect validates the precise reference.
+# Decide the pull flag based on actual reachability, not just "is an image
+# already cached locally". A backup node that has been deployed to before
+# always has a cached traefik:latest, so a presence-only check would skip
+# pulling forever and traefik:latest would never get refreshed even with a
+# working internet connection. Mirror the master node's behaviour: try to
+# reach Docker Hub first, and only fall back to the local image if that
+# genuinely fails (or we're in a bundle-loaded offline install).
 _PULL_FLAG="--pull always"
-if [ "$OFFLINE_TRAEFIK_LOADED" = "yes" ] || \
-   docker image inspect docker.io/library/traefik:latest >/dev/null 2>&1 || \
-   docker image inspect traefik:latest >/dev/null 2>&1; then
+if [ "$OFFLINE_TRAEFIK_LOADED" = "yes" ]; then
+    echo "Offline install — using image loaded from bundle"
     _PULL_FLAG="--pull never"
+elif docker pull docker.io/library/traefik:latest >/dev/null 2>&1; then
+    echo "✓ Pulled latest Traefik image"
+    _PULL_FLAG="--pull never"
+else
+    echo "⚠️  Could not reach Docker Hub to pull a fresh Traefik image"
+    if docker image inspect docker.io/library/traefik:latest >/dev/null 2>&1 || \
+       docker image inspect traefik:latest >/dev/null 2>&1; then
+        echo "  Falling back to existing local image"
+        _PULL_FLAG="--pull never"
+    else
+        echo "❌ No local Traefik image available and Docker Hub unreachable"
+        exit 1
+    fi
 fi
 docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate $_PULL_FLAG
 sleep 5
