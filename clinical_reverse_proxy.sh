@@ -4110,6 +4110,16 @@ extend_update_ssl() {
     echo "Paste the new SSL private key:"
     SSL_KEY_CONTENT=$(prompt_ssl_input "key")
 
+    # Guard: Docker auto-creates missing bind-mount sources as directories,
+    # so a prior compose recreate before these files existed can leave
+    # cert.crt / server.key as directories instead of files.
+    for _f in "${_cert_file}" "${_key_file}"; do
+        if [[ -d "${_f}" ]]; then
+            echo "  ⚠️  ${_f} exists as a directory — removing so the certificate can be written"
+            rm -rf "${_f}"
+        fi
+    done
+
     echo "$SSL_CERT_CONTENT" > "${_cert_file}"
     echo "$SSL_KEY_CONTENT" > "${_key_file}"
     chmod 644 "${_cert_file}"
@@ -4215,7 +4225,15 @@ extend_update_ca() {
 
     if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
         mkdir -p "$(dirname "$_ca_file")"
-        mkdir -p "$(dirname "$_ca_file")"
+
+        # Guard: a previous run may have left this path as a directory
+        # (e.g. Docker created it as a bind-mount target before the file
+        # existed). Remove it so we can write the cert as a plain file.
+        if [[ -d "${_ca_file}" ]]; then
+            echo "  ⚠️  ${_ca_file} exists as a directory — removing so the certificate can be written"
+            rm -rf "${_ca_file}"
+        fi
+
         echo "$CUSTOM_CA_CERT_CONTENT" > "${_ca_file}"
         chmod 644 "${_ca_file}"
         echo "✓ CA certificate written locally"
