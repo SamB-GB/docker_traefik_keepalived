@@ -11683,6 +11683,17 @@ if [[ -n "$_legacy_env" && ! -f "$CONFIG_FILE" ]]; then
         chown -R root:root /opt/indica 2>/dev/null || true
         cp "$_legacy_env" "$CONFIG_FILE"
 
+        # The legacy env file predates the /home/haloap → /opt/indica install
+        # path migration, so any path variables it carried (CERT_FILE,
+        # KEY_FILE, CERT_DIR) may still point at the old location even though
+        # this host now lives at /opt/indica. Fix them the same way the
+        # directory migration below does, so save_config never tries to cat
+        # a dead path.
+        if grep -q '/home/haloap' "$CONFIG_FILE" 2>/dev/null; then
+            sed -i 's|/home/haloap|/opt/indica|g' "$CONFIG_FILE"
+            echo "  ✓ Fixed stale /home/haloap path references carried over from legacy config"
+        fi
+
         # Add any missing newer variables with defaults
         _add_vars=()
         grep -q '^HL7_ENABLED=' "$CONFIG_FILE"       || _add_vars+=('HL7_ENABLED="no"')
@@ -11768,6 +11779,20 @@ if [[ -d "/home/haloap/traefik" && -d "/opt/indica/traefik" ]]; then
                 echo "  ✓ Recovered config/dynamic/$(basename "$_yml")"
             fi
         done
+    fi
+
+    # deployment.config was never part of the per-file recovery above, so a
+    # host that hit an earlier incomplete migration could carry a stale
+    # CERT_FILE/KEY_FILE pointing at /home/haloap indefinitely — the first
+    # thing to try reading those paths (e.g. save_config's cat) would then
+    # fail. Recover the file if it's missing, and fix stale paths either way.
+    if [[ ! -f "/opt/indica/traefik/deployment.config" && -f "/home/haloap/traefik/deployment.config" ]]; then
+        cp /home/haloap/traefik/deployment.config /opt/indica/traefik/deployment.config
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/deployment.config 2>/dev/null || true
+        echo "  ✓ Recovered deployment.config"
+    elif [[ -f "/opt/indica/traefik/deployment.config" ]] && grep -q '/home/haloap' /opt/indica/traefik/deployment.config 2>/dev/null; then
+        sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/deployment.config
+        echo "  ✓ Fixed stale /home/haloap path references in deployment.config"
     fi
 
     chown -R root:root /opt/indica/traefik 2>/dev/null || true
