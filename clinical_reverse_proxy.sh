@@ -344,11 +344,19 @@ verify_password_encoding() {
 run_remote_sudo() {
     local ip=$1
     local cmd=$2
-    
+    # base64-encode the command so embedded quotes/$()/backticks can't break
+    # the nested local-shell -> ssh -> remote-shell quoting, regardless of
+    # what $cmd contains.
+    local cmd_b64
+    cmd_b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" -- bash -lc "echo \"$SUDO_PASS\" | ssh $SSH_OPTS -l '$CURRENT_USER' '$ip' 'sudo -S bash -c \"$cmd\"'"
+        # SUDO_PASS is piped in from outside the -lc string (not embedded in
+        # it) so it never appears in this process's argv/ps output; it flows
+        # through untouched via inherited stdin: bash -lc -> ssh -> remote sudo -S.
+        printf '%s\n' "$SUDO_PASS" | sudo -u "$SUDO_USER" -- bash -lc "ssh $SSH_OPTS -l '$CURRENT_USER' '$ip' \"sudo -S bash -c 'echo $cmd_b64 | base64 -d | bash'\""
     else
-        echo "$SUDO_PASS" | ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "sudo -S bash -c \"$cmd\""
+        echo "$SUDO_PASS" | ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" "sudo -S bash -c 'echo $cmd_b64 | base64 -d | bash'"
     fi
 }
 
@@ -359,9 +367,9 @@ copy_to_remote() {
     local dest=$3
 
     # SCP options — -O forces legacy SCP protocol to avoid SFTP subsystem requirement
-    local SCP_OPTS="-O -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5"
+    local SCP_OPTS="-O -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5"
     # SSH options for the cat fallback — no -O (that flag has a different meaning for ssh)
-    local SSH_COPY_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5"
+    local SSH_COPY_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5"
     local KEY_OPT="-i $ACTUAL_HOME/.ssh/id_rsa"
 
     # Helper: stream file via ssh cat, writing to a tmp file then sudo-moving to dest
@@ -811,11 +819,15 @@ fi
 
 # === Elevate with environment preserved ===
 # Use -E to pass proxy env to root for dnf/curl within SCRIPT_PATH
-printf '%s' "$SUDO_PASS" | sudo -E -S bash SCRIPT_PATH 2>&1 || true
+printf '%s' "$SUDO_PASS" | sudo -E -S bash SCRIPT_PATH 2>&1
+_remote_rc=$?
 
 # Cleanup wrapper copy
 rm -f SCRIPT_PATH || true
-exit 0
+# Exit with the real result of the inner script (not an unconditional 0) so
+# callers of execute_remote_script can actually detect a failed remote run
+# instead of every invocation silently looking like a success.
+exit $_remote_rc
 WRAPPER
     chmod 644 "$SCRIPTS_DIR/run_script_wrapper.sh"
     sed -i "s|SCRIPT_PATH|$script_path|g" "$SCRIPTS_DIR/run_script_wrapper.sh"
@@ -823,13 +835,24 @@ WRAPPER
     ensure_SCRIPTS_DIR "$ip" || true
     copy_to_remote "$SCRIPTS_DIR/run_script_wrapper.sh" "$ip" "$SCRIPTS_DIR/run_script.sh" || true
 
+    # The remote command always removes run_script.sh AND exits with the
+    # wrapper's real exit code (captured into \$_rc before the cleanup rm),
+    # rather than the old "cmd && rm -f ..." — which both skipped cleanup on
+    # failure and, more importantly, discarded the failure itself the moment
+    # it was chained with &&. PIPESTATUS[0] is captured immediately after
+    # (not the pipeline's own status, which would be grep's) since this
+    # script has no `pipefail` set anywhere.
+    local _rc
     if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh' && rm -f '$SCRIPTS_DIR/run_script.sh'" 2>&1 | grep -v "^Connection to\|^Shared connection to"
+        sudo -u "$SUDO_USER" ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh'; _rc=\$?; rm -f '$SCRIPTS_DIR/run_script.sh'; exit \$_rc" 2>&1 | grep -v "^Connection to\|^Shared connection to"
+        _rc=${PIPESTATUS[0]}
     else
-        ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh' && rm -f '$SCRIPTS_DIR/run_script.sh'" 2>&1 | grep -v "^Connection to\|^Shared connection to"
+        ssh -tt $SSH_OPTS -l "$CURRENT_USER" "$ip" "env SUDO_PASS_B64='$PASS_B64' PROXY_HOST='${PROXY_HOST}' PROXY_PORT='${PROXY_PORT}' PROXY_USER='${PROXY_USER}' PROXY_PASSWORD='${PROXY_PASSWORD}' INTERNAL_REPO_DOMAINS='${INTERNAL_REPO_DOMAINS}' SKIP_SSL_VERIFY='${SKIP_SSL_VERIFY}' PROXY_STRATEGY='${PROXY_STRATEGY}' bash '$SCRIPTS_DIR/run_script.sh'; _rc=\$?; rm -f '$SCRIPTS_DIR/run_script.sh'; exit \$_rc" 2>&1 | grep -v "^Connection to\|^Shared connection to"
+        _rc=${PIPESTATUS[0]}
     fi
-    
+
     rm -f "$SCRIPTS_DIR/run_script_wrapper.sh"
+    return $_rc
 }
 
 # Helper function to run docker commands with proper permissions
@@ -1107,14 +1130,45 @@ find_bundle_root() {
 # Search common locations for a bundle archive and update OFFLINE_PACKAGE_SOURCE
 # in place. Returns 0 if found, 1 otherwise. Quiet on failure so callers can
 # decide what to do (auto mode falls through to online).
+# Reject auto-detected bundle candidates that aren't owned by root or the
+# invoking user, or that are group/world-writable. Without this, any local
+# user could drop a file matching our naming pattern into world-writable
+# /tmp and have it silently picked up and dpkg/rpm-installed as root with no
+# integrity verification at all. This only gates auto-detection — a bundle
+# explicitly named via --package-source=PATH is the operator's own choice
+# and isn't second-guessed here.
+_offline_bundle_is_trusted() {
+    local f="$1"
+    [ -e "$f" ] || return 1
+    local owner mode
+    owner=$(stat -c '%U' "$f" 2>/dev/null || stat -f '%Su' "$f" 2>/dev/null)
+    mode=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null)
+    if [ "$owner" != "root" ] && [ "$owner" != "$CURRENT_USER" ]; then
+        return 1
+    fi
+    mode="${mode: -3}"
+    local group_bit="${mode:1:1}" other_bit="${mode:2:1}"
+    case "$group_bit" in 2|3|6|7) return 1 ;; esac
+    case "$other_bit" in 2|3|6|7) return 1 ;; esac
+    return 0
+}
+
 auto_detect_offline_package() {
     if [ "$OFFLINE_PACKAGE_SOURCE" = "auto" ]; then
-        local found_archive=""
+        local found_archive="" candidate
         for location in "$ACTUAL_HOME" "/opt" "/tmp"; do
             [ -d "$location" ] || continue
-            found_archive=$(find "$location" -maxdepth 1 \
+            while IFS= read -r candidate; do
+                [ -n "$candidate" ] || continue
+                if _offline_bundle_is_trusted "$candidate"; then
+                    found_archive="$candidate"
+                    break
+                else
+                    echo "⚠️  Ignoring untrusted bundle candidate (not owned by root/$CURRENT_USER, or group/world-writable): $candidate" >&2
+                fi
+            done < <(find "$location" -maxdepth 1 \
                 \( -name "traefik-rp-packages-*.tar.gz" -o -name "traefik-rp-packages-*.zip" \) \
-                2>/dev/null | sort -r | head -1)
+                2>/dev/null | sort -r)
             if [ -n "$found_archive" ]; then
                 OFFLINE_PACKAGE_SOURCE="$found_archive"
                 return 0
@@ -1317,9 +1371,11 @@ EOF
 
     echo "    Using $_pf_py to extract bundle (no tar/network required)..."
 
-    local _pf_tmp="/tmp/traefik_rp_preflight_$$"
-    rm -rf "$_pf_tmp"
-    mkdir -p "$_pf_tmp" || { echo "❌ Could not create $_pf_tmp"; exit 1; }
+    # mktemp -d (not a predictable /tmp/..._$$ name + rm -rf/mkdir -p) so a
+    # local attacker can't pre-create a symlink at a guessable path and have
+    # root's extraction output redirected through it.
+    local _pf_tmp
+    _pf_tmp=$(mktemp -d /tmp/traefik_rp_preflight_XXXXXX) || { echo "❌ Could not create a temp dir for extraction"; exit 1; }
 
     if ! "$_pf_py" - "$archive" "$_pf_tmp" <<'PYEXTRACT'
 import os, sys, tarfile, zipfile, gzip, warnings
@@ -1327,23 +1383,39 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 src, dst = sys.argv[1], sys.argv[2]
 os.makedirs(dst, exist_ok=True)
+dst_real = os.path.realpath(dst)
+
+def is_safe(name):
+    # Reject absolute paths and any entry that would resolve outside dst
+    # (path traversal via "../" or similar) — the tarfile 'data' filter
+    # only guards against this on Python 3.12+, and zipfile.extractall
+    # never guards against it at all.
+    if os.path.isabs(name):
+        return False
+    target = os.path.realpath(os.path.join(dst, name))
+    return target == dst_real or target.startswith(dst_real + os.sep)
+
 try:
     if src.endswith(('.tar.gz', '.tgz')):
         # gzip + tarfile from stdlib — works without tar/gzip binaries
         # because zlib is statically linked into Python.
         with gzip.open(src, 'rb') as gz, tarfile.open(fileobj=gz, mode='r|') as tar:
-            # Python 3.12+ raises a RuntimeWarning about CVE-2007-4559
-            # ("data" filter is the new safer default). We control the
-            # bundle source so the new default is fine; suppress the noise.
-            try:
-                tar.extractall(dst, filter='data')
-            except TypeError:
-                # Python < 3.12: filter= isn't supported; default behaviour
-                # was the same as 'fully_trusted' which is fine for our
-                # known-good bundle.
-                tar.extractall(dst)
+            for member in tar:
+                if not is_safe(member.name):
+                    sys.exit(f"unsafe path in archive, refusing to extract: {member.name}")
+                # Python 3.12+ raises a RuntimeWarning about CVE-2007-4559
+                # ("data" filter is the new safer default) — we've already
+                # validated the path above, so this is just belt-and-braces.
+                try:
+                    tar.extract(member, dst, filter='data')
+                except TypeError:
+                    # Python < 3.12: filter= isn't supported.
+                    tar.extract(member, dst)
     elif src.endswith('.zip'):
         with zipfile.ZipFile(src) as z:
+            for name in z.namelist():
+                if not is_safe(name):
+                    sys.exit(f"unsafe path in archive, refusing to extract: {name}")
             z.extractall(dst)
     else:
         sys.exit(f"unsupported: {src}")
@@ -1463,10 +1535,26 @@ verify_bundle_compatibility() {
     local target_arch
     target_arch=$(uname -m)
 
+    # A manifest field that's present-but-blank is just as unverifiable as a
+    # missing manifest — silently skipping that specific comparison (the
+    # previous behaviour, via `[ -n "$b_family" ] &&`) let a hand-edited or
+    # corrupted manifest bypass compatibility checking entirely without ever
+    # needing --force-os-mismatch. Treat it the same as "no manifest.txt".
+    if [ -z "$b_family" ] || [ -z "$b_codename" ] || [ -z "$b_arch" ]; then
+        echo "⚠️  Bundle manifest.txt is missing OS_FAMILY/OS_CODENAME/ARCH — compatibility cannot be verified" >&2
+        if [ "$FORCE_OS_MISMATCH" != "yes" ]; then
+            echo "    Re-run with --force-os-mismatch to proceed anyway" >&2
+            return 1
+        fi
+        echo "    Continuing anyway because --force-os-mismatch is set." >&2
+        echo "$b_image"
+        return 0
+    fi
+
     local mismatch=""
-    [ -n "$b_family"   ] && [ "$b_family"   != "$OS_FAMILY"   ] && mismatch="${mismatch}  family:    bundle=${b_family}, target=${OS_FAMILY}\n"
-    [ -n "$b_codename" ] && [ "$b_codename" != "$OS_CODENAME" ] && mismatch="${mismatch}  codename:  bundle=${b_codename}, target=${OS_CODENAME}\n"
-    [ -n "$b_arch"     ] && [ "$b_arch"     != "$target_arch" ] && mismatch="${mismatch}  arch:      bundle=${b_arch}, target=${target_arch}\n"
+    [ "$b_family"   != "$OS_FAMILY"   ] && mismatch="${mismatch}  family:    bundle=${b_family}, target=${OS_FAMILY}\n"
+    [ "$b_codename" != "$OS_CODENAME" ] && mismatch="${mismatch}  codename:  bundle=${b_codename}, target=${OS_CODENAME}\n"
+    [ "$b_arch"     != "$target_arch" ] && mismatch="${mismatch}  arch:      bundle=${b_arch}, target=${target_arch}\n"
 
     if [ -n "$mismatch" ]; then
         echo "" >&2
@@ -1573,14 +1661,17 @@ prepare_offline_packages() {
     echo ""
 
     # Working directory layout matches what the install side expects.
-    local work_dir="/tmp/traefik_rp_offline_prep_$$"
+    # mktemp -d (not a predictable /tmp/..._$$ name + rm -rf/mkdir -p) so a
+    # local attacker can't pre-create a symlink at a guessable path and have
+    # root's package-download/build output redirected through it.
+    local work_dir
+    work_dir=$(mktemp -d /tmp/traefik_rp_offline_prep_XXXXXX) || { echo "❌ Could not create a temp dir for the bundle build"; exit 1; }
     local archive_basename="traefik-rp-packages-${OS_CODENAME}-${target_arch}-$(date +%Y%m%d)"
     local bundle_dir="${work_dir}/${archive_basename}"
     local pkg_dir="${bundle_dir}/packages"
     local img_dir="${bundle_dir}/images"
     local repo_dir="${bundle_dir}/repo"
 
-    rm -rf "$work_dir"
     mkdir -p "$pkg_dir" "$img_dir" "$repo_dir"
 
     # ----------------------------------------------------------------------
@@ -2320,8 +2411,13 @@ check_repository_connectivity() {
     echo "Local/Master Node:"
     echo "----------"
     
-    check_single_node "local" "" ""
-    LOCAL_CHECK_FAILED=$?
+    # Guarded via if/else (not a bare call + $?) so a non-zero return from
+    # check_single_node doesn't trip set -e before the status is captured.
+    if check_single_node "local" "" ""; then
+        LOCAL_CHECK_FAILED=0
+    else
+        LOCAL_CHECK_FAILED=$?
+    fi
     
     # Check if we should test backup nodes
     # Safe check: verify variable is set and equals "yes"
@@ -2384,8 +2480,7 @@ PREREQSCRIPT
                 execute_remote_script "$ip" "$_prereq_script" || true
                 rm -f "$_prereq_script"
 
-                check_single_node "remote" "$node" "$ip"
-                if [ $? -ne 0 ]; then
+                if ! check_single_node "remote" "$node" "$ip"; then
                     REMOTE_FAILURES=$((REMOTE_FAILURES + 1))
                 fi
             done
@@ -3047,7 +3142,7 @@ clean_orphaned_nodes() {
     read -s -p "  Enter sudo password for orphaned nodes: " _orphan_sudo_pass
     echo ""
     export SUDO_PASS="$_orphan_sudo_pass"
-    SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no}"
+    SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new}"
 
     local _orphan_count=0
     local _orphan_user="$CURRENT_USER"
@@ -3055,7 +3150,7 @@ clean_orphaned_nodes() {
     if [[ -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
         _ssh_key_opt="-i $ACTUAL_HOME/.ssh/id_rsa"
     fi
-    SSH_OPTS="-o StrictHostKeyChecking=no ${_ssh_key_opt}"
+    SSH_OPTS="-o StrictHostKeyChecking=accept-new ${_ssh_key_opt}"
 
     # If no SSH key exists, offer to generate one and copy to nodes
     if [[ ! -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
@@ -3068,7 +3163,7 @@ clean_orphaned_nodes() {
                 -f "$ACTUAL_HOME/.ssh/id_rsa" 2>/dev/null
             if [[ -f "$ACTUAL_HOME/.ssh/id_rsa" ]]; then
                 _ssh_key_opt="-i $ACTUAL_HOME/.ssh/id_rsa"
-                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
                 echo "  ✓ SSH key generated"
             else
                 echo "  ✗ Key generation failed — cannot proceed"
@@ -3103,7 +3198,7 @@ clean_orphaned_nodes() {
         echo -n "  Testing SSH connectivity to ${_oname} (${_oip}) as ${_orphan_user}... "
 
         if sudo -u "$SUDO_USER" ssh $_ssh_key_opt \
-            -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             -l "$_orphan_user" "$_oip" "echo ok" >/dev/null 2>&1; then
             echo "✓"
         else
@@ -3114,13 +3209,13 @@ clean_orphaned_nodes() {
                 echo ""
                 sudo -u "$SUDO_USER" ssh-copy-id \
                     -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
-                    -o StrictHostKeyChecking=no \
+                    -o StrictHostKeyChecking=accept-new \
                     "${_orphan_user}@${_oip}" \
                     && echo "  ✓ Key copied" \
                     || { echo "  ✗ Failed to copy key — skipping node"; continue; }
                 # Re-test
                 if ! sudo -u "$SUDO_USER" ssh $_ssh_key_opt \
-                    -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                    -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
                     -l "$_orphan_user" "$_oip" "echo ok" >/dev/null 2>&1; then
                     echo "  ✗ Still cannot connect — skipping node"
                     continue
@@ -3283,7 +3378,7 @@ if [[ "$1" == "--clean" ]]; then
                 export SUDO_PASS
                 
                 # Set up SSH options
-                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
             fi
         fi
     fi
@@ -3525,15 +3620,26 @@ REMOTECLEANUP
             sed -i "s/UNINSTALL_KEEPALIVED_FLAG/$UNINSTALL_KEEPALIVED_REMOTE/g" "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
             sed -i "s/UNINSTALL_DOCKER_FLAG/$UNINSTALL_DOCKER_REMOTE/g" "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
             
-            # Copy and execute
-            ensure_SCRIPTS_DIR "$node_ip" || true
-            copy_to_remote "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh" "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh" || true
-            execute_remote_script "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh" || true
-            
+            # Copy and execute — track each step so a failure isn't reported
+            # as success just because it was `|| true`-guarded against set -e.
+            # execute_remote_script now propagates the remote script's real
+            # exit code (it used to always return 0), so this actually means
+            # something.
+            local _cleanup_ok=true
+            ensure_SCRIPTS_DIR "$node_ip" || _cleanup_ok=false
+            copy_to_remote "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh" "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh" || _cleanup_ok=false
+            execute_remote_script "$node_ip" "$SCRIPTS_DIR/cleanup_traefik.sh" || _cleanup_ok=false
+
             # Cleanup temp files
             rm -f "$SCRIPTS_DIR/cleanup_remote_${node_name}.sh"
-            
-            echo "✓ Cleanup completed on $node_name"
+
+            if [[ "$_cleanup_ok" == true ]]; then
+                echo "✓ Cleanup completed on $node_name"
+            else
+                echo "⚠️  Cleanup on $node_name may be incomplete — one or more remote steps failed"
+                echo "   Traefik/Keepalived could still be running there. Verify manually:"
+                echo "     ssh ${CURRENT_USER}@${node_ip} 'docker ps; systemctl status keepalived'"
+            fi
             
         else
             # Local cleanup
@@ -4365,7 +4471,7 @@ extend_add_nodes() {
     echo "Existing nodes:"
     echo "  Master : ${MASTER_HOSTNAME} (${MASTER_IP}) — Priority 110"
     for i in "${!BACKUP_NODES[@]}"; do
-        local p=$((100 - (i * 10)))
+        local p=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
         echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) — Priority ${p}"
     done
     echo ""
@@ -4388,7 +4494,7 @@ extend_add_nodes() {
 
     for ((n=1; n<=new_count; n++)); do
         local new_idx=$(( start_idx + n - 1 ))
-        local priority=$(( 100 - (new_idx * 10) ))
+        local priority=$(( (100 - (new_idx * 10)) < 1 ? 1 : (100 - (new_idx * 10)) ))
 
         echo ""
         echo "New Backup Node #$((new_idx + 1)) (Priority ${priority}):"
@@ -4424,7 +4530,7 @@ extend_add_nodes() {
     echo "Updated node list:"
     echo "  Master : ${MASTER_HOSTNAME} (${MASTER_IP}) — Priority 110"
     for i in "${!BACKUP_NODES[@]}"; do
-        local p=$(( 100 - (i * 10) ))
+        local p=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
         echo "  Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) — Priority ${p}"
     done
     echo ""
@@ -4449,6 +4555,11 @@ extend_add_nodes() {
 
     if ! prompt_yn "Deploy new nodes now?" "y"; then
         echo ""
+        # Actually persist the new node(s) before claiming they're "saved" —
+        # this used to just print the message and return without ever
+        # calling save_config, silently discarding the registration.
+        snapshot_config "NODE_ADD" "Backup node(s) registered (not yet deployed)"
+        save_config
         echo "  New node(s) saved. Run this script again and choose"
         echo "  Reinstall to deploy them."
         return 0
@@ -4475,7 +4586,7 @@ extend_add_nodes() {
         fi
     fi
 
-    SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no}"
+    SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new}"
 
     # Sudo password — may already be set by the extend-mode dispatcher
     if [ -z "${SUDO_PASS:-}" ]; then
@@ -4515,15 +4626,19 @@ extend_add_nodes() {
         local _copy_ok=false
         local _copy_err=""
 
-        # Try with sshpass if available (non-interactive password passing)
+        # Try with sshpass if available (non-interactive password passing).
+        # SSHPASS is set as an env-var prefix (sshpass -e) rather than passed
+        # via -p, so the password lands in this process's environment (only
+        # readable via /proc/<pid>/environ by its owner or root) instead of
+        # its argv (visible to every local user via plain `ps aux`).
         if command -v sshpass &>/dev/null && [[ -n "$SUDO_PASS" ]]; then
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                _copy_err=$(sudo -u "$SUDO_USER" sshpass -p "$SUDO_PASS" \
+                _copy_err=$(sudo -u "$SUDO_USER" env SSHPASS="$SUDO_PASS" sshpass -e \
                     ssh-copy-id -o StrictHostKeyChecking=accept-new \
                     -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
                     -o "User=$CURRENT_USER" "$_ip" 2>&1) && _copy_ok=true
             else
-                _copy_err=$(sshpass -p "$SUDO_PASS" \
+                _copy_err=$(SSHPASS="$SUDO_PASS" sshpass -e \
                     ssh-copy-id -o StrictHostKeyChecking=accept-new \
                     -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
                     -o "User=$CURRENT_USER" "$_ip" 2>&1) && _copy_ok=true
@@ -4554,12 +4669,15 @@ extend_add_nodes() {
 
         echo -n "  ${_n} — verify SSH... "
         local _test
+        # `|| true` so a failed/unreachable ssh (exit 255 — exactly the case
+        # this check exists to detect) doesn't trip set -e before the
+        # following grep gets a chance to report "FAILED" gracefully.
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
             _test=$(sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=5 \
-                $SSH_OPTS -l "$CURRENT_USER" "$_ip" "echo SSH_TEST_OK" 2>/dev/null)
+                $SSH_OPTS -l "$CURRENT_USER" "$_ip" "echo SSH_TEST_OK" 2>/dev/null) || true
         else
             _test=$(ssh -o BatchMode=yes -o ConnectTimeout=5 \
-                $SSH_OPTS -l "$CURRENT_USER" "$_ip" "echo SSH_TEST_OK" 2>/dev/null)
+                $SSH_OPTS -l "$CURRENT_USER" "$_ip" "echo SSH_TEST_OK" 2>/dev/null) || true
         fi
         if echo "$_test" | grep -q "SSH_TEST_OK"; then
             echo "✓"
@@ -4572,6 +4690,10 @@ extend_add_nodes() {
     if [ "$_ssh_ok" = false ]; then
         echo ""
         echo "⚠️  SSH verification failed for one or more nodes."
+        # Same fix as the decline-to-deploy path above — actually save the
+        # registration instead of just claiming to.
+        snapshot_config "NODE_ADD" "Backup node(s) registered (SSH verification failed)"
+        save_config
         echo "   New node(s) saved to config. Fix SSH access then:"
         echo "   run the script again and choose Reinstall."
         return 0
@@ -4884,43 +5006,6 @@ EOF
 # ==========================================
 # Extend Mode — Option 4: Add/Edit Component Servers/Services
 # ==========================================
-
-# Internal helper — print a numbered flat list of all current service URLs.
-# Populates caller-scoped arrays _ec_svc_idx and _ec_url_idx (parallel to
-# _ec_flat_svcs / _ec_flat_urls) so the caller can look up which service
-# and URL a chosen number corresponds to.
-#
-# Args: $1 = name-ref to _svc_names array
-#       $2 = name-ref to _svc_vars array
-#       $3 = output name-ref for _ec_flat_svcs  (service name per entry)
-#       $4 = output name-ref for _ec_flat_urls   (url per entry)
-#
-# Because bash 3 doesn't support namerefs we use a simpler approach:
-# the function writes into globals _ec_flat_svcs / _ec_flat_urls directly.
-_ec_build_flat_list() {
-    local -n _bfl_names="$1"
-    local -n _bfl_vars="$2"
-    _ec_flat_svcs=()
-    _ec_flat_urls=()
-
-    local _n=1
-    for i in "${!_bfl_names[@]}"; do
-        local _svc="${_bfl_names[$i]}"
-        local _var="${_bfl_vars[$i]}"
-        local _urls_raw="${!_var}"
-        if [[ -z "$_urls_raw" ]]; then continue; fi
-
-        IFS=',' read -ra _url_arr <<< "$_urls_raw"
-        for _u in "${_url_arr[@]}"; do
-            if [[ -z "$_u" ]]; then continue; fi
-            _ec_flat_svcs+=("$_svc")
-            _ec_flat_urls+=("$_u")
-            printf "  [%2d]  %-24s  %s\n" "$_n" "${_svc}:" "$_u"
-            (( _n++ ))
-        done
-    done
-    return 0
-}
 
 # Remove a URL from a comma-separated string. Prints the updated string.
 _ec_remove_url() {
@@ -6228,7 +6313,12 @@ extend_edit_hl7() {
             local _addr="    address: ':${_np}'"
             if [[ -n "$_cmt" ]]; then _addr="${_addr} # ${_cmt}"; fi
 
-            if grep -q "^  ${_ep_name}:" "${_tmp_t}"; then
+            if grep -qx "  ${_ep_name}:" "${_tmp_t}"; then
+                # grep -x (exact whole-line match) here, not a loose prefix
+                # match — it must agree with the awk's own `$0 == ep` test
+                # below, or a line with trailing content (e.g. a hand-added
+                # comment) would pass this grep but never actually match in
+                # awk, silently leaving the address line stale.
                 local _tmp_upd
                 _tmp_upd=$(mktemp)
                 awk -v ep="  ${_ep_name}:" -v addr="${_addr}" '
@@ -6237,9 +6327,16 @@ extend_edit_hl7() {
                     in_block && !/^    /        { in_block=0 }
                     { print }
                 ' "${_tmp_t}" > "${_tmp_upd}"
-                cp "${_tmp_upd}" "${_tmp_t}"
+                # Verify the address line actually landed before claiming
+                # success — awk can silently no-op if the file's structure
+                # doesn't match what it expects.
+                if grep -qF "${_addr}" "${_tmp_upd}"; then
+                    cp "${_tmp_upd}" "${_tmp_t}"
+                    echo "  ✓ traefik.yml entrypoint ${_ep_name} updated"
+                else
+                    echo "  ⚠️  Could not update traefik.yml entrypoint ${_ep_name} — address line not found where expected; edit ${_traefik_cfg} manually"
+                fi
                 rm -f "${_tmp_upd}"
-                echo "  ✓ traefik.yml entrypoint ${_ep_name} updated"
             else
                 local _tmp2
                 _tmp2=$(mktemp)
@@ -6256,9 +6353,15 @@ extend_edit_hl7() {
                     }
                     { print }
                 ' "${_tmp_t}" > "${_tmp2}"
-                cp "${_tmp2}" "${_tmp_t}"
+                # Same verification as the update path above — confirm the
+                # insertion actually happened before reporting success.
+                if grep -qF "${_addr}" "${_tmp2}"; then
+                    cp "${_tmp2}" "${_tmp_t}"
+                    echo "  ✓ traefik.yml entrypoint ${_ep_name} added"
+                else
+                    echo "  ⚠️  Could not add traefik.yml entrypoint ${_ep_name} — no insertion point found under entryPoints:; edit ${_traefik_cfg} manually"
+                fi
                 rm -f "${_tmp2}"
-                echo "  ✓ traefik.yml entrypoint ${_ep_name} added"
             fi
             _pidx=$(( _pidx + 1 ))
         done
@@ -6940,7 +7043,7 @@ deploy_to_backup_nodes() {
 
         local node="${BACKUP_NODES[$i]}"
         local ip="${BACKUP_IPS[$i]}"
-        local priority=$((100 - (i * 10)))
+        local priority=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
 
         echo ""
         echo ":: Backup Node $((i+1))/${#BACKUP_NODES[@]}: $node ($ip)"
@@ -6954,6 +7057,53 @@ write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
 #!/bin/bash
 set -e
 set -x
+
+# Belt-and-braces: also clean up the staged /tmp files (deployment.config
+# carries the plaintext TLS private key + Keepalived AUTH_PASS) on ANY exit
+# from this script, not just the successful-completion path at the bottom —
+# an install failure under set -e must not leave secrets behind in /tmp either.
+trap 'rm -f /tmp/deployment.config /tmp/clinical_conf.yml /tmp/hl7.yml /tmp/diagnostics_monitor.yml' EXIT
+
+# If the existing install gets backed up below and a later step then fails
+# (pull failure, offline rpm/dpkg failure, etc.), this node was previously
+# left with no running Traefik at all and no attempt to restore what was
+# working before. ERR fires under the same conditions set -e would abort on
+# (i.e. NOT for the many `|| true`-guarded fallbacks throughout this script),
+# so it's a reliable "something genuinely failed" signal here.
+_ROLLBACK_BACKUP_DIR=""
+_ROLLBACK_DONE=false
+rollback_on_failure() {
+    [[ "$_ROLLBACK_DONE" == true ]] && return 0
+    _ROLLBACK_DONE=true
+    [[ -n "$_ROLLBACK_BACKUP_DIR" && -d "$_ROLLBACK_BACKUP_DIR" ]] || return 0
+
+    echo ""
+    echo "❌ Installation failed after the existing Traefik install was backed up."
+    echo "   Attempting to restore the previous install from: ${_ROLLBACK_BACKUP_DIR}"
+
+    docker stop traefik 2>/dev/null || true
+    docker rm traefik 2>/dev/null || true
+
+    # Clear out whatever the failed new install partially wrote, but never
+    # touch backups/ itself — that's where the restore source lives.
+    find /opt/indica/traefik -mindepth 1 -maxdepth 1 \
+        ! -path /opt/indica/traefik/backups \
+        -exec rm -rf {} \; 2>/dev/null || true
+    find "${_ROLLBACK_BACKUP_DIR}" -mindepth 1 -maxdepth 1 \
+        -exec mv {} /opt/indica/traefik/ \; 2>/dev/null || true
+
+    if [[ -f /opt/indica/traefik/docker-compose.yaml ]]; then
+        if (cd /opt/indica/traefik && docker compose up -d 2>&1); then
+            echo "✓ Previous Traefik install restored and restarted"
+        else
+            echo "⚠️  Restored the previous files but the old Traefik container failed to start."
+            echo "   Manual intervention needed: cd /opt/indica/traefik && docker compose up -d"
+        fi
+    else
+        echo "⚠️  No docker-compose.yaml found after restore — manual intervention needed."
+    fi
+}
+trap 'rollback_on_failure' ERR
 
 echo ""
 echo ""
@@ -6993,6 +7143,9 @@ if [[ -d "/opt/indica/traefik" ]]; then
         ! -path "/opt/indica/traefik/backups/*" \
         -exec mv {} "${_backup_dir}/" \; 2>/dev/null || true
     echo "✓ Backed up"
+    # From this point on, if installation fails, rollback_on_failure (ERR
+    # trap) will try to restore what was just moved out of the way.
+    _ROLLBACK_BACKUP_DIR="${_backup_dir}"
     # Stop existing container
     docker stop traefik 2>/dev/null || true
     docker rm traefik 2>/dev/null || true
@@ -7068,7 +7221,14 @@ echo "=== Installing on $(hostname) ==="
 CONFIG_FILE="/tmp/deployment.config"
 
 if [ -f "$CONFIG_FILE" ]; then
+    # set -x is active for this whole script (troubleshooting aid) but must
+    # not trace this specific line — deployment.config assigns SSL_KEY_CONTENT
+    # (the TLS private key) and AUTH_PASS (Keepalived shared secret), and a
+    # traced `+ VAR=value` line would otherwise leak both into the install
+    # log captured over the master's SSH session.
+    set +x
     source "$CONFIG_FILE"
+    set -x
     echo "✓ Configuration loaded from $CONFIG_FILE"
 else
     echo "ERROR: Configuration file not found at $CONFIG_FILE"
@@ -7169,9 +7329,10 @@ BANNER
 
         echo "  Using $_bn_py to extract bundle..."
 
-        _bn_pf_tmp="/tmp/traefik_rp_bn_preflight_$$"
-        rm -rf "$_bn_pf_tmp"
-        mkdir -p "$_bn_pf_tmp"
+        # mktemp -d (not a predictable /tmp/..._$$ name + rm -rf/mkdir -p) so
+        # a local attacker on this node can't pre-create a symlink at a
+        # guessable path and have root's extraction output redirected.
+        _bn_pf_tmp=$(mktemp -d /tmp/traefik_rp_bn_preflight_XXXXXX) || { echo "❌ Could not create a temp dir for extraction"; exit 1; }
 
         if ! "$_bn_py" - "$OFFLINE_ARCHIVE_PATH" "$_bn_pf_tmp" <<'PYEXTRACT'
 import os, sys, tarfile, zipfile, gzip, warnings
@@ -7179,14 +7340,32 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 src, dst = sys.argv[1], sys.argv[2]
 os.makedirs(dst, exist_ok=True)
+dst_real = os.path.realpath(dst)
+
+def is_safe(name):
+    # Reject absolute paths and any entry that would resolve outside dst
+    # (path traversal via "../" or similar) — the tarfile 'data' filter
+    # only guards against this on Python 3.12+, and zipfile.extractall
+    # never guards against it at all.
+    if os.path.isabs(name):
+        return False
+    target = os.path.realpath(os.path.join(dst, name))
+    return target == dst_real or target.startswith(dst_real + os.sep)
+
 if src.endswith(('.tar.gz', '.tgz')):
     with gzip.open(src, 'rb') as gz, tarfile.open(fileobj=gz, mode='r|') as tar:
-        try:
-            tar.extractall(dst, filter='data')
-        except TypeError:
-            tar.extractall(dst)
+        for member in tar:
+            if not is_safe(member.name):
+                sys.exit(f"unsafe path in archive, refusing to extract: {member.name}")
+            try:
+                tar.extract(member, dst, filter='data')
+            except TypeError:
+                tar.extract(member, dst)
 elif src.endswith('.zip'):
     with zipfile.ZipFile(src) as z:
+        for name in z.namelist():
+            if not is_safe(name):
+                sys.exit(f"unsafe path in archive, refusing to extract: {name}")
         z.extractall(dst)
 else:
     sys.exit(f"unsupported: {src}")
@@ -7777,6 +7956,9 @@ systemctl enable keepalived
 systemctl start keepalived
 systemctl restart keepalived
 
+# (staged /tmp files, including deployment.config's plaintext secrets, are
+# removed by the EXIT trap set at the top of this script)
+
 echo ""
 echo "✓ Installation complete on backup node"
 echo "✓ Traefik: Running"
@@ -7880,7 +8062,14 @@ PYEOF
         echo "This may take 5-10 minutes..."
         echo ""
 
-        execute_remote_script "$ip" "$SCRIPTS_DIR/install_backup.sh"
+        # execute_remote_script now propagates the remote install's real exit
+        # code (previously it always returned 0) — guard the call so one
+        # node's failed install doesn't abort this whole loop under set -e
+        # and silently skip every node after it; the verification checks
+        # below already report per-node problems without stopping.
+        if ! execute_remote_script "$ip" "$SCRIPTS_DIR/install_backup.sh"; then
+            echo "⚠️  Installation script reported a failure on $node — verifying anyway:"
+        fi
 
         rm -f "$SCRIPTS_DIR/install_backup_${node}.sh" /tmp/clinical_conf.yml /tmp/hl7.yml /tmp/diagnostics_monitor.yml
 
@@ -7955,7 +8144,7 @@ extend_remove_nodes() {
     echo "  Current nodes:"
     echo "  Master : ${MASTER_HOSTNAME} (${MASTER_IP}) — cannot be removed here"
     for i in "${!BACKUP_NODES[@]}"; do
-        local p=$(( 100 - (i * 10) ))
+        local p=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
         printf "  [%d] Backup %d: %-20s (%s) — Priority %d\n" \
             "$(( i + 1 ))" "$(( i + 1 ))" "${BACKUP_NODES[$i]}" "${BACKUP_IPS[$i]}" "$p"
     done
@@ -8050,7 +8239,7 @@ extend_remove_nodes() {
         read -s -p "  Enter YOUR sudo password for remote hosts: " SUDO_PASS
         echo ""
         export SUDO_PASS
-        SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no}"
+        SSH_OPTS="${SSH_OPTS:--i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new}"
     fi
 
     # Clean each node remotely
@@ -8266,8 +8455,13 @@ REMOVECLEANUP
 
             echo "  ✓ Keepalived removed from master"
         fi
-    snapshot_config "NODE_REMOVE" "Backup node(s) removed"
     fi
+
+    # Snapshot/audit before every save — not just the "removed all nodes"
+    # branch above, which used to be the only path that called this,
+    # leaving a partial removal (e.g. 1 of 3 nodes) with no pre-change
+    # backup and no audit trail, unlike every other config-mutating path.
+    snapshot_config "NODE_REMOVE" "Backup node(s) removed"
 
     # Clean up remote temp dirs and save
     cleanup_remote_scripts_dirs
@@ -8337,7 +8531,7 @@ extend_replace_node() {
     local _old_node="${BACKUP_NODES[$_ridx]}"
     local _old_ip="${BACKUP_IPS[$_ridx]}"
     local _old_iface="${BACKUP_INTERFACES[$_ridx]}"
-    local _priority=$(( 100 - (_ridx * 10) ))
+    local _priority=$(( (100 - (_ridx * 10)) < 1 ? 1 : (100 - (_ridx * 10)) ))
 
     echo ""
     echo "  Replacing: ${_old_node} (${_old_ip})"
@@ -8380,7 +8574,7 @@ extend_replace_node() {
     echo ""
 
     local _reachable=false
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
         -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_old_ip" \
         "echo ok" >/dev/null 2>&1; then
         _reachable=true
@@ -8443,12 +8637,12 @@ REPLACECLEANUP
     local _copy_ok=false
     if command -v sshpass &>/dev/null && [[ -n "$_new_node_pass" ]]; then
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            sudo -u "$SUDO_USER" sshpass -p "$_new_node_pass" \
+            sudo -u "$SUDO_USER" env SSHPASS="$_new_node_pass" sshpass -e \
                 ssh-copy-id -o StrictHostKeyChecking=accept-new \
                 -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
                 -o "User=$CURRENT_USER" "$_new_ip" 2>/dev/null && _copy_ok=true
         else
-            sshpass -p "$_new_node_pass" \
+            SSHPASS="$_new_node_pass" sshpass -e \
                 ssh-copy-id -o StrictHostKeyChecking=accept-new \
                 -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
                 -o "User=$CURRENT_USER" "$_new_ip" 2>/dev/null && _copy_ok=true
@@ -8480,7 +8674,7 @@ REPLACECLEANUP
     echo "  Detecting network interface on ${_new_node}..."
     local _detected_iface=""
     _detected_iface=$(ssh -o BatchMode=yes -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=no \
+        -o StrictHostKeyChecking=accept-new \
         -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_new_ip" \
         "ip -o addr show | grep 'inet ${_new_ip}' | awk '{print \$2}' | head -1" 2>/dev/null \
         | sed 's/@.*//')
@@ -8489,7 +8683,7 @@ REPLACECLEANUP
         echo "  ✓ Detected interface: ${_detected_iface}"
         echo ""
         echo "  Available interfaces on ${_new_node}:"
-        ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_new_ip" \
             "ip -o link show | awk '{print \"    - \" \$2}' | sed 's/:$//' | grep -v lo" 2>/dev/null || true
         echo ""
@@ -8549,7 +8743,7 @@ extend_edit_nodes() {
         printf "  %-12s %-28s %s\n" "Master" "${MASTER_HOSTNAME:-$(hostname -s)}" "(${MASTER_IP:-$(hostname -I | awk '{print $1}')})"
         if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
             for i in "${!BACKUP_NODES[@]}"; do
-                local p=$(( 100 - (i * 10) ))
+                local p=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
                 printf "  %-12s %-28s %s\n" \
                     "Backup $(( i + 1 ))" "${BACKUP_NODES[$i]}" "(${BACKUP_IPS[$i]})"
             done
@@ -8602,6 +8796,10 @@ extend_edit_nodes() {
 check_keepalived_state() {
     local _vip="${VIRTUAL_IP:-}"
     if [[ -z "$_vip" ]]; then return 0; fi
+    # Match "inet <vip>/" (as it actually appears in `ip addr show` output),
+    # not a bare substring — otherwise a VIP like 10.0.0.5 false-matches a
+    # different live address such as 10.0.0.50/24.
+    local _vip_re="${_vip//./\\.}"
 
     echo ""
     echo "  Keepalived / Virtual IP:"
@@ -8609,7 +8807,7 @@ check_keepalived_state() {
 
     # Check master
     local _master_has_vip=false
-    if ip addr show 2>/dev/null | grep -q "$_vip"; then
+    if ip addr show 2>/dev/null | grep -qE "inet ${_vip_re}/"; then
         _master_has_vip=true
         printf "  %-12s %-28s →  MASTER  ✓  (VIP %s assigned)\n" \
             "Master" "${MASTER_HOSTNAME:-$(hostname -s)}" "$_vip"
@@ -8624,14 +8822,14 @@ check_keepalived_state() {
         local _bip="${BACKUP_IPS[$i]}"
         local _vip_held=false
 
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_bip" \
-            "ip addr show 2>/dev/null | grep -q '$_vip' && echo VIP_HELD" 2>/dev/null | grep -q VIP_HELD; then
+            "ip addr show 2>/dev/null | grep -qE 'inet ${_vip_re}/' && echo VIP_HELD" 2>/dev/null | grep -q VIP_HELD; then
             _vip_held=true
         fi
 
         local _kv_running=false
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_bip" \
             "systemctl is-active keepalived 2>/dev/null | grep -q active && echo RUNNING" 2>/dev/null | grep -q RUNNING; then
             _kv_running=true
@@ -8663,7 +8861,7 @@ check_ssh_key_rotation() {
     for i in "${!BACKUP_NODES[@]}"; do
         local _bn="${BACKUP_NODES[$i]}"
         local _bip="${BACKUP_IPS[$i]}"
-        if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
             -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_bip" \
             "echo ok" >/dev/null 2>&1; then
             if [[ "$_key_issues" == false ]]; then
@@ -8687,14 +8885,14 @@ check_ssh_key_rotation() {
             for i in "${!BACKUP_NODES[@]}"; do
                 local _bn="${BACKUP_NODES[$i]}"
                 local _bip="${BACKUP_IPS[$i]}"
-                if ! ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+                if ! ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new \
                     -i "$ACTUAL_HOME/.ssh/id_rsa" -l "$CURRENT_USER" "$_bip" \
                     "echo ok" >/dev/null 2>&1; then
                     echo -n "  Re-copying key to ${_bn}... "
                     ssh-keygen -R "$_bip" 2>/dev/null || true
                     ssh-keygen -R "$_bn"  2>/dev/null || true
                     if command -v sshpass &>/dev/null; then
-                        sshpass -p "$_rekey_pass" ssh-copy-id \
+                        SSHPASS="$_rekey_pass" sshpass -e ssh-copy-id \
                             -o StrictHostKeyChecking=accept-new \
                             -i "$ACTUAL_HOME/.ssh/id_rsa.pub" \
                             -o "User=$CURRENT_USER" "$_bip" 2>/dev/null \
@@ -8751,11 +8949,11 @@ show_status() {
             local _bip="${BACKUP_IPS[$i]}"
             local _bstatus="✗ unreachable"
             if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
+                -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
                 "echo ok" >/dev/null 2>&1; then
                 local _bt
                 _bt=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
-                    -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
+                    -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
                     "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
                      sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
                      sudo docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null" \
@@ -8779,16 +8977,24 @@ show_status() {
         _expiry=$(openssl x509 -noout -enddate -in "$CERT_FILE" 2>/dev/null | cut -d= -f2)
         if [[ -n "$_expiry" ]]; then
             local _exp_epoch _now_epoch
+            # `|| true` — if BOTH the GNU and BSD date parse attempts fail
+            # (unexpected enddate format), this bare assignment would
+            # otherwise trip set -e and abort the whole status display
+            # instead of just falling back to "unknown" below.
             _exp_epoch=$(date -d "$_expiry" +%s 2>/dev/null || \
-                date -j -f "%b %d %T %Y %Z" "$_expiry" +%s 2>/dev/null)
+                date -j -f "%b %d %T %Y %Z" "$_expiry" +%s 2>/dev/null) || true
             _now_epoch=$(date +%s)
-            _days_left=$(( (_exp_epoch - _now_epoch) / 86400 ))
-            if (( _days_left <= 0 )); then
-                printf "  %-10s →  EXPIRED  ✗\n" "Status"
-            elif (( _days_left <= 30 )); then
-                printf "  %-10s →  Expires in %d days  ⚠\n" "Status" "$_days_left"
+            if [[ -z "$_exp_epoch" ]]; then
+                printf "  %-10s →  Could not parse certificate expiry date\n" "Status"
             else
-                printf "  %-10s →  Valid (%d days remaining)  ✓\n" "Status" "$_days_left"
+                _days_left=$(( (_exp_epoch - _now_epoch) / 86400 ))
+                if (( _days_left <= 0 )); then
+                    printf "  %-10s →  EXPIRED  ✗\n" "Status"
+                elif (( _days_left <= 30 )); then
+                    printf "  %-10s →  Expires in %d days  ⚠\n" "Status" "$_days_left"
+                else
+                    printf "  %-10s →  Valid (%d days remaining)  ✓\n" "Status" "$_days_left"
+                fi
             fi
             printf "  %-10s →  %s\n" "Expiry" "$_expiry"
         fi
@@ -8801,7 +9007,11 @@ show_status() {
         echo ""
         echo "  Keepalived / Virtual IP:"
         echo ""
-        if ip addr show 2>/dev/null | grep -q "$VIRTUAL_IP"; then
+        # Match "inet <vip>/" (as it actually appears in `ip addr show`
+        # output), not a bare substring — otherwise a VIP like 10.0.0.5
+        # false-matches a different live address such as 10.0.0.50/24.
+        local _vip_re="${VIRTUAL_IP//./\\.}"
+        if ip addr show 2>/dev/null | grep -qE "inet ${_vip_re}/"; then
             printf "  %-12s %-28s →  MASTER  ✓  (VIP %s assigned)\n" \
                 "Master" "${MASTER_HOSTNAME:-$(hostname -s)}" "$VIRTUAL_IP"
         else
@@ -8813,13 +9023,13 @@ show_status() {
             local _bip="${BACKUP_IPS[$i]}"
             local _vip_held=false _kv_running=false
             if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
-                "ip addr show 2>/dev/null | grep -q '$VIRTUAL_IP' && echo VIP_HELD" \
+                -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
+                "ip addr show 2>/dev/null | grep -qE 'inet ${_vip_re}/' && echo VIP_HELD" \
                 2>/dev/null | grep -q VIP_HELD; then
                 _vip_held=true
             fi
             if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
+                -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
                 "systemctl is-active keepalived 2>/dev/null | grep -q active && echo RUNNING" \
                 2>/dev/null | grep -q RUNNING; then
                 _kv_running=true
@@ -8847,7 +9057,7 @@ show_status() {
             local _bn="${BACKUP_NODES[$i]}"
             local _bip="${BACKUP_IPS[$i]}"
             if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=no -l "$CURRENT_USER" "$_bip" \
+                -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
                 "echo ok" >/dev/null 2>&1; then
                 printf "  %-12s %-28s →  ✓\n" "Backup $(( i+1 ))" "$_bn"
             else
@@ -8988,15 +9198,23 @@ prompt_use_existing_config() {
             _expiry=$(openssl x509 -noout -enddate -in "$_peek_cert_file" 2>/dev/null | cut -d= -f2)
             if [[ -n "$_expiry" ]]; then
                 local _exp_epoch _now_epoch
-                _exp_epoch=$(date -d "$_expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$_expiry" +%s 2>/dev/null)
+                # `|| true` — same set -e pitfall as show_status: if both the
+                # GNU and BSD date parse attempts fail, this bare assignment
+                # would otherwise abort the whole menu instead of just
+                # falling back to "unknown" below.
+                _exp_epoch=$(date -d "$_expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$_expiry" +%s 2>/dev/null) || true
                 _now_epoch=$(date +%s)
-                _days_left=$(( (_exp_epoch - _now_epoch) / 86400 ))
-                if (( _days_left <= 0 )); then
-                    _peek_cert_status="EXPIRED"
-                elif (( _days_left <= 30 )); then
-                    _peek_cert_status="Expires in ${_days_left} days  ⚠"
+                if [[ -z "$_exp_epoch" ]]; then
+                    _peek_cert_status="Could not parse expiry date"
                 else
-                    _peek_cert_status="Valid  (${_days_left} days remaining)"
+                    _days_left=$(( (_exp_epoch - _now_epoch) / 86400 ))
+                    if (( _days_left <= 0 )); then
+                        _peek_cert_status="EXPIRED"
+                    elif (( _days_left <= 30 )); then
+                        _peek_cert_status="Expires in ${_days_left} days  ⚠"
+                    else
+                        _peek_cert_status="Valid  (${_days_left} days remaining)"
+                    fi
                 fi
             fi
         elif [[ -n "$_peek_cert_file" ]]; then
@@ -9032,12 +9250,12 @@ prompt_use_existing_config() {
                     local _ssh_key="-i $ACTUAL_HOME/.ssh/id_rsa"
                     [[ ! -f "$ACTUAL_HOME/.ssh/id_rsa" ]] && _ssh_key=""
                     if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=3 \
-                        -o StrictHostKeyChecking=no \
+                        -o StrictHostKeyChecking=accept-new \
                         -l "$CURRENT_USER" "$_bip" \
                         "echo ok" >/dev/null 2>&1; then
                         local _btraefik
                         _btraefik=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=3 \
-                            -o StrictHostKeyChecking=no \
+                            -o StrictHostKeyChecking=accept-new \
                             -l "$CURRENT_USER" "$_bip" \
                             "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
                              sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
@@ -9129,7 +9347,7 @@ prompt_use_existing_config() {
                     read -s -p "Enter YOUR sudo password for remote hosts: " SUDO_PASS
                     echo ""
                     export SUDO_PASS
-                    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
                     echo ""
                 fi
 
@@ -9146,7 +9364,7 @@ prompt_use_existing_config() {
                 echo ""
                 log "User selected: Status Check"
                 source "$CONFIG_FILE" 2>/dev/null || true
-                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
                 show_status
                 ;;
             3)
@@ -9161,7 +9379,7 @@ prompt_use_existing_config() {
                     read -s -p "Enter YOUR sudo password for remote hosts: " SUDO_PASS
                     echo ""
                     export SUDO_PASS
-                    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
                     echo ""
 
                     # Check SSH key health — detect rotation silently
@@ -9436,11 +9654,17 @@ install_packages() {
         sudo -E bash -c 'echo "[dnf env] http_proxy=${http_proxy:-<unset>} HTTPS_PROXY=${HTTPS_PROXY:-<unset>} no_proxy=${no_proxy:-<unset>}"' >> "$LOGFILE" 2>/dev/null || true
         # DNF uses environment proxy (http_proxy/https_proxy/no_proxy) automatically
         # Or explicit --setopt=proxy if DNF_PROXY_OPT is set
-        if sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+        #
+        # Check PIPESTATUS[0] (dnf's real exit code), not the if's own status —
+        # this pipeline ends in `tee`, which exits 0 regardless of whether dnf
+        # failed, and pipefail is never set anywhere in this script.
+        sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"
+        if [ "${PIPESTATUS[0]}" -eq 0 ]; then
             log "✓ Packages installed"
         else
             log "Trying with --nobest..."
-            if sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"; then
+            sudo -E dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"
+            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
                 log "✓ Packages installed (older versions)"
             else
                 exit_on_error "Failed to install: ${packages[*]}"
@@ -9449,11 +9673,12 @@ install_packages() {
 
     elif command -v yum &>/dev/null; then
         log "Installing via YUM (strategy: ${PROXY_STRATEGY})..."
-        if sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"; then
+        sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" 2>&1 | tee -a "$LOGFILE"
+        if [ "${PIPESTATUS[0]}" -eq 0 ]; then
             log "✓ Packages installed"
         else
-            sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE" || \
-                exit_on_error "Failed to install: ${packages[*]}"
+            sudo -E yum ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install "${packages[@]}" --nobest 2>&1 | tee -a "$LOGFILE"
+            [ "${PIPESTATUS[0]}" -eq 0 ] || exit_on_error "Failed to install: ${packages[*]}"
         fi
     else
         exit_on_error "No supported package manager found"
@@ -9550,7 +9775,7 @@ prompt_multi_node_deployment() {
         # Get backup node information with interface detection
         local all_valid=true
         for i in $(seq 1 "$BACKUP_NODE_COUNT"); do
-            local priority=$((100 - ((i - 1) * 10)))
+            local priority=$(( (100 - ((i - 1) * 10)) < 1 ? 1 : (100 - ((i - 1) * 10)) ))
     
             echo "Backup Node #$i (priority $priority):"
     
@@ -9619,7 +9844,7 @@ prompt_multi_node_deployment() {
         echo ""
         echo "Backup Nodes:"
         for i in "${!BACKUP_NODES[@]}"; do
-            priority=$((100 - (i * 10)))
+            priority=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
             echo "  Backup $((i+1)): ${BACKUP_NODES[$i]}"
             echo "    IP: ${BACKUP_IPS[$i]}"
             echo "    Interface: ${BACKUP_INTERFACES[$i]}"
@@ -9717,15 +9942,22 @@ check_host_resolution() {
     echo "${_ip}    ${_host}" >> /etc/hosts
     echo "  ✓ Added ${_host} → ${_ip} to /etc/hosts" >&3
 
-    # Store in HOSTS_ENTRIES (avoid duplicates)
+    # Store in HOSTS_ENTRIES (avoid duplicates). HOSTS_ENTRIES is pipe-separated
+    # host:ip pairs, so an entry must be anchored to a "|" or string-start
+    # boundary — an unanchored substring match (e.g. matching "db:" against
+    # "proddb:1.1.1.1") would silently repoint an unrelated existing host.
     local _new_entry="${_host}:${_ip}"
+    local _host_re="${_host//./\\.}"
     if [[ -z "$HOSTS_ENTRIES" ]]; then
         HOSTS_ENTRIES="$_new_entry"
-    elif ! echo "$HOSTS_ENTRIES" | grep -q "^${_host}:\|${_host}:"; then
+    elif ! echo "$HOSTS_ENTRIES" | grep -qE "(^|\|)${_host_re}:"; then
         HOSTS_ENTRIES="${HOSTS_ENTRIES}|${_new_entry}"
     else
-        # Update existing entry
-        HOSTS_ENTRIES=$(echo "$HOSTS_ENTRIES" | sed "s|${_host}:[^|]*|${_new_entry}|")
+        # Update existing entry — \1 preserves whichever boundary matched
+        # (start-of-string or the preceding "|") so only this host's
+        # own host:ip pair is replaced. Delimiter is "#", not "|" — the
+        # pattern itself needs literal "|" characters.
+        HOSTS_ENTRIES=$(echo "$HOSTS_ENTRIES" | sed -E "s#(^|\|)${_host_re}:[^|]*#\1${_new_entry}#")
     fi
 
     # Push to backup nodes
@@ -11496,12 +11728,25 @@ check_key_cert_match() {
     local CERT_FILE="$1"
     local KEY_FILE="$2"
 
-    # Extract SHA-256 hash of public keys
-    cert_pubkey_hash=$(openssl x509 -in "$CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | awk '{print $1}')
-    key_pubkey_hash=$(openssl pkey -in "$KEY_FILE" -pubout -outform der | sha256sum | awk '{print $1}')
+    # Compare base64-encoded public-key DER bytes directly rather than
+    # hashing them — sha256sum always produces a valid-looking 64-hex-char
+    # hash even for empty input, so if an earlier openssl stage silently
+    # failed (corrupt/unsupported-type file) on BOTH sides, their hashes
+    # would trivially "match" as the hash of nothing. An explicit emptiness
+    # check here catches that instead of reporting a broken pair as valid.
+    local cert_pubkey_der key_pubkey_der
+    cert_pubkey_der=$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | base64)
+    if [[ -z "$cert_pubkey_der" ]]; then
+        exit_on_error "Could not extract a public key from certificate: $CERT_FILE (file may be corrupt or unreadable)"
+    fi
 
-    # Compare hashes
-    if [ "$cert_pubkey_hash" != "$key_pubkey_hash" ]; then
+    key_pubkey_der=$(openssl pkey -in "$KEY_FILE" -pubout -outform der 2>/dev/null | base64)
+    if [[ -z "$key_pubkey_der" ]]; then
+        exit_on_error "Could not extract a public key from private key: $KEY_FILE (file may be corrupt or unreadable)"
+    fi
+
+    # Compare public keys
+    if [ "$cert_pubkey_der" != "$key_pubkey_der" ]; then
         exit_on_error "The certificate and private key do not match!"
     else
         log "The certificate and private key match!"
@@ -11585,7 +11830,12 @@ EOF
 IMAGE_SERVICE_URLS="$IMAGE_SERVICE_URLS"
 EOF
     fi
-    
+
+    # deployment.config holds the plaintext TLS private key, DIAG_PASSWORD,
+    # and Keepalived AUTH_PASS — without this, a default root umask (022)
+    # leaves it world-readable (644).
+    chmod 600 "$CONFIG_FILE"
+
     log "Configuration saved to $CONFIG_FILE"
 
     # Push a backup copy of deployment.config to each backup node
@@ -11625,6 +11875,17 @@ READMETXT
                     "sudo -S mkdir -p ${_backup_dest}" <<< "$SUDO_PASS" 2>/dev/null || true
             fi
             copy_to_remote_root "$CONFIG_FILE"  "$_bip" "${_backup_dest}/deployment.config"
+            # deployment.config contains the plaintext TLS private key and
+            # shared secrets — lock down the remote backup copy the same way
+            # the local file now is (chmod 600); copy_to_remote_root only
+            # chowns it to root:root, it doesn't tighten permissions.
+            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+                echo "$SUDO_PASS" | sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
+                    "sudo -S chmod 600 '${_backup_dest}/deployment.config'" 2>/dev/null || true
+            else
+                ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
+                    "sudo -S chmod 600 '${_backup_dest}/deployment.config'" <<< "$SUDO_PASS" 2>/dev/null || true
+            fi
             copy_to_remote_root "$_readme_tmp"  "$_bip" "${_backup_dest}/RECOVERY_README.txt"
         done
         rm -f "$_readme_tmp"
@@ -11897,7 +12158,8 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                     # ── SSL Certificate ──
                     echo "── SSL Certificate ─────────────────────────────────────────────"
                     if [[ -f "${_traefik_dir}/certs/cert.crt" ]]; then
-                        _subj _expiry _issuer
+                        # (top-level script code — no enclosing function, so
+                        # `local` is not valid here; these are plain globals)
                         _subj=$(openssl x509 -noout -subject -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | sed 's/subject=//')
                         _expiry=$(openssl x509 -noout -enddate -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | cut -d= -f2)
                         _issuer=$(openssl x509 -noout -issuer -in "${_traefik_dir}/certs/cert.crt" 2>/dev/null | sed 's/issuer=//')
@@ -11908,8 +12170,12 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                         echo "  Certificate (PEM):"
                         cat "${_traefik_dir}/certs/cert.crt"
                         echo ""
-                        echo "  Private Key (PEM):"
-                        cat "${_traefik_dir}/certs/server.key" 2>/dev/null || echo "  (server.key not readable)"
+                        # The private key itself is deliberately NOT cat'd here — this
+                        # whole block is piped through `tee` to the terminal, and the
+                        # key is appended directly to the recovery file (only, after
+                        # chmod 600) further below instead, so it never lands in
+                        # scrollback/session recordings as a side effect of migration.
+                        echo "  Private Key (PEM): written to ${_recovery_file} only — not shown on screen"
                         echo ""
                         if [[ -f "${_traefik_dir}/certs/customca.crt" ]]; then
                             echo "  Custom CA Certificate (PEM):"
@@ -11939,7 +12205,6 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                     echo "── HL7 Configuration ───────────────────────────────────────────"
                     _traefik_yml="${_traefik_dir}/config/traefik.yml"
                     if [[ -f "$_traefik_yml" ]]; then
-                        _hl7_ports
                         _hl7_ports=$(grep -E "^  hl7" "$_traefik_yml" 2>/dev/null | sed 's/://' | sed 's/^  /  Port: /')
                         if [[ -n "$_hl7_ports" ]]; then
                             echo "$_hl7_ports"
@@ -11954,7 +12219,6 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                     # ── Keepalived ──
                     echo "── Keepalived / Virtual IP ─────────────────────────────────────"
                     if [[ -f "/etc/keepalived/keepalived.conf" ]]; then
-                        _vip _vrid _iface _priority
                         _vip=$(grep -oP '(?<=virtual_ipaddress \{)[^}]*' /etc/keepalived/keepalived.conf 2>/dev/null | tr -d ' \n' || \
                                grep "virtual_ipaddress" -A2 /etc/keepalived/keepalived.conf 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
                         _vrid=$(grep -oP '(?<=virtual_router_id )\d+' /etc/keepalived/keepalived.conf 2>/dev/null)
@@ -11973,7 +12237,6 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                     # ── Docker image ──
                     echo "── Traefik Docker Image ────────────────────────────────────────"
                     if [[ -f "${_traefik_dir}/docker-compose.yaml" ]]; then
-                        _image
                         _image=$(grep -oP '(?<=image: ).*' "${_traefik_dir}/docker-compose.yaml" 2>/dev/null | head -1)
                         echo "  Image       : ${_image:-not found}"
                     fi
@@ -11987,6 +12250,19 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                 } | tee "$_recovery_file"
 
                 chmod 600 "$_recovery_file"
+
+                # Append the private key straight to the file only, now that
+                # permissions are already locked to 600 — never through the
+                # tee'd group above, so it's never echoed to the terminal.
+                if [[ -f "${_traefik_dir}/certs/server.key" ]]; then
+                    {
+                        echo ""
+                        echo "  Private Key (PEM):"
+                        cat "${_traefik_dir}/certs/server.key"
+                    } >> "$_recovery_file"
+                else
+                    echo "  (server.key not readable — not appended to recovery file)" >> "$_recovery_file"
+                fi
 
                 echo ""
                 echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -12018,7 +12294,7 @@ if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
                 read -s -p "  Enter sudo password for remote hosts: " SUDO_PASS
                 echo ""
                 export SUDO_PASS
-                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+                SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
             fi
 
             for i in "${!BACKUP_NODES[@]}"; do
@@ -12103,7 +12379,7 @@ fi
 if [[ "$1" == "--status" ]]; then
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE" 2>/dev/null || true
-        SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+        SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
     fi
     show_status
     exit 0
@@ -12191,7 +12467,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "Verifying passwordless SSH to backup nodes..."
     echo ""
     
-    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+    SSH_OPTS="-i $ACTUAL_HOME/.ssh/id_rsa -o StrictHostKeyChecking=accept-new"
     SSH_FAILED=0
     FAILED_SSH_NODES=()
     
@@ -12200,11 +12476,14 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
         ip="${BACKUP_IPS[$i]}"
         
         echo -n "Testing SSH to $node ($ip)... "
-        
+
+        # `|| true` so a failed/unreachable ssh (exit 255 — exactly the case
+        # this check exists to detect) doesn't trip set -e before the
+        # following grep gets a chance to report a failed node gracefully.
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null)
+            TEST_RESULT=$(sudo -u "$SUDO_USER" ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null) || true
         else
-            TEST_RESULT=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null)
+            TEST_RESULT=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_OPTS -l "$CURRENT_USER" "$ip" "echo SSH_TEST_OK" 2>/dev/null) || true
         fi
         
         if echo "$TEST_RESULT" | grep -q "SSH_TEST_OK"; then
@@ -12660,8 +12939,14 @@ if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
     DOCKER_AUTH_BLOCKED=false
     echo "Repository connectivity check skipped (offline mode)."
 else
-    check_repository_connectivity
-    REPO_CONNECTIVITY_OK=$( [ $? -eq 0 ] && echo true || echo false )
+    # Guarded via if/else (not a bare call + $?) so a genuine connectivity
+    # failure — exactly the case this flag exists to detect — doesn't trip
+    # set -e before REPO_CONNECTIVITY_OK is ever set to false.
+    if check_repository_connectivity; then
+        REPO_CONNECTIVITY_OK=true
+    else
+        REPO_CONNECTIVITY_OK=false
+    fi
 fi
 
 ### END Repository Connectivity Check
@@ -14059,7 +14344,10 @@ EOF
   # Check if VIP is assigned (for MASTER) or ready (for BACKUP)
   echo -n "Checking Virtual IP configuration... "
   sleep 2
-  if ip addr show "$NETWORK_INTERFACE" | grep -q "$VIRTUAL_IP"; then
+  # Match "inet <vip>/" (as it actually appears in `ip addr show` output),
+  # not a bare substring — otherwise a VIP like 10.0.0.5 false-matches a
+  # different live address such as 10.0.0.50/24.
+  if ip addr show "$NETWORK_INTERFACE" | grep -qE "inet ${VIRTUAL_IP//./\\.}/"; then
       echo "✓ Virtual IP $VIRTUAL_IP is assigned"
       if [[ "$NODE_ROLE" == "BACKUP" ]]; then
           echo "   Note: Virtual IP is assigned to BACKUP (master may be down)"
@@ -14130,7 +14418,7 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "  - HA Mode: Multi-node (1 master + ${#BACKUP_NODES[@]} backup nodes)"
     echo "  - Master Node: $MASTER_HOSTNAME ($MASTER_IP) - Priority 110"
     for i in "${!BACKUP_NODES[@]}"; do
-        priority=$((100 - (i * 10)))
+        priority=$(( (100 - (i * 10)) < 1 ? 1 : (100 - (i * 10)) ))
         echo "  - Backup $((i+1)): ${BACKUP_NODES[$i]} (${BACKUP_IPS[$i]}) - Priority $priority"
     done
     echo "  - Virtual IP: $VIRTUAL_IP"
