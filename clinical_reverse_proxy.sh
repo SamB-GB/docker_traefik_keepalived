@@ -4326,9 +4326,9 @@ CACONF
 
         _extend_restart_traefik_all_nodes
         echo -n "  Saving configuration... "
-        CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
+        [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
         snapshot_config "CA_UPDATE" "CA certificate updated"
-        KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+        [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
         save_config
         echo "✓"
         echo "✓ CA certificate updated"
@@ -4874,8 +4874,8 @@ EOF
 
     # Save config so the deployment config file on the remote is up-to-date
     snapshot_config "NODE_ADD" "Backup node(s) added"
-    CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
-    KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+    [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+    [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
     save_config
 
     deploy_to_backup_nodes "$start_idx"
@@ -5840,8 +5840,8 @@ extend_edit_components() {
     _extend_restart_traefik_all_nodes
     snapshot_config "COMPONENT" "Component server configuration changed"
     echo -n "  Saving configuration... "
-    CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
-    KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+    [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+    [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
     save_config
     echo "✓"
     echo "✓ Component servers updated"
@@ -6285,8 +6285,8 @@ extend_edit_hl7() {
         snapshot_config "HL7" "HL7 configuration changed"
         _extend_restart_traefik_all_nodes
         echo -n "  Saving configuration... "
-        CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
-        KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+        [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+        [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
         save_config
         echo "✓"
         echo ""
@@ -6844,8 +6844,8 @@ extend_edit_hl7() {
 
                 _extend_restart_traefik_all_nodes
                 echo -n "  Saving configuration... "
-                CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
-                KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+                [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+                [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
                 save_config
                 echo "✓"
                 echo "  ✓ HL7 integration disabled"
@@ -8271,8 +8271,8 @@ REMOVECLEANUP
 
     # Clean up remote temp dirs and save
     cleanup_remote_scripts_dirs
-    CERT_FILE="${CERT_FILE:-/opt/indica/traefik/certs/cert.crt}"
-    KEY_FILE="${KEY_FILE:-/opt/indica/traefik/certs/server.key}"
+    [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+    [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
     save_config
 
     echo ""
@@ -11514,6 +11514,16 @@ check_key_cert_match() {
 
 # Function to save configuration settings
 save_config() {
+    # Guard: CERT_FILE/KEY_FILE may be unset, or hold a stale path (e.g. a
+    # pre-migration /home/haloap/... value that got saved into
+    # deployment.config before the /opt/indica migration ran). Callers
+    # setting "${CERT_FILE:-default}" don't fix this — that expansion only
+    # applies when the variable is empty, not when it points to a file that
+    # no longer exists. Fall back to the canonical path whenever the current
+    # value doesn't resolve to a real file, so the cat below never fails.
+    [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
+    [[ -f "$KEY_FILE" ]]  || KEY_FILE="/opt/indica/traefik/certs/server.key"
+
     # Read the content of the certificate and key files
     SSL_CERT_CONTENT=$(cat "$CERT_FILE")
     SSL_KEY_CONTENT=$(cat "$KEY_FILE")
