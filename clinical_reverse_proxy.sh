@@ -1660,6 +1660,44 @@ prepare_offline_packages() {
     echo "Archive format: $ARCHIVE_FORMAT"
     echo ""
 
+    # ----------------------------------------------------------------------
+    # Preflight: bundle generation DOWNLOADS packages, the Docker repo/GPG
+    # key and the Traefik image — it cannot work without internet access.
+    # Probe download.docker.com up front (honouring any configured proxy) so
+    # an air-gapped box fails right here with a clear message instead of
+    # dying mid-bootstrap on the GPG key download. No -f: any HTTP response
+    # (200/301/403/…) proves reachability — only connection/DNS failures
+    # should trip this.
+    # ----------------------------------------------------------------------
+    echo -n "Checking internet access (download.docker.com)... "
+    if timeout 8 curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -sI "https://download.docker.com/" >/dev/null 2>&1; then
+        echo "✓ reachable"
+        echo ""
+    else
+        echo "❌ unreachable"
+        cat >&2 <<EOF
+
+❌ Bundle generation requires internet access, and download.docker.com is
+   not reachable from this machine.
+
+   This option ([2] / --prepare-offline) downloads packages and the Traefik
+   image to BUILD a transferrable bundle — it must run on an internet-
+   connected machine of the same OS family/codename as the target
+   (this machine: ${OS_PRETTY}, codename: ${OS_CODENAME}).
+
+   If this is your air-gapped target machine:
+     1. Run this script with option [2] on a connected ${OS_CODENAME} machine
+     2. Copy the resulting traefik-rp-packages-*.tar.gz into ~/ here
+     3. Re-run this script and choose [1] Install Reverse Proxy — the bundle
+        is detected automatically and the install runs fully offline.
+
+   If this machine should reach the internet via a proxy, set PROXY_HOST and
+   PROXY_PORT at the top of this script and re-run.
+
+EOF
+        exit 1
+    fi
+
     # Working directory layout matches what the install side expects.
     # mktemp -d (not a predictable /tmp/..._$$ name + rm -rf/mkdir -p) so a
     # local attacker can't pre-create a symlink at a guessable path and have
@@ -2857,6 +2895,21 @@ if [ "$PREPARE_OFFLINE" != "true" ] && [[ "$1" != "--status" ]] && [[ "$1" != "-
     fi
 fi
 
+# Fast connectivity probe for the early-prereqs install below. Uses bash's
+# built-in /dev/tcp rather than curl — curl may itself be one of the missing
+# packages we'd be trying to install. Returns 0 if a well-known host answers.
+# Assumed OK when a proxy is configured: a direct TCP probe would
+# false-negative behind proxy-only egress, and apt/dnf may still succeed via
+# their own proxy configuration.
+_early_net_ok() {
+    if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+        return 0
+    fi
+    timeout 5 bash -c 'exec 3<>/dev/tcp/download.docker.com/443' 2>/dev/null && return 0
+    timeout 5 bash -c 'exec 3<>/dev/tcp/deb.debian.org/80' 2>/dev/null && return 0
+    return 1
+}
+
 if [[ "$1" != "--status" ]] && [ "$_early_skip_for_offline" != "yes" ]; then
 echo ""
 echo "Checking essential prerequisites..."
@@ -2868,7 +2921,12 @@ if command -v apt-get &>/dev/null; then
             _early_missing="$_early_missing $_pkg"
         fi
     done
-    if [ -n "$_early_missing" ]; then
+    if [ -n "$_early_missing" ] && ! _early_net_ok; then
+        echo "  ⚠️  Missing packages (${_early_missing# }) but no internet access detected —"
+        echo "      skipping the online install attempt."
+        echo "      If this is an air-gapped target: the offline bundle provides these"
+        echo "      packages. Copy traefik-rp-packages-*.tar.gz into ~/ and re-run."
+    elif [ -n "$_early_missing" ]; then
         echo "Installing essential prerequisites:$_early_missing"
         # Use `|| true` so transient apt-update failures don't kill the
         # script under `set -e`; install step below has its own ||{...} guard
@@ -2895,7 +2953,12 @@ elif command -v dnf &>/dev/null; then
             _early_missing="$_early_missing $_pkg"
         fi
     done
-    if [ -n "$_early_missing" ]; then
+    if [ -n "$_early_missing" ] && ! _early_net_ok; then
+        echo "  ⚠️  Missing packages (${_early_missing# }) but no internet access detected —"
+        echo "      skipping the online install attempt."
+        echo "      If this is an air-gapped target: the offline bundle provides these"
+        echo "      packages. Copy traefik-rp-packages-*.tar.gz into ~/ and re-run."
+    elif [ -n "$_early_missing" ]; then
         echo "Installing essential prerequisites:$_early_missing"
         if ! dnf --setopt=skip_if_unavailable=True install -y $_early_missing; then
             echo ""
@@ -2961,15 +3024,43 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 if [ "$_show_action_menu" = "yes" ]; then
+    # Resolve what option [1] would actually do BEFORE showing the menu, so
+    # the operator isn't choosing blind on an air-gapped target. Same
+    # lightweight filename-only scan as the early-prereqs gate and the mode
+    # banner below — the three must stay consistent.
+    _menu_bundle=""
+    for _menu_loc in "$ACTUAL_HOME" "/opt" "/tmp"; do
+        [ -d "$_menu_loc" ] || continue
+        _menu_found=$(find "$_menu_loc" -maxdepth 1 \
+            \( -name "traefik-rp-packages-*.tar.gz" -o -name "traefik-rp-packages-*.zip" \) \
+            2>/dev/null | sort -r | head -1)
+        if [ -n "$_menu_found" ]; then
+            _menu_bundle="$_menu_found"
+            break
+        fi
+    done
+
     echo ""
     echo ""
     echo ":: Select Action"
     echo "──────────────────────────────────────────────────"
     echo ""
-    echo "Please choose an action:"
-    echo "  [1] Install Reverse Proxy           (deploy on this machine)"
-    echo "  [2] Generate Offline Install Bundle (download packages + Traefik image)"
-    echo "  [3] Cancel"
+    if [ -n "$_menu_bundle" ]; then
+        echo "Detected offline bundle: $(basename "$_menu_bundle")"
+        echo "                     in: $(dirname "$_menu_bundle")"
+        echo ""
+        echo "Please choose an action:"
+        echo "  [1] Install Reverse Proxy           (OFFLINE — installs from the bundle above)"
+        echo "  [2] Generate Offline Install Bundle (requires internet — run on a connected machine)"
+        echo "  [3] Cancel"
+    else
+        echo "No offline bundle found in $ACTUAL_HOME, /opt or /tmp."
+        echo ""
+        echo "Please choose an action:"
+        echo "  [1] Install Reverse Proxy           (ONLINE — needs internet/repo access)"
+        echo "  [2] Generate Offline Install Bundle (requires internet — download packages + Traefik image)"
+        echo "  [3] Cancel"
+    fi
     echo ""
 
     while true; do
