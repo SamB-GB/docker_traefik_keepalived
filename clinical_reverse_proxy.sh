@@ -2203,7 +2203,13 @@ install_traefik_stack_offline() {
 
         if [ ${#rpms_to_install[@]} -gt 0 ]; then
             log "Installing ${#rpms_to_install[@]} missing package(s) from bundle"
-            dnf ${DNF_SSL_OPT} -y --disablerepo='*' install "${rpms_to_install[@]}" 2>&1 \
+            # --skip-broken: a not-installed subpackage of a skipped base
+            # package (e.g. glibc-minimal-langpack, which strictly requires
+            # the bundle's newer glibc we deliberately don't install) would
+            # otherwise abort the whole transaction. Docker/Keepalived don't
+            # need those stragglers, and the command -v checks below catch
+            # it if anything essential got skipped.
+            dnf ${DNF_SSL_OPT} -y --disablerepo='*' --skip-broken install "${rpms_to_install[@]}" 2>&1 \
                 | tee -a "$LOGFILE" || \
                 exit_on_error "Failed to install RPMs from bundle"
         else
@@ -7605,7 +7611,11 @@ PYEXTRACT
         done
         if [ ${#_rpms_to_install[@]} -gt 0 ]; then
             echo "Installing ${#_rpms_to_install[@]} missing package(s) from bundle"
-            dnf -y --disablerepo='*' install "${_rpms_to_install[@]}" 2>&1 || {
+            # --skip-broken: same as the master node — drop not-installed
+            # subpackages that strictly require base-package versions we
+            # deliberately skip; the docker/keepalived checks below catch
+            # anything essential going missing.
+            dnf -y --disablerepo='*' --skip-broken install "${_rpms_to_install[@]}" 2>&1 || {
                 echo "❌ Failed to install RPMs from bundle"
                 exit 1
             }
