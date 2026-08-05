@@ -1920,9 +1920,11 @@ EOF
         )
 
         # dnf download --resolve pulls each package and ALL of its dependencies
-        # into the destination directory.
+        # into the destination directory. --arch keeps i686 multilib packages
+        # (which --alldeps would otherwise pull) out of the bundle.
         if ! dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
-            download --resolve --alldeps --destdir="$pkg_dir" \
+            download --resolve --alldeps --arch="$(uname -m)" --arch=noarch \
+            --destdir="$pkg_dir" \
             "${dnf_packages[@]}" 2>&1 | tee /tmp/dnf_download.log; then
             echo "⚠️  dnf download had warnings (see /tmp/dnf_download.log)"
         fi
@@ -2183,10 +2185,30 @@ install_traefik_stack_offline() {
         log "✓ All packages installed from bundle"
 
     elif [ "$PKG_MANAGER" = "dnf" ]; then
-        # dnf localinstall handles dependency resolution between local rpms.
-        dnf ${DNF_SSL_OPT} -y --disablerepo='*' install "$pkg_dir"/*.rpm 2>&1 \
-            | tee -a "$LOGFILE" || \
-            exit_on_error "Failed to install RPMs from bundle"
+        # Only install RPMs for packages that are missing. The bundle may
+        # carry newer builds of base packages (glibc, systemd, ...) than this
+        # host's patch level; asking dnf to upgrade those breaks their
+        # already-installed companion subpackages (glibc-devel, systemd-udev,
+        # python3-libxml2, ...) that the bundle doesn't carry, and dnf aborts
+        # the whole transaction. The installed versions satisfy Docker and
+        # Keepalived fine — skip them, along with any i686 multilib RPMs.
+        local _rpm _rpm_name
+        local rpms_to_install=()
+        for _rpm in "$pkg_dir"/*.rpm; do
+            case "$_rpm" in *.i686.rpm) continue ;; esac
+            _rpm_name=$(rpm -qp --qf '%{NAME}' "$_rpm" 2>/dev/null) || continue
+            rpm -q "$_rpm_name" >/dev/null 2>&1 && continue
+            rpms_to_install+=("$_rpm")
+        done
+
+        if [ ${#rpms_to_install[@]} -gt 0 ]; then
+            log "Installing ${#rpms_to_install[@]} missing package(s) from bundle"
+            dnf ${DNF_SSL_OPT} -y --disablerepo='*' install "${rpms_to_install[@]}" 2>&1 \
+                | tee -a "$LOGFILE" || \
+                exit_on_error "Failed to install RPMs from bundle"
+        else
+            log "All bundle packages already installed — nothing to install"
+        fi
 
         command -v docker     >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
         command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
@@ -7571,10 +7593,25 @@ PYEXTRACT
                 -o Dpkg::Options::="--force-confold" 2>/dev/null || true
         fi
     elif command -v dnf >/dev/null 2>&1; then
-        dnf -y --disablerepo='*' install "$_PKG_DIR"/*.rpm 2>&1 || {
-            echo "❌ Failed to install RPMs from bundle"
-            exit 1
-        }
+        # Same filtering as the master node: only install packages that are
+        # missing, so newer base-package builds in the bundle (glibc, systemd,
+        # ...) can't wedge the transaction against protected packages.
+        _rpms_to_install=()
+        for _rpm in "$_PKG_DIR"/*.rpm; do
+            case "$_rpm" in *.i686.rpm) continue ;; esac
+            _rpm_name=$(rpm -qp --qf '%{NAME}' "$_rpm" 2>/dev/null) || continue
+            rpm -q "$_rpm_name" >/dev/null 2>&1 && continue
+            _rpms_to_install+=("$_rpm")
+        done
+        if [ ${#_rpms_to_install[@]} -gt 0 ]; then
+            echo "Installing ${#_rpms_to_install[@]} missing package(s) from bundle"
+            dnf -y --disablerepo='*' install "${_rpms_to_install[@]}" 2>&1 || {
+                echo "❌ Failed to install RPMs from bundle"
+                exit 1
+            }
+        else
+            echo "All bundle packages already installed — nothing to install"
+        fi
     else
         echo "❌ No supported package manager found"
         exit 1
