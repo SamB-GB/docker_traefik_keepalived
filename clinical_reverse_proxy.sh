@@ -4510,6 +4510,18 @@ CACONF
             echo "    Add component servers first, then re-run Update CA Certificate."
         fi
 
+        # Regenerate diagnostics_monitor.yml so diagmonitor-service picks up the
+        # serversTransport reference too. Only when internalCA is actually defined
+        # in clinical_conf.yml — otherwise the reference would dangle.
+        local _diag_conf="/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml"
+        local _diag_updated="no"
+        if [[ "$DIAG_ENABLED" == "yes" ]] && [[ -f "$_clinical_conf" ]] && \
+           grep -q "serversTransports" "$_clinical_conf"; then
+            generate_diag_conf "/opt/indica/traefik/config/dynamic"
+            _diag_updated="yes"
+            echo "✓ serversTransport reference added to diagnostics monitor"
+        fi
+
         # Push to backup nodes
         if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ] && [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
             echo ""
@@ -4544,6 +4556,10 @@ CACONF
                 # Push updated clinical_conf.yml if serversTransport was added
                 if [[ -f "$_clinical_conf" ]] && grep -q "serversTransports" "$_clinical_conf"; then
                     copy_to_remote_root "$_clinical_conf" "$ip" "/opt/indica/traefik/config/dynamic/clinical_conf.yml"
+                fi
+                # Push diagnostics_monitor.yml if it was regenerated above
+                if [[ "$_diag_updated" == "yes" && -f "$_diag_conf" ]]; then
+                    copy_to_remote_root "$_diag_conf" "$ip" "/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml"
                 fi
                 echo "✓"
             done
@@ -10710,6 +10726,17 @@ http:
   services:
     diagmonitor-service:
       loadBalancer:
+EOF
+
+    # DIAG_URL is always https, so an internal-CA-signed diagnostics host fails
+    # verification without this. internalCA itself is defined in clinical_conf.yml
+    # — Traefik merges every file under /dynamic into one configuration, so
+    # referencing it across files resolves; defining it twice would not.
+    if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
+        echo "        serversTransport: internalCA" >> "$diag_file"
+    fi
+
+    cat >> "$diag_file" <<EOF
         servers:
           - url: '${DIAG_URL}'
   middlewares:
