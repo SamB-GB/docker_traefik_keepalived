@@ -11302,7 +11302,6 @@ EOF
       rule: "PathPrefix(\`/\`)"
       middlewares:
         - SecurityHeaders
-        - compress
         - cors
       service: image-service
       tls: {}
@@ -11616,7 +11615,6 @@ EOF
       middlewares:
         - image-rewrite
         - SecurityHeaders
-        - compress
       service: image-service
       tls: {}
     app-router:
