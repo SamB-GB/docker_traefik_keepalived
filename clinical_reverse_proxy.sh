@@ -138,8 +138,9 @@ HL7_PORT_COMMENTS=""     # Pipe-separated comment per port           (e.g. "Main
 DIAG_ENABLED="no"
 DIAG_URL=""              # Service URL  e.g. https://host:9090
 DIAG_AUTH_ADDRESS=""     # ForwardAuth address  e.g. https://host/idsrv/connect/userinfo
-DIAG_PASSWORD=""         # Raw password for Basic auth (username: diagnostics)
-DIAG_AUTH_TOKEN=""       # Base64 encoded Basic auth token
+DIAG_PASSWORD=""         # Auto-generated password for Basic auth (username: traefik)
+DIAG_AUTH_TOKEN=""       # Base64 encoded Basic auth token ('traefik:DIAG_PASSWORD')
+DIAG_BCRYPT_HASH=""      # bcrypt hash of DIAG_PASSWORD, for the Diagnostics Monitor's own web-config.yml
 
 # Custom CA certificate for upstream TLS verification
 USE_CUSTOM_CA="no"
@@ -10761,6 +10762,86 @@ EOF
 }
 
 # ==========================================
+# Diagnostics Monitor — bcrypt helper
+# ==========================================
+# IndicaLabs.DiagnosticsMonitor checks Basic Auth against a bcrypt hash in
+# its own web-config.yml (on the server hosting it) — not against the
+# plaintext password — so we generate that hash here for the operator to
+# paste in.
+generate_bcrypt_hash() {
+    local _password="$1"
+    local _hash=""
+
+    # Prefer a Python bcrypt module if one is already installed — avoids an
+    # unnecessary package install.
+    if command -v python3 &>/dev/null; then
+        _hash=$(python3 -c "
+import sys
+try:
+    import bcrypt
+    print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=10)).decode())
+except Exception:
+    pass
+" "$_password" 2>/dev/null)
+    fi
+
+    # htpasswd (apache2-utils / httpd-tools) — widely packaged, most reliable
+    if [[ -z "$_hash" ]] && command -v htpasswd &>/dev/null; then
+        _hash=$(htpasswd -nbBC 10 "x" "$_password" 2>/dev/null | cut -d: -f2)
+    fi
+
+    # Install htpasswd from the package manager if nothing worked yet
+    if [[ -z "$_hash" ]]; then
+        echo "  Installing htpasswd (needed to generate the bcrypt hash)..." >&2
+        if command -v apt-get &>/dev/null; then
+            apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT:-} install -y -qq apache2-utils >/dev/null 2>&1 || true
+        elif command -v dnf &>/dev/null; then
+            dnf ${DNF_PROXY_OPT:-} ${DNF_SSL_OPT:-} --setopt=skip_if_unavailable=True install -y httpd-tools >/dev/null 2>&1 || true
+        fi
+        if command -v htpasswd &>/dev/null; then
+            _hash=$(htpasswd -nbBC 10 "x" "$_password" 2>/dev/null | cut -d: -f2)
+        fi
+    fi
+
+    echo -n "$_hash"
+}
+
+# Generates a random password for the Diagnostics Monitor's 'traefik' Basic
+# Auth user, the Authorization header Traefik sends upstream, and the bcrypt
+# hash the Diagnostics Monitor itself needs in web-config.yml. The operator
+# never types a password — they only copy the resulting hash across.
+_diag_generate_credentials() {
+    DIAG_PASSWORD=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | cut -c1-20)
+    DIAG_AUTH_TOKEN=$(printf 'traefik:%s' "$DIAG_PASSWORD" | base64 | tr -d '\n')
+    echo "  Generating bcrypt hash for Diagnostics Monitor basic auth..."
+    DIAG_BCRYPT_HASH=$(generate_bcrypt_hash "$DIAG_PASSWORD")
+    if [[ -z "$DIAG_BCRYPT_HASH" ]]; then
+        echo "  ⚠️  Could not generate a bcrypt hash automatically (no htpasswd/bcrypt available)."
+        echo "      Generate one manually on any machine with htpasswd installed:"
+        echo "        htpasswd -nbBC 10 x '${DIAG_PASSWORD}' | cut -d: -f2"
+    fi
+}
+
+# Prints the instructions for wiring the bcrypt hash into the Diagnostics
+# Monitor's own config. Reusable so the operator can re-display it later
+# without regenerating the password.
+_diag_print_bcrypt_instructions() {
+    echo ""
+    echo "  ┌─ Diagnostics Monitor — Basic Auth Setup ──────────────────────"
+    echo "  │"
+    echo "  │  On the Diagnostics Monitor server, edit:"
+    echo "  │    C:\\ProgramData\\Indica Labs\\Configuration\\IndicaLabs.DiagnosticsMonitor\\web-config.yml"
+    echo "  │"
+    echo "  │  Replace the line after 'basic_auth_users:' with:"
+    echo "  │"
+    echo "  │    traefik: ${DIAG_BCRYPT_HASH:-<hash generation failed — see above>}"
+    echo "  │"
+    echo "  │  Then restart the Diagnostics Monitor service."
+    echo "  └─────────────────────────────────────────────────────────────────"
+    echo ""
+}
+
+# ==========================================
 # Diagnostics Monitor — main install prompt
 # ==========================================
 
@@ -10781,8 +10862,9 @@ prompt_diag_config() {
     echo ""
     echo "  The diagnostics monitor integration configures Traefik to proxy"
     echo "  requests to a diagnostics service and authenticate via ForwardAuth."
-    echo "  Basic authentication uses the username 'diagnostics' with a"
-    echo "  password you provide."
+    echo "  Basic authentication uses a fixed username ('traefik') with an"
+    echo "  automatically generated password — you'll be given a bcrypt hash"
+    echo "  to add to the Diagnostics Monitor's own configuration."
     echo ""
 
     if ! prompt_yn "Configure the diagnostics monitor integration?" "n"; then
@@ -10791,6 +10873,7 @@ prompt_diag_config() {
         DIAG_AUTH_ADDRESS=""
         DIAG_PASSWORD=""
         DIAG_AUTH_TOKEN=""
+        DIAG_BCRYPT_HASH=""
         log "Diagnostics monitor skipped"
         return 0
     fi
@@ -10869,25 +10952,19 @@ prompt_diag_config() {
     done
     DIAG_AUTH_ADDRESS="https://${_diag_origin}/idsrv/connect/userinfo"
 
-    # Basic auth password — with confirmation
+    # Basic auth credentials are generated automatically — username is fixed
+    # as 'traefik' and the password is random; the operator never types one,
+    # they only add the resulting bcrypt hash to the Diagnostics Monitor.
     echo ""
-    while true; do
-        read -s -p "  Basic auth password for user 'diagnostics': " DIAG_PASSWORD
-        echo ""
-        if [[ -z "$DIAG_PASSWORD" ]]; then echo "  Error: Password cannot be empty."; continue; fi
-        local _diag_confirm=""
-        read -s -p "  Confirm password: " _diag_confirm
-        echo ""
-        if [[ "$DIAG_PASSWORD" == "$_diag_confirm" ]]; then break; fi
-        echo "  Error: Passwords do not match. Please try again."
-    done
-    DIAG_AUTH_TOKEN=$(printf 'diagnostics:%s' "$DIAG_PASSWORD" | base64 | tr -d '\n')
+    echo "  Generating Basic auth credentials (username: traefik)..."
+    _diag_generate_credentials
 
     echo ""
     echo "  ✓ Diagnostics monitor configured"
     echo "    Service URL  : ${DIAG_URL}"
     echo "    Auth address : ${DIAG_AUTH_ADDRESS}"
-    echo "    Basic auth   : diagnostics / ${DIAG_PASSWORD}"
+    echo "    Basic auth   : traefik / ${DIAG_PASSWORD}"
+    _diag_print_bcrypt_instructions
 }
 
 # ==========================================
@@ -10933,7 +11010,7 @@ PLUGINBLOCK
             echo "  Current configuration:"
             echo "    Service URL  : ${DIAG_URL}"
             echo "    Auth address : ${DIAG_AUTH_ADDRESS}"
-            echo "    Basic auth   : diagnostics / ${DIAG_PASSWORD}"
+            echo "    Basic auth   : traefik / ${DIAG_PASSWORD}"
         else
             echo "  Diagnostics monitor is not currently enabled."
         fi
@@ -10942,16 +11019,18 @@ PLUGINBLOCK
         echo "  ----------------------------------------"
         if [[ "$DIAG_ENABLED" != "yes" ]]; then
             echo "  [1] Enable diagnostics monitor"
-            echo "  [2] Update service URL         (n/a — not enabled)"
+            echo "  [2] Update service URL              (n/a — not enabled)"
             echo "  [3] Update ForwardAuth public origin (n/a — not enabled)"
-            echo "  [4] Update Basic auth password (n/a — not enabled)"
-            echo "  [5] Disable / remove           (n/a — not enabled)"
+            echo "  [4] Regenerate Basic auth password   (n/a — not enabled)"
+            echo "  [5] Disable / remove                 (n/a — not enabled)"
+            echo "  [6] Show bcrypt hash / setup instructions (n/a — not enabled)"
         else
             echo "  [1] Enable diagnostics monitor (n/a — already enabled)"
             echo "  [2] Update service URL"
             echo "  [3] Update ForwardAuth public origin"
-            echo "  [4] Update Basic auth password"
+            echo "  [4] Regenerate Basic auth password"
             echo "  [5] Disable / remove"
+            echo "  [6] Show bcrypt hash / setup instructions"
         fi
         echo "  ─────────────────────────────────────────────────────"
         echo "  [0] Back"
@@ -10959,7 +11038,7 @@ PLUGINBLOCK
 
         local _sub
         while true; do
-            read -p "Enter choice [0-5]: " _sub
+            read -p "Enter choice [0-6]: " _sub
             case "$_sub" in
                 0) return 0 ;;
                 1)
@@ -10968,13 +11047,13 @@ PLUGINBLOCK
                     else
                         break
                     fi ;;
-                2|3|4|5)
+                2|3|4|5|6)
                     if [[ "$DIAG_ENABLED" != "yes" ]]; then
                         echo "  Option unavailable — diagnostics monitor is not enabled."
                     else
                         break
                     fi ;;
-                *) echo "  Please enter 0–5." ;;
+                *) echo "  Please enter 0–6." ;;
             esac
         done
 
@@ -11038,20 +11117,12 @@ PLUGINBLOCK
                 done
                 DIAG_AUTH_ADDRESS="https://${_diag_origin}/idsrv/connect/userinfo"
                 echo ""
-                while true; do
-                    read -s -p "  Basic auth password for user 'diagnostics': " DIAG_PASSWORD
-                    echo ""
-                    if [[ -z "$DIAG_PASSWORD" ]]; then echo "  Error: Password cannot be empty."; continue; fi
-                    local _diag_confirm=""
-                    read -s -p "  Confirm password: " _diag_confirm
-                    echo ""
-                    if [[ "$DIAG_PASSWORD" == "$_diag_confirm" ]]; then break; fi
-                    echo "  Error: Passwords do not match. Please try again."
-                done
-                DIAG_AUTH_TOKEN=$(printf 'diagnostics:%s' "$DIAG_PASSWORD" | base64 | tr -d '\n')
+                echo "  Generating Basic auth credentials (username: traefik)..."
+                _diag_generate_credentials
                 DIAG_ENABLED="yes"
                 echo ""
                 echo "  ✓ Diagnostics monitor enabled"
+                _diag_print_bcrypt_instructions
                 ;;
             2)
                 # Update URL — use component server picker
@@ -11123,20 +11194,14 @@ PLUGINBLOCK
                 echo "  ✓ Auth address updated to: ${DIAG_AUTH_ADDRESS}"
                 ;;
             4)
-                # Update password
+                # Regenerate password — the Diagnostics Monitor's config must
+                # be updated with the new bcrypt hash afterwards, so remind
+                # the operator via _diag_print_bcrypt_instructions below.
                 echo ""
-                while true; do
-                    read -s -p "  New Basic auth password for user 'diagnostics': " DIAG_PASSWORD
-                    echo ""
-                    if [[ -z "$DIAG_PASSWORD" ]]; then echo "  Error: Password cannot be empty."; continue; fi
-                    local _diag_confirm=""
-                    read -s -p "  Confirm new password: " _diag_confirm
-                    echo ""
-                    if [[ "$DIAG_PASSWORD" == "$_diag_confirm" ]]; then break; fi
-                    echo "  Error: Passwords do not match. Please try again."
-                done
-                DIAG_AUTH_TOKEN=$(printf 'diagnostics:%s' "$DIAG_PASSWORD" | base64 | tr -d '\n')
-                echo "  ✓ Basic auth password updated"
+                echo "  Regenerating Basic auth credentials (username: traefik)..."
+                _diag_generate_credentials
+                echo "  ✓ Basic auth password regenerated"
+                _diag_print_bcrypt_instructions
                 ;;
             5)
                 # Disable
@@ -11150,7 +11215,19 @@ PLUGINBLOCK
                 DIAG_AUTH_ADDRESS=""
                 DIAG_PASSWORD=""
                 DIAG_AUTH_TOKEN=""
+                DIAG_BCRYPT_HASH=""
                 echo "  ✓ Diagnostics monitor disabled"
+                ;;
+            6)
+                # View-only — re-display the hash/instructions without
+                # touching Traefik, so skip the apply/restart block below.
+                if [[ -z "$DIAG_BCRYPT_HASH" ]]; then
+                    echo ""
+                    echo "  No bcrypt hash on record — regenerating from the current password..."
+                    DIAG_BCRYPT_HASH=$(generate_bcrypt_hash "$DIAG_PASSWORD")
+                fi
+                _diag_print_bcrypt_instructions
+                continue
                 ;;
         esac
 
@@ -11961,6 +12038,7 @@ DIAG_URL="$DIAG_URL"
 DIAG_AUTH_ADDRESS="$DIAG_AUTH_ADDRESS"
 DIAG_PASSWORD="$DIAG_PASSWORD"
 DIAG_AUTH_TOKEN="$DIAG_AUTH_TOKEN"
+DIAG_BCRYPT_HASH="$DIAG_BCRYPT_HASH"
 HOSTS_ENTRIES="$HOSTS_ENTRIES"
 EOF
 
@@ -12131,6 +12209,7 @@ if [[ -n "$_legacy_env" && ! -f "$CONFIG_FILE" ]]; then
         grep -q '^DIAG_AUTH_ADDRESS=' "$CONFIG_FILE" || _add_vars+=('DIAG_AUTH_ADDRESS=""')
         grep -q '^DIAG_PASSWORD=' "$CONFIG_FILE"     || _add_vars+=('DIAG_PASSWORD=""')
         grep -q '^DIAG_AUTH_TOKEN=' "$CONFIG_FILE"   || _add_vars+=('DIAG_AUTH_TOKEN=""')
+        grep -q '^DIAG_BCRYPT_HASH=' "$CONFIG_FILE"  || _add_vars+=('DIAG_BCRYPT_HASH=""')
         grep -q '^HOSTS_ENTRIES=' "$CONFIG_FILE"     || _add_vars+=('HOSTS_ENTRIES=""')
 
         for _var in "${_add_vars[@]}"; do
