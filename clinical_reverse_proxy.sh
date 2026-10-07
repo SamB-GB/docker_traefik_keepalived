@@ -7970,10 +7970,6 @@ providers:
   file:
     directory: /dynamic
     watch: true
-# experimental:
-#   localPlugins:
-#     traefik_is_admin:
-#       moduleName: gitlab.com/indica1/traefik-is-admin
 TRAEFIKCONF2
 
 # Copy dynamic config files from /tmp
@@ -10675,7 +10671,6 @@ http:
       middlewares:
         - SecurityHeaders
         - diagmonitor-rewrite
-        # - diagmonitor-check-is-admin
         - diagmonitor-auth
         - diagmonitor-basicauth
         - compress
@@ -10691,9 +10686,6 @@ http:
       stripPrefix:
         prefixes:
           - '/diagnostics'
-    # diagmonitor-check-is-admin:
-    #   plugin:
-    #     traefik_is_admin: {}
     diagmonitor-auth:
       forwardAuth:
         address: 'https://localhost/idsrv/connect/userinfo'
@@ -10717,7 +10709,6 @@ http:
       middlewares:
         - SecurityHeaders
         - diagmonitor-rewrite
-        # - diagmonitor-check-is-admin
         - diagmonitor-auth
         - diagmonitor-basicauth
         - compress
@@ -10745,9 +10736,6 @@ EOF
       stripPrefix:
         prefixes:
           - '/diagnostics'
-    # diagmonitor-check-is-admin:
-    #   plugin:
-    #     traefik_is_admin: {}
     diagmonitor-auth:
       forwardAuth:
         address: '${DIAG_AUTH_ADDRESS}'
@@ -10826,17 +10814,20 @@ _diag_generate_credentials() {
 # Monitor's own config. Reusable so the operator can re-display it later
 # without regenerating the password.
 _diag_print_bcrypt_instructions() {
+    local _diag_server_host="${DIAG_URL#https://}"
+    _diag_server_host="${_diag_server_host%%:*}"
+
     echo ""
     echo "  ┌─ Diagnostics Monitor — Basic Auth Setup ──────────────────────"
     echo "  │"
-    echo "  │  On the Diagnostics Monitor server, edit:"
+    echo "  │  On the Diagnostics Monitor server ${_diag_server_host}, edit:"
     echo "  │    C:\\ProgramData\\Indica Labs\\Configuration\\IndicaLabs.DiagnosticsMonitor\\web-config.yml"
     echo "  │"
     echo "  │  Replace the line after 'basic_auth_users:' with:"
     echo "  │"
     echo "  │    traefik: ${DIAG_BCRYPT_HASH:-<hash generation failed — see above>}"
     echo "  │"
-    echo "  │  Then restart the Diagnostics Monitor service."
+    echo "  │  Then restart the Indica Labs Diagnostics Monitor Database service."
     echo "  └─────────────────────────────────────────────────────────────────"
     echo ""
 }
@@ -10976,17 +10967,12 @@ extend_edit_diag() {
     local _compose_dir="/opt/indica/traefik"
     local _traefik_yml="/opt/indica/traefik/config/traefik.yml"
 
-    # Ensure the experimental plugin block exists in traefik.yml
-    # (may be missing on installs that pre-date this feature)
-    if [[ -f "$_traefik_yml" ]] && ! grep -q "traefik_is_admin" "$_traefik_yml"; then
-        log "Adding traefik_is_admin plugin block to traefik.yml..."
-        cat >> "$_traefik_yml" <<'PLUGINBLOCK'
-# experimental:
-#   localPlugins:
-#     traefik_is_admin:
-#       moduleName: gitlab.com/indica1/traefik-is-admin
-PLUGINBLOCK
-        log "✓ traefik_is_admin plugin block added"
+    # Remove the legacy traefik_is_admin plugin block from traefik.yml if
+    # present — left over from older installs, no longer used.
+    if [[ -f "$_traefik_yml" ]] && grep -q "traefik_is_admin" "$_traefik_yml"; then
+        log "Removing legacy traefik_is_admin plugin block from traefik.yml..."
+        sed -i '/^# experimental:$/,/^#       moduleName: gitlab.com\/indica1\/traefik-is-admin$/d' "$_traefik_yml"
+        log "✓ traefik_is_admin plugin block removed"
 
         # Push updated traefik.yml to backup nodes if multi-node
         if [[ "$MULTI_NODE_DEPLOYMENT" == "yes" && ${#BACKUP_NODES[@]} -gt 0 ]]; then
@@ -14088,10 +14074,6 @@ providers:
   file:
     directory: /dynamic
     watch: true
-# experimental:
-#   localPlugins:
-#     traefik_is_admin:
-#       moduleName: gitlab.com/indica1/traefik-is-admin
 EOF
 
 # Write custom CA certificate and update docker-compose volume mount if configured
