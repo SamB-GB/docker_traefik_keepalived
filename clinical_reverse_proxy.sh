@@ -2088,9 +2088,9 @@ MANIFEST
 # ==========================================
 # OFFLINE INSTALLATION (master node)
 # ==========================================
-# Installs prereqs + Docker + Keepalived from a pre-built bundle, then loads
-# the Traefik image from the bundle. Replaces the prereq+Docker online flow
-# entirely when --offline is in effect.
+# Installs prereqs + Docker from a pre-built bundle (and Keepalived when
+# multi-node / HA), then loads the Traefik image from the bundle. Replaces
+# the prereq+Docker online flow entirely when --offline is in effect.
 #
 # Sets two globals on success:
 #   OFFLINE_BUNDLE_ROOT  — path to the extracted bundle (manifest.txt parent)
@@ -2166,9 +2166,22 @@ install_traefik_stack_offline() {
 
     if [ "$PKG_MANAGER" = "apt" ]; then
         export DEBIAN_FRONTEND=noninteractive
-        # First pass: dpkg-install everything. Some deps may be unsatisfied
+        # First pass: dpkg-install packages. Some deps may be unsatisfied
         # mid-pass; the second pass with apt --fix-broken sorts them.
-        dpkg -i "$pkg_dir"/*.deb 2>&1 | tee -a "$LOGFILE" | grep -E "^(Setting up|Selecting|Preparing|dpkg: error)" || true
+        # Keepalived is only needed for HA — skip it on single-node so a
+        # broken keepalived dep cannot poison an otherwise-good install.
+        local _debs=()
+        local _deb
+        for _deb in "$pkg_dir"/*.deb; do
+            [ -f "$_deb" ] || continue
+            if [ "${MULTI_NODE_DEPLOYMENT:-no}" != "yes" ]; then
+                case "$(basename "$_deb")" in keepalived*) continue ;; esac
+            fi
+            _debs+=("$_deb")
+        done
+        if [ ${#_debs[@]} -gt 0 ]; then
+            dpkg -i "${_debs[@]}" 2>&1 | tee -a "$LOGFILE" | grep -E "^(Setting up|Selecting|Preparing|dpkg: error)" || true
+        fi
 
         # If anything is broken, attempt a fix WITHOUT going online.
         if ! dpkg -C >/dev/null 2>&1; then
@@ -2180,11 +2193,6 @@ install_traefik_stack_offline() {
                 2>&1 | tee -a "$LOGFILE" || true
         fi
 
-        # Verify Docker + Keepalived ended up installed.
-        command -v docker     >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
-        command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
-        log "✓ All packages installed from bundle"
-
     elif [ "$PKG_MANAGER" = "dnf" ]; then
         # Only install RPMs for packages that are missing. The bundle may
         # carry newer builds of base packages (glibc, systemd, ...) than this
@@ -2193,12 +2201,16 @@ install_traefik_stack_offline() {
         # python3-libxml2, ...) that the bundle doesn't carry, and dnf aborts
         # the whole transaction. The installed versions satisfy Docker and
         # Keepalived fine — skip them, along with any i686 multilib RPMs.
+        # Keepalived itself is skipped on single-node (HA only).
         local _rpm _rpm_name
         local rpms_to_install=()
         for _rpm in "$pkg_dir"/*.rpm; do
             case "$_rpm" in *.i686.rpm) continue ;; esac
             _rpm_name=$(rpm -qp --qf '%{NAME}' "$_rpm" 2>/dev/null) || continue
             rpm -q "$_rpm_name" >/dev/null 2>&1 && continue
+            if [ "${MULTI_NODE_DEPLOYMENT:-no}" != "yes" ]; then
+                case "$_rpm_name" in keepalived) continue ;; esac
+            fi
             rpms_to_install+=("$_rpm")
         done
 
@@ -2216,11 +2228,16 @@ install_traefik_stack_offline() {
         else
             log "All bundle packages already installed — nothing to install"
         fi
-
-        command -v docker     >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
-        command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
-        log "✓ All packages installed from bundle"
     fi
+
+    # Verify required packages landed. Keepalived is only needed for HA.
+    command -v docker >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
+    if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ]; then
+        command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
+    else
+        log "Single-node deployment — Keepalived not required"
+    fi
+    log "✓ Required packages installed from bundle"
 
     # Make sure Docker is up so we can load the image into it.
     systemctl enable docker >/dev/null 2>&1 || true
@@ -13255,8 +13272,6 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "  ${_next_step}. Install and configure Keepalived (MASTER on this node)"
     (( _next_step++ ))
     echo "  ${_next_step}. Deploy to ${#BACKUP_NODES[@]} backup node(s)"
-elif [[ -z "$INSTALL_KEEPALIVED" ]]; then
-    echo "  ${_next_step}. Keepalived installation (will prompt)"
 fi
 
 echo ""
@@ -13267,9 +13282,6 @@ echo "  - SSL certificate and private key"
 echo "  - Backend service URLs and ports"
 if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
     echo "  - HL7 / TCP integration (optional, full install only)"
-fi
-if [[ -z "$INSTALL_KEEPALIVED" ]]; then
-    echo "  - Keepalived installation (y/n)"
 fi
 echo ""
 
