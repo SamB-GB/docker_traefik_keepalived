@@ -1,6 +1,6 @@
 # Clinical Traefik Reverse Proxy Setup
 
-An interactive Bash script that installs and configures a [Traefik](https://traefik.io/) reverse proxy for  Halo AP, deployed as a Docker container on linux based server. Supports both single-node and high-availability multi-node deployments with Keepalived VRRP failover, offline (air-gapped) installation, and post-install change management.
+An interactive Bash script that installs and configures a [Traefik](https://traefik.io/) reverse proxy for  Halo AP, deployed as a native binary managed by systemd on a Linux server. Supports both single-node and high-availability multi-node deployments with Keepalived VRRP failover, offline (air-gapped) installation, and post-install change management.
 
 **Script version:** 1.4.1
 **Author:** Sam Barr
@@ -35,7 +35,8 @@ An interactive Bash script that installs and configures a [Traefik](https://trae
 
 ## Features
 
-- Installs Docker CE and deploys Traefik as a containerised reverse proxy
+- Installs Traefik as a native binary (systemd service, dedicated unprivileged `traefik` user) — no container runtime required
+- Traefik version is pinned on first install and kept across restarts/extends; upgrading is a separate, explicit action (`TRAEFIK_UPGRADE=1`)
 - TLS termination with a user-supplied certificate and key
 - Optional custom CA certificate for upstream HTTPS connections
 - Generates Traefik static and dynamic configuration files for Halo AP services
@@ -58,8 +59,8 @@ An interactive Bash script that installs and configures a [Traefik](https://trae
 - Flexible HTTP proxy support (authenticated or unauthenticated) with smart strategy selection to connect to package repositories
 - Supports both `apt` (Debian/Ubuntu) and `dnf` (RHEL/CentOS/Rocky/AlmaLinux) package managers
 - Idempotent: re-running the script on an existing deployment presents a menu (Reinstall, Status, Change Deployment, Uninstall)
-- Automatic migration of legacy `clinical_traefik.env` configurations to the current `deployment.config` format
-- `--clean` mode for full removal of Traefik, Keepalived, and optionally Docker
+- Automatic migration of legacy `clinical_traefik.env` configurations to the current `deployment.config` format, and of pre-migration Docker-based installs to the native binary
+- `--clean` mode for full removal of Traefik and Keepalived
 
 ---
 
@@ -82,10 +83,9 @@ Other distributions may work but are not tested. The script will prompt you to c
 - `sudo`, `curl`, `wget`, `ca-certificates`, `gnupg` — the script will attempt to install any that are missing before proceeding
 - SSH key-based access to all backup nodes (required for multi-node deployments)
 - Internet access, or a configured HTTP proxy, sufficient to reach (for online installs):
-  - `download.docker.com`
-  - `registry-1.docker.io`
-  - `docker.io`
-  - Docker image storage (Cloudflare R2)
+  - `api.github.com` (release metadata)
+  - `github.com` (release download)
+  - `objects.githubusercontent.com` (release asset CDN)
 
 ---
 
@@ -141,15 +141,17 @@ All other settings (deployment type, service URLs, certificates, Keepalived topo
 | Flag | Argument | Description |
 |---|---|---|
 | *(none)* | | Interactive menu — choose Install or Generate Offline Bundle |
-| `--clean` | | Remove Traefik, Keepalived, Docker config, and deployment files |
+| `--clean` | | Remove Traefik, Keepalived, and deployment files |
 | `--status` | | Quick health check of the current deployment (no install) |
 | `--extend` | | Jump directly to the Change Deployment menu |
-| `--prepare-offline` | | Build an offline install bundle (packages + Traefik image) |
+| `--prepare-offline` | | Build an offline install bundle (packages + Traefik release) |
 | `--offline` | | Force offline install; fail if no bundle is found |
 | `--online` | | Force online install even if a bundle is present |
 | `--package-source=` | `PATH` | Use a specific bundle file or directory instead of auto-detecting |
 | `--archive-format=` | `tar.gz` \| `zip` | Archive format when building an offline bundle (default: `tar.gz`) |
 | `--force-os-mismatch` | | Skip the OS codename compatibility check for offline bundles |
+
+**Environment variables:** `TRAEFIK_VERSION=vX.Y.Z` pins a specific release (default: latest stable on first install); `TRAEFIK_UPGRADE=1` reinstalls/upgrades Traefik even if a version is already pinned, e.g. `sudo TRAEFIK_UPGRADE=1 ./clinical_reverse_proxy.sh`.
 
 ### Normal Installation
 
@@ -167,7 +169,7 @@ On a bare invocation the script presents a top-level action menu:
 ──────────────────────────────────────────────────
 
   [1] Install Reverse Proxy           (deploy on this machine)
-  [2] Generate Offline Install Bundle (download packages + Traefik image)
+  [2] Generate Offline Install Bundle (download packages + Traefik release)
   [3] Cancel
 ```
 
@@ -181,7 +183,7 @@ Use offline mode to install on air-gapped machines that cannot reach the interne
 sudo ./clinical_reverse_proxy.sh --prepare-offline
 ```
 
-Or select option **[2] Generate Offline Install Bundle** from the interactive menu. This downloads all required packages and the Traefik Docker image into a transferable archive (`traefik-rp-packages-*.tar.gz` by default).
+Or select option **[2] Generate Offline Install Bundle** from the interactive menu. This downloads all required packages and the Traefik release binary into a transferable archive (`traefik-rp-packages-*.tar.gz` by default).
 
 ```bash
 # Use zip format instead of tar.gz
@@ -223,7 +225,7 @@ sudo ./clinical_reverse_proxy.sh --status
 
 Displays a summary of the current deployment:
 
-- Traefik container status on the master and all backup nodes
+- Traefik service status on the master and all backup nodes
 - SSL certificate validity and days until expiry
 - Keepalived / Virtual IP information (HA deployments)
 - HL7 and Diagnostics Monitor state (if configured)
@@ -269,7 +271,7 @@ Changes are automatically pushed to all backup nodes in multi-node deployments. 
 sudo ./clinical_reverse_proxy.sh --clean
 ```
 
-Removes Traefik, Keepalived (if installed), Docker proxy config, and the `deployment.config` file. You are optionally prompted to also uninstall Docker and to extend cleanup to backup nodes in a multi-node deployment.
+Removes Traefik (binary, systemd unit, and config), Keepalived (if installed), and the `deployment.config` file. You are optionally prompted to extend cleanup to backup nodes in a multi-node deployment, and — only if a node still has a pre-migration Docker-based install — to uninstall Docker.
 
 ---
 
@@ -281,17 +283,16 @@ The script is fully interactive. It guides you through the following steps:
 2. **Existing config detection** — If a deployment config exists, you can reinstall using it, run a status check, change the deployment, or uninstall
 3. **Offline/online mode banner** — Displays whether the install will use a local bundle or reach the network
 4. **Deployment type selection** — Full install or Image Server Only (see [Deployment Types](#deployment-types))
-5. **Docker installation** — Installs Docker CE via the official Docker repository (or from the offline bundle); configures proxy in `daemon.json` if a proxy is set
-6. **Docker repository management** — When a proxy is configured, you are offered the option to disable the Docker repository after installation to prevent future `apt`/`dnf` update failures
-7. **TLS certificate and key** — You paste or provide the paths to your PEM-format certificate and private key; these are written into the Traefik certificates directory
-8. **Service URL configuration** — You enter the host, protocol, and port for each Halo AP service. You can configure multiple upstream nodes in batches for load balancing
-9. **Custom CA certificate** (optional) — Paste a PEM CA certificate if your upstream Halo AP servers use a private/internal CA
-10. **Component server `/etc/hosts` entries** (optional) — Map hostnames to IP addresses for servers that are not in DNS
-11. **HL7 / TCP integration** (optional) — Configure TCP entrypoints and backend groups for HL7 messaging ports
-12. **Diagnostics Monitor** (optional) — Configure a diagnostics monitoring service with ForwardAuth and Basic auth
-13. **Keepalived (HA)** — Optionally install Keepalived and configure a VRRP Virtual IP and network interface for this node
-14. **Multi-node deployment** — If configuring HA, you define master and backup node hostnames and IP addresses; the script deploys to backup nodes automatically over SSH
-15. **Final service restart and verification** — Docker and Keepalived are restarted; Traefik health is checked
+5. **Traefik installation** — Downloads, checksum-verifies, and installs the Traefik binary from the latest stable GitHub release (or from the offline bundle); creates a dedicated unprivileged `traefik` system user and a systemd service with a hardening drop-in
+6. **TLS certificate and key** — You paste or provide the paths to your PEM-format certificate and private key; these are written into the Traefik certificates directory
+7. **Service URL configuration** — You enter the host, protocol, and port for each Halo AP service. You can configure multiple upstream nodes in batches for load balancing
+8. **Custom CA certificate** (optional) — Paste a PEM CA certificate if your upstream Halo AP servers use a private/internal CA
+9. **Component server `/etc/hosts` entries** (optional) — Map hostnames to IP addresses for servers that are not in DNS
+10. **HL7 / TCP integration** (optional) — Configure TCP entrypoints and backend groups for HL7 messaging ports
+11. **Diagnostics Monitor** (optional) — Configure a diagnostics monitoring service with ForwardAuth and Basic auth
+12. **Keepalived (HA)** — Optionally install Keepalived and configure a VRRP Virtual IP and network interface for this node
+13. **Multi-node deployment** — If configuring HA, you define master and backup node hostnames and IP addresses; the script deploys to backup nodes automatically over SSH
+14. **Final service restart and verification** — Keepalived is restarted (if installed); Traefik health is checked
 
 ---
 
@@ -369,7 +370,7 @@ The script handles HTTP proxies robustly, including:
 
 - Passwords containing special characters (URL-encoded via Python 3, `jq`, or a built-in fallback)
 - Masking of credentials in all log output
-- Propagation of proxy settings to `apt`/`dnf`, `curl`, and the Docker daemon
+- Propagation of proxy settings to `apt`/`dnf` and `curl` (including the Traefik release download)
 - Four configurable strategies (`auto`, `all`, `external`, `none`) — see [Configuration](#configuration)
 
 ---
@@ -388,8 +389,9 @@ The script handles HTTP proxies robustly, including:
 | `/opt/indica/traefik/certs/cert.crt` | TLS certificate |
 | `/opt/indica/traefik/certs/server.key` | TLS private key |
 | `/opt/indica/traefik/certs/customca.crt` | Custom CA certificate (only if a custom CA is supplied) |
-| `/opt/indica/traefik/docker-compose.yaml` | Docker Compose file for the Traefik container |
-| `/etc/docker/daemon.json` | Docker daemon proxy configuration (only if proxy is configured) |
+| `/opt/indica/traefik/VERSION` | The pinned Traefik version, written only after a passing health check |
+| `/usr/local/bin/traefik` | The Traefik binary |
+| `/etc/systemd/system/traefik.service` + `traefik.service.d/10-hardening.conf` | systemd unit and hardening drop-in |
 | `/etc/keepalived/keepalived.conf` | Keepalived VRRP configuration (only if Keepalived is installed) |
 | `/bin/haloap_service_check.sh` | Keepalived health check script (only if Keepalived is installed) |
 | `/var/log/installation.log` | Full installation log |
@@ -422,11 +424,11 @@ After installation, use these commands to confirm everything is running:
 # Quick status check via the script
 sudo ./clinical_reverse_proxy.sh --status
 
-# Check all containers
-docker ps
+# Check the Traefik service
+sudo systemctl status traefik
 
 # Check Traefik logs
-docker logs traefik
+sudo journalctl -u traefik -f
 
 # Check Traefik health endpoint
 curl http://localhost:8800/ping
@@ -451,7 +453,7 @@ cat /var/log/installation.log
 ```
 
 **Traefik won't start:**
-Check `docker logs traefik` for configuration errors. Verify that the certificate and key paths in `clinical_conf.yml` are correct and the files are readable by the container.
+Check `sudo journalctl -u traefik -n 50` for configuration errors. Verify that the certificate and key paths in `clinical_conf.yml` are correct and the files are readable by the `traefik` system user (`sudo -u traefik cat /opt/indica/traefik/certs/cert.crt`).
 
 **Keepalived failover not working:**
 Confirm the `haloap_service_check.sh` script exits non-zero when Traefik is unhealthy (`sudo /bin/haloap_service_check.sh`), that the VRRP interface name is correct (`ip link show`), and that both nodes are running the same VRRP instance name and authentication.
@@ -459,14 +461,12 @@ Confirm the `haloap_service_check.sh` script exits non-zero when Traefik is unhe
 **Proxy issues during installation:**
 Set `PROXY_STRATEGY="all"` if the auto-detection probes fail in your environment. If your proxy password contains special characters, ensure `python3` is installed before running the script for reliable URL encoding.
 
-**Docker repository causes `apt update` failures:**
-This is expected in proxied environments. Re-enable the repository only when you need to update Docker, then disable it again:
+**Upgrading Traefik:**
+The installed version is pinned in `/opt/indica/traefik/VERSION` and kept across restarts/extends. To upgrade to the latest stable release (or a specific one):
 ```bash
-sudo mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list
-sudo mv /etc/apt/keyrings/docker.gpg.disabled /etc/apt/keyrings/docker.gpg
-sudo -E apt-get update && sudo -E apt-get upgrade docker-ce
-sudo mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled
-sudo mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled
+sudo TRAEFIK_UPGRADE=1 ./clinical_reverse_proxy.sh
+# or pin an exact version:
+sudo TRAEFIK_VERSION=v3.2.1 TRAEFIK_UPGRADE=1 ./clinical_reverse_proxy.sh
 ```
 
 **Domain-joined username issues:**

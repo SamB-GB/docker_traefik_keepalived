@@ -577,13 +577,13 @@ setup_proxy_strategy() {
         auto|*)
             log "Strategy: AUTO - Try direct first, then proxy; settle on EXTERNAL if either works"
             log "Testing repository connectivity..."
-            # Probe Docker CE endpoint direct
-            if timeout 5 curl -s -o /dev/null -w "%{http_code}" ${CURL_SSL_OPT} "https://download.docker.com/" 2>/dev/null | grep -qE '^(200|301|302)$'; then
+            # Probe GitHub (where the Traefik release is fetched from) direct
+            if timeout 5 curl -s -o /dev/null -w "%{http_code}" ${CURL_SSL_OPT} "https://github.com/" 2>/dev/null | grep -qE '^(200|301|302)$'; then
                 log "External repos reachable directly - using EXTERNAL strategy"
                 PROXY_STRATEGY="external"; setup_proxy_strategy; return $?
             fi
             # Probe via proxy with credentials and accept 407 as success (proxy path viable)
-            if timeout 7 curl -s -o /dev/null -w "%{http_code}" -x "${PROXY_URL}" ${CURL_SSL_OPT} --proxy-anyauth "https://download.docker.com/" 2>/dev/null | grep -qE '^(200|301|302|407)$'; then
+            if timeout 7 curl -s -o /dev/null -w "%{http_code}" -x "${PROXY_URL}" ${CURL_SSL_OPT} --proxy-anyauth "https://github.com/" 2>/dev/null | grep -qE '^(200|301|302|407)$'; then
                 log "External repos reachable via proxy - using EXTERNAL strategy"
                 PROXY_STRATEGY="external"; setup_proxy_strategy; return $?
             fi
@@ -856,12 +856,354 @@ WRAPPER
     return $_rc
 }
 
-# Helper function to run docker commands with proper permissions
-docker_cmd() {
-    if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
-        sg docker -c "docker $*"
+# ==========================================
+# Native Traefik install/upgrade library
+# ==========================================
+# Replaces the old docker-compose-based lifecycle. These functions are
+# shared between the local install flow and the REMOTEINSTALL / cleanup
+# heredocs pushed to backup nodes — embedded there via
+# `declare -f`, the same pattern already used for
+# install_packages/exit_on_error/log/url_encode_password.
+#
+# Layout is unchanged from the Docker-based version: /opt/indica/traefik
+# stays the root (config/, config/dynamic/, certs/, logs/); only
+# docker-compose.yaml disappears, replaced by a systemd unit and a real
+# binary. Traefik runs as its own unprivileged "traefik" system user with
+# just CAP_NET_BIND_SERVICE, not root.
+#
+# Versioning: once $TRAEFIK_VERSION_FILE exists, install_traefik_binary
+# keeps that exact version on every rerun (restart/extend/CA-update) and
+# only changes it when explicitly asked to (force=1) — avoiding the old
+# behaviour where a floating :latest tag plus --force-recreate could
+# silently move the whole fleet to a new Traefik release on any routine
+# operation.
+
+TRAEFIK_BIN="/usr/local/bin/traefik"
+TRAEFIK_ROOT="/opt/indica/traefik"
+TRAEFIK_UNIT="/etc/systemd/system/traefik.service"
+TRAEFIK_DROPIN_DIR="/etc/systemd/system/traefik.service.d"
+TRAEFIK_DROPIN="$TRAEFIK_DROPIN_DIR/10-hardening.conf"
+TRAEFIK_VERSION_FILE="$TRAEFIK_ROOT/VERSION"
+TRAEFIK_HEALTH_URL="http://127.0.0.1:8800/ping"
+
+# Map this host's architecture to Traefik's release-asset naming
+# (amd64/arm64/armv7). Docker's multi-arch manifest used to hide this
+# entirely; a single static binary does not.
+traefik_arch() {
+    local _m
+    if command -v dpkg > /dev/null 2>&1; then
+        case "$(dpkg --print-architecture)" in
+            amd64) echo amd64; return 0 ;;
+            arm64) echo arm64; return 0 ;;
+            armhf) echo armv7; return 0 ;;
+        esac
+    fi
+    _m=$(uname -m)
+    case "$_m" in
+        x86_64|amd64)    echo amd64 ;;
+        aarch64|arm64)   echo arm64 ;;
+        armv7*|armhf)    echo armv7 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Poll the local ping endpoint + systemd unit state until healthy, or
+# give up after $1 tries (1s apart). Mirrors the existing container
+# health-poll loops elsewhere in this script.
+traefik_health_wait() {
+    local _tries="${1:-15}" _i
+    for _i in $(seq 1 "$_tries"); do
+        if systemctl is-active --quiet traefik.service && \
+           curl -fs --connect-timeout 1 --max-time 2 "$TRAEFIK_HEALTH_URL" > /dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+traefik_is_active() {
+    systemctl is-active --quiet traefik.service
+}
+
+# Resolve "latest" (or a pinned vX.Y.Z) to a concrete stable release tag
+# via the GitHub Releases API.
+resolve_traefik_version() {
+    local _version="${1:-latest}"
+    if [[ "$_version" == "latest" ]]; then
+        _version=$(curl -fsSL ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} --retry 3 \
+            https://api.github.com/repos/traefik/traefik/releases/latest \
+            | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+    fi
+    [[ "$_version" =~ ^v3\.[0-9]+\.[0-9]+$ ]] || return 1
+    echo "$_version"
+}
+
+# Download + checksum-verify + extract the traefik binary for release
+# $1 (e.g. v3.2.1) into directory $2 (binary lands at $2/traefik).
+fetch_traefik_release() {
+    local _version="$1" _dest="$2" _arch _archive _base
+    _arch=$(traefik_arch) || { log "Unsupported architecture for Traefik"; return 1; }
+    _base="https://github.com/traefik/traefik/releases/download/${_version}"
+    _archive="traefik_${_version}_linux_${_arch}.tar.gz"
+    mkdir -p "$_dest"
+    curl -fsSL ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} --retry 3 \
+        -o "$_dest/$_archive" "$_base/$_archive" || return 1
+    curl -fsSL ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} --retry 3 \
+        -o "$_dest/checksums.txt" "$_base/traefik_${_version}_checksums.txt" || return 1
+    (cd "$_dest" && awk -v name="$_archive" '$2 == name' checksums.txt > selected.txt)
+    [[ $(wc -l < "$_dest/selected.txt") -eq 1 ]] || { log "Could not find a unique checksum for $_archive"; return 1; }
+    (cd "$_dest" && sha256sum -c selected.txt > /dev/null) || return 1
+    tar -xzf "$_dest/$_archive" -C "$_dest" traefik || return 1
+    chmod 0755 "$_dest/traefik"
+    return 0
+}
+
+# Create the dedicated unprivileged traefik system user/group if missing.
+ensure_traefik_user() {
+    getent group traefik > /dev/null 2>&1 || groupadd --system traefik
+    id traefik > /dev/null 2>&1 || useradd --system --gid traefik \
+        --home-dir "$TRAEFIK_ROOT" --shell /usr/sbin/nologin traefik
+}
+
+# Write the systemd unit + hardening drop-in. Rewritten on every install;
+# TRAEFIK_LXC_COMPAT=1 omits mount-namespace sandboxing for targets
+# without it (seccomp/capability restrictions are kept either way).
+write_traefik_unit() {
+    mkdir -p "$TRAEFIK_DROPIN_DIR"
+    cat > "$TRAEFIK_UNIT" <<EOF
+[Unit]
+Description=Traefik reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=traefik
+Group=traefik
+ExecStart=$TRAEFIK_BIN --configFile=$TRAEFIK_ROOT/config/traefik.yml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "$TRAEFIK_UNIT"
+
+    {
+        cat <<'HARDEOF'
+# Managed by clinical_reverse_proxy.sh; rewritten on every install.
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+HARDEOF
+        if [[ "${TRAEFIK_LXC_COMPAT:-0}" != 1 ]]; then
+            cat <<EOF
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=$TRAEFIK_ROOT
+EOF
+        fi
+    } > "$TRAEFIK_DROPIN"
+    chmod 0644 "$TRAEFIK_DROPIN"
+    systemctl daemon-reload
+}
+
+# Fix ownership/permissions on the Traefik config tree for the traefik user.
+fix_traefik_perms() {
+    chown -R root:traefik "$TRAEFIK_ROOT/config" "$TRAEFIK_ROOT/certs" 2>/dev/null || true
+    chown -R traefik:traefik "$TRAEFIK_ROOT/logs" 2>/dev/null || true
+    find "$TRAEFIK_ROOT/config" "$TRAEFIK_ROOT/certs" -type d -exec chmod 0750 {} + 2>/dev/null || true
+    find "$TRAEFIK_ROOT/config" "$TRAEFIK_ROOT/certs" -type f -exec chmod 0640 {} + 2>/dev/null || true
+}
+
+# Write $TRAEFIK_ROOT/config/traefik.yml (the static config). Shared by the
+# local install flow and the REMOTEINSTALL heredoc so the template only
+# exists once. Reads HL7_ENABLED/HL7_LISTEN_PORTS/HL7_PORT_COMMENTS as
+# globals — both call sites already set these before calling it. No
+# providers.docker block: nothing in this deployment has ever carried a
+# Traefik label, so the file provider (config/dynamic) is the only one.
+write_traefik_static_config() {
+    local _file="$TRAEFIK_ROOT/config/traefik.yml"
+    tee "$_file" > /dev/null <<CONFEOF
+entryPoints:
+  http:
+    address: ':80'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
+    http:
+      redirections:
+        entryPoint:
+          to: 'https'
+          scheme: 'https'
+      encodedCharacters:
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
+  https:
+    address: ':443'
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
+    http:
+      encodedCharacters:
+        allowEncodedBackSlash: true   # \  (UNC paths)
+        allowEncodedSemicolon: true   # ;
+        allowEncodedPercent: true     # %
+        allowEncodedHash: true        # #
+  ping:
+    address: ':8800'
+CONFEOF
+
+    if [[ "$HL7_ENABLED" == "yes" ]]; then
+        local _ep_idx=0 _ep_ports _ep_comments _ep_port _ep_name _ep_comment _ep_addr_line
+        IFS='|' read -ra _ep_ports    <<< "$HL7_LISTEN_PORTS"
+        IFS='|' read -ra _ep_comments <<< "$HL7_PORT_COMMENTS"
+        for _ep_port in "${_ep_ports[@]}"; do
+            _ep_name="hl7"
+            [[ $_ep_idx -gt 0 ]] && _ep_name="hl7-${_ep_port}"
+            _ep_comment="${_ep_comments[$_ep_idx]:-}"
+            _ep_addr_line="    address: ':${_ep_port}'"
+            [[ -n "$_ep_comment" ]] && _ep_addr_line="${_ep_addr_line} # ${_ep_comment}"
+            cat >> "$_file" <<CONFEOF
+  ${_ep_name}:
+${_ep_addr_line}
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
+        idleTimeout: 0
+CONFEOF
+            (( ++_ep_idx ))
+        done
+    fi
+
+    cat >> "$_file" <<CONFEOF
+ping:
+  entryPoint: 'ping'
+
+providers:
+  file:
+    directory: $TRAEFIK_ROOT/config/dynamic
+    watch: true
+CONFEOF
+}
+
+# Install/upgrade the Traefik binary with rollback on failure.
+#   $1 = requested version ("latest" or vX.Y.Z); ignored (keeps the
+#        pinned version) unless $2=1 or no version is pinned yet.
+#   $2 = force (1 = upgrade/reinstall even if already pinned)
+#   $3 = optional pre-staged binary (e.g. extracted from an offline bundle
+#        by install_traefik_stack_offline) — when given, this is used
+#        directly instead of fetching from GitHub, but $1 still becomes
+#        the pinned VERSION recorded on success.
+# Rolls back the previous binary + hardening drop-in and restarts the
+# previous service if anything fails after changes begin — same shape as
+# the existing REMOTEINSTALL rollback_on_failure trap, scoped to just the
+# binary/unit instead of the whole /opt/indica/traefik tree.
+install_traefik_binary() {
+    local _requested="${1:-latest}" _force="${2:-0}" _staged_bin="${3:-}" _version _tmp
+    local _had_binary=0 _had_dropin=0 _was_active=0
+    # Save whatever ERR trap (if any) the caller already had registered —
+    # e.g. the REMOTEINSTALL script's own whole-tree rollback_on_failure —
+    # so this function restores it exactly instead of clobbering it.
+    local _prev_err_trap
+    _prev_err_trap=$(trap -p ERR)
+
+    if [[ -n "$_staged_bin" ]]; then
+        [[ "$_requested" != "latest" ]] || { log "A pinned version is required when installing from a staged binary"; return 1; }
+        _version="$_requested"
+    elif [[ -s "$TRAEFIK_VERSION_FILE" && "$_force" != "1" ]]; then
+        _version=$(head -n1 "$TRAEFIK_VERSION_FILE")
+        log "Traefik already pinned to $_version; keeping it."
     else
-        docker "$@"
+        _version=$(resolve_traefik_version "$_requested") || { log "Could not resolve Traefik version '$_requested'"; return 1; }
+    fi
+
+    _tmp=$(mktemp -d)
+    if [[ -n "$_staged_bin" ]]; then
+        install -m 0755 "$_staged_bin" "$_tmp/traefik" || { rm -rf "$_tmp"; return 1; }
+    elif ! fetch_traefik_release "$_version" "$_tmp"; then
+        rm -rf "$_tmp"
+        return 1
+    fi
+
+    ensure_traefik_user
+    mkdir -p "$TRAEFIK_ROOT/config/dynamic" "$TRAEFIK_ROOT/certs" "$TRAEFIK_ROOT/logs"
+
+    [[ -e "$TRAEFIK_BIN" ]] && { _had_binary=1; cp -a "$TRAEFIK_BIN" "$TRAEFIK_BIN.prev"; }
+    [[ -e "$TRAEFIK_DROPIN" ]] && { _had_dropin=1; cp -a "$TRAEFIK_DROPIN" "$TRAEFIK_DROPIN.prev"; }
+    systemctl is-active --quiet traefik.service && _was_active=1
+
+    # Self-disarming handler: restores whatever ERR trap was previously
+    # registered (none, or the caller's own) before it does anything else,
+    # so a leftover registration can never fire again later for an
+    # unrelated failure, and the caller's own trap isn't lost.
+    traefik_install_rollback() {
+        eval "${_prev_err_trap:-trap - ERR}"
+        log "Traefik install failed; rolling back to the previous binary."
+        systemctl stop traefik.service 2>/dev/null || true
+        if [[ $_had_binary -eq 1 ]]; then mv -f "$TRAEFIK_BIN.prev" "$TRAEFIK_BIN"; else rm -f "$TRAEFIK_BIN"; fi
+        if [[ $_had_dropin -eq 1 ]]; then mv -f "$TRAEFIK_DROPIN.prev" "$TRAEFIK_DROPIN"; else rm -f "$TRAEFIK_DROPIN"; fi
+        systemctl daemon-reload 2>/dev/null || true
+        [[ $_was_active -eq 1 ]] && systemctl restart traefik.service 2>/dev/null || true
+    }
+    trap traefik_install_rollback ERR
+
+    install -m 0755 -o root -g root "$_tmp/traefik" "$TRAEFIK_BIN.new"
+    mv -f "$TRAEFIK_BIN.new" "$TRAEFIK_BIN"
+    write_traefik_unit
+    fix_traefik_perms
+    systemctl enable traefik.service > /dev/null
+    systemctl restart traefik.service
+
+    if ! traefik_health_wait 15; then
+        traefik_install_rollback
+        rm -rf "$_tmp"
+        return 1
+    fi
+
+    eval "${_prev_err_trap:-trap - ERR}"
+    rm -f "$TRAEFIK_BIN.prev" "$TRAEFIK_DROPIN.prev"
+    rm -rf "$_tmp"
+    printf '%s\n' "$_version" > "$TRAEFIK_VERSION_FILE"
+    chmod 0644 "$TRAEFIK_VERSION_FILE"
+    log "Traefik $_version installed and healthy."
+    return 0
+}
+
+# Restart the native service and confirm it comes back healthy.
+traefik_restart() {
+    systemctl restart traefik.service
+    traefik_health_wait 15
+}
+
+# Stop/disable/remove the native Traefik install. $1=yes also removes
+# the config tree (certs, dynamic config, logs) — same "optionally wipe
+# everything" semantics as the old --clean Docker/image removal prompt.
+uninstall_traefik_native() {
+    local _remove_config="${1:-no}"
+    systemctl stop traefik.service 2>/dev/null || true
+    systemctl disable traefik.service 2>/dev/null || true
+    rm -f "$TRAEFIK_UNIT" "$TRAEFIK_DROPIN"
+    rmdir "$TRAEFIK_DROPIN_DIR" 2>/dev/null || true
+    rm -f "$TRAEFIK_BIN"
+    systemctl daemon-reload 2>/dev/null || true
+    if [[ "$_remove_config" == "yes" ]]; then
+        rm -rf "$TRAEFIK_ROOT"
     fi
 }
 
@@ -1102,7 +1444,7 @@ find_package_dir() {
 }
 
 # Find the wrapper directory of an extracted bundle (the one that holds
-# manifest.txt + packages/ + images/). Falls back to the package dir's parent.
+# manifest.txt + packages/ + bin/). Falls back to the package dir's parent.
 find_bundle_root() {
     local base_dir="$1"
 
@@ -1119,7 +1461,7 @@ find_bundle_root() {
     fi
 
     # No manifest — fall back to the package dir's parent so callers can still
-    # locate images/ if it happens to live alongside packages/.
+    # locate bin/ if it happens to live alongside packages/.
     local pkg_dir=""
     pkg_dir=$(find_package_dir "$base_dir" 2>/dev/null) || true
     if [ -n "$pkg_dir" ]; then
@@ -1527,11 +1869,12 @@ verify_bundle_compatibility() {
 
     detect_os_type 2>/dev/null || true
 
-    local b_family b_codename b_arch b_image
+    local b_family b_codename b_arch b_traefik_version b_traefik_arch
     b_family=$(grep -E '^OS_FAMILY=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
     b_codename=$(grep -E '^OS_CODENAME=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
     b_arch=$(grep -E '^ARCH=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
-    b_image=$(grep -E '^TRAEFIK_IMAGE=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    b_traefik_version=$(grep -E '^TRAEFIK_VERSION=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    b_traefik_arch=$(grep -E '^TRAEFIK_ARCH=' "$manifest" 2>/dev/null | cut -d= -f2- | tr -d '"')
 
     local target_arch
     target_arch=$(uname -m)
@@ -1548,8 +1891,24 @@ verify_bundle_compatibility() {
             return 1
         fi
         echo "    Continuing anyway because --force-os-mismatch is set." >&2
-        echo "$b_image"
+        echo "$b_traefik_version"
         return 0
+    fi
+
+    # Traefik's architecture check is independent of --force-os-mismatch and
+    # never overridable: that flag is about .deb/.rpm package-codename
+    # compatibility (which can, in practice, still work across a mismatch),
+    # but a binary built for the wrong architecture simply will not execute.
+    # Docker's multi-arch manifest used to make this a non-issue; it no
+    # longer is.
+    local this_traefik_arch
+    this_traefik_arch=$(traefik_arch) || true
+    if [ -n "$b_traefik_arch" ] && [ -n "$this_traefik_arch" ] && [ "$b_traefik_arch" != "$this_traefik_arch" ]; then
+        echo "" >&2
+        echo "❌ Bundle Traefik architecture mismatch: bundle=${b_traefik_arch}, target=${this_traefik_arch}" >&2
+        echo "    The Traefik binary in this bundle will not run on this host. Rebuild" >&2
+        echo "    the bundle (--prepare-offline) on a machine with this architecture." >&2
+        return 1
     fi
 
     local mismatch=""
@@ -1570,7 +1929,7 @@ verify_bundle_compatibility() {
         echo "    Continuing anyway because --force-os-mismatch is set." >&2
     fi
 
-    echo "$b_image"
+    echo "$b_traefik_version"
     return 0
 }
 
@@ -1614,16 +1973,16 @@ trap cleanup_offline_temp EXIT INT TERM
 # transferred to an air-gapped target. Bundle layout:
 #
 #   traefik-rp-packages-<codename>-<arch>-<date>/
-#   ├── manifest.txt         # OS family/codename/arch/date + Traefik image info
-#   ├── packages/            # all .deb or .rpm files
-#   │   └── *.deb|*.rpm
-#   ├── images/
-#   │   └── traefik.tar.gz   # docker save | gzip
-#   └── repo/                # docker.gpg (deb) or docker-ce.repo (rhel)
+#   ├── manifest.txt         # OS family/codename/arch/date + Traefik version/arch
+#   ├── packages/            # all .deb or .rpm files (prereqs + keepalived;
+#   │   └── *.deb|*.rpm      # no docker-ce — Traefik runs natively)
+#   └── bin/
+#       ├── traefik_<version>_linux_<arch>.tar.gz   # GitHub release tarball
+#       └── checksums.txt                           # its official checksums
 #
-# Always pulls docker.io/library/traefik:latest fresh (per project convention)
-# and records the resolved digest in the manifest so the offline install can
-# verify it loaded the same image.
+# Always resolves the latest stable Traefik release and records the exact
+# version + architecture in the manifest; the offline install re-verifies
+# the tarball's checksum before extracting it.
 
 prepare_offline_packages() {
     echo ""
@@ -1662,28 +2021,27 @@ prepare_offline_packages() {
     echo ""
 
     # ----------------------------------------------------------------------
-    # Preflight: bundle generation DOWNLOADS packages, the Docker repo/GPG
-    # key and the Traefik image — it cannot work without internet access.
-    # Probe download.docker.com up front (honouring any configured proxy) so
-    # an air-gapped box fails right here with a clear message instead of
-    # dying mid-bootstrap on the GPG key download. No -f: any HTTP response
-    # (200/301/403/…) proves reachability — only connection/DNS failures
-    # should trip this.
+    # Preflight: bundle generation DOWNLOADS packages and the Traefik
+    # release — it cannot work without internet access. Probe github.com
+    # up front (honouring any configured proxy) so an air-gapped box fails
+    # right here with a clear message instead of dying mid-fetch. No -f:
+    # any HTTP response (200/301/403/…) proves reachability — only
+    # connection/DNS failures should trip this.
     # ----------------------------------------------------------------------
-    echo -n "Checking internet access (download.docker.com)... "
-    if timeout 8 curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -sI "https://download.docker.com/" >/dev/null 2>&1; then
+    echo -n "Checking internet access (github.com)... "
+    if timeout 8 curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -sI "https://github.com/" >/dev/null 2>&1; then
         echo "✓ reachable"
         echo ""
     else
         echo "❌ unreachable"
         cat >&2 <<EOF
 
-❌ Bundle generation requires internet access, and download.docker.com is
-   not reachable from this machine.
+❌ Bundle generation requires internet access, and github.com is not
+   reachable from this machine.
 
    This option ([2] / --prepare-offline) downloads packages and the Traefik
-   image to BUILD a transferrable bundle — it must run on an internet-
-   connected machine of the same OS family/codename as the target
+   release binary to BUILD a transferrable bundle — it must run on an
+   internet-connected machine of the same OS family/codename as the target
    (this machine: ${OS_PRETTY}, codename: ${OS_CODENAME}).
 
    If this is your air-gapped target machine:
@@ -1708,35 +2066,21 @@ EOF
     local archive_basename="traefik-rp-packages-${OS_CODENAME}-${target_arch}-$(date +%Y%m%d)"
     local bundle_dir="${work_dir}/${archive_basename}"
     local pkg_dir="${bundle_dir}/packages"
-    local img_dir="${bundle_dir}/images"
-    local repo_dir="${bundle_dir}/repo"
+    local bin_dir="${bundle_dir}/bin"
 
-    mkdir -p "$pkg_dir" "$img_dir" "$repo_dir"
+    mkdir -p "$pkg_dir" "$bin_dir"
 
     # ----------------------------------------------------------------------
-    # Step 1/5: Bootstrap the prep machine. This makes --prepare-offline
-    # work on a freshly-installed VM with nothing but the OS:
-    #   - install apt-transport-https / software-properties-common (Debian)
-    #     or dnf-plugins-core (RHEL) so we can add the Docker repo and use
-    #     `dnf download --resolve` later.
-    #   - configure the Docker repo + GPG key.
-    #   - install Docker (CE) on the prep machine if it isn't already, so
-    #     `docker pull` and `docker save` work in step 3.
-    #   - start and enable the Docker daemon.
-    # All of this is idempotent — re-running on a machine that already has
-    # everything is a no-op.
+    # Step 1/5: Bootstrap the prep machine — just make sure curl/tar/gzip
+    # are present (needed to fetch the Traefik release and build the
+    # archive below). No Docker, no repo/GPG setup: a native binary needs
+    # neither, so this step shrinks to almost nothing.
     # ----------------------------------------------------------------------
     echo "Step 1/5: Bootstrapping prep machine..."
 
-    # Install our own minimum prereqs first. The script-level early prereqs
-    # check is sometimes skipped (e.g. when a stale bundle archive exists in
-    # the user's home from a previous run, the auto-detect code skips the
-    # online prereqs install on the assumption this is an offline target).
-    # So this step belt-and-braces: install what we need to add the Docker
-    # repo and call gpg/curl, even if the early check ran or didn't.
     if [ "$OS_FAMILY" = "debian" ]; then
         local _prep_missing=""
-        for _pkg in lsb-release ca-certificates gnupg curl wget; do
+        for _pkg in ca-certificates curl wget; do
             dpkg -l "$_pkg" 2>/dev/null | grep -q "^ii" || _prep_missing="$_prep_missing $_pkg"
         done
         if [ -n "$_prep_missing" ]; then
@@ -1747,7 +2091,7 @@ EOF
         fi
     elif [ "$OS_FAMILY" = "rhel" ]; then
         local _prep_missing=""
-        for _pkg in ca-certificates curl wget gnupg2; do
+        for _pkg in ca-certificates curl wget; do
             rpm -q "$_pkg" &>/dev/null || _prep_missing="$_prep_missing $_pkg"
         done
         if [ -n "$_prep_missing" ]; then
@@ -1755,96 +2099,16 @@ EOF
             dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} -y install $_prep_missing \
                 || { echo "❌ Failed to install:$_prep_missing"; exit 1; }
         fi
-    fi
-
-    if [ "$OS_FAMILY" = "debian" ]; then
-        # Note: we deliberately do NOT install apt-transport-https or
-        # software-properties-common here — they aren't actually used by the
-        # rest of the script and on minimal Debian installs (e.g. netinst
-        # without a full mirror) software-properties-common may not even be
-        # available. lsb-release/ca-certificates/gnupg/curl/wget were
-        # installed by the prep prerequisites block above.
-
-        # Add Docker repo + GPG key (idempotent).
-        install -m 0755 -d /etc/apt/keyrings
-        if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
-            echo "  Adding Docker GPG key..."
-            curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -fsSL \
-                "https://download.docker.com/linux/${OS_TYPE}/gpg" \
-                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
-                || { echo "❌ Failed to download Docker GPG key"; exit 1; }
-            chmod a+r /etc/apt/keyrings/docker.gpg
-        fi
-        cp /etc/apt/keyrings/docker.gpg "$repo_dir/docker.gpg"
-
-        if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
-            echo "  Adding Docker apt source..."
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_TYPE} ${OS_CODENAME} stable" \
-                > /etc/apt/sources.list.d/docker.list
-        fi
-        apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} update \
-            || { echo "❌ Failed to refresh apt indexes"; exit 1; }
-
-        # Install Docker on the prep machine if not already installed (needed
-        # for `docker pull` + `docker save` in step 3).
-        if ! command -v docker >/dev/null 2>&1; then
-            echo "  Docker not found on prep machine — installing..."
-            apt-get ${APT_PROXY_OPT_PROXY:-} ${APT_SSL_OPT} install -y \
-                docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
-                || { echo "❌ Failed to install Docker on prep machine"; exit 1; }
-        fi
-
-    elif [ "$OS_FAMILY" = "rhel" ]; then
-        # dnf-plugins-core provides `dnf download --resolve` which we use in
-        # step 2 to pull dependency-resolved RPMs into the bundle.
+        # dnf-plugins-core provides `dnf download --resolve`, used in step 2
+        # to pull dependency-resolved RPMs into the bundle (unrelated to Docker).
         if ! rpm -q dnf-plugins-core &>/dev/null; then
             echo "  Installing dnf-plugins-core..."
             dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} -y install dnf-plugins-core \
                 || { echo "❌ Failed to install dnf-plugins-core"; exit 1; }
         fi
-
-        # Add Docker repo (idempotent).
-        if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
-            echo "  Adding Docker repo..."
-            curl ${PROXY_CURL_OPTS:-} ${CURL_SSL_OPT} -fsSL \
-                "https://download.docker.com/linux/centos/docker-ce.repo" \
-                -o /etc/yum.repos.d/docker-ce.repo \
-                || { echo "❌ Failed to download docker-ce.repo"; exit 1; }
-        fi
-        cp /etc/yum.repos.d/docker-ce.repo "$repo_dir/docker-ce.repo"
-        dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True clean all >/dev/null 2>&1 || true
-
-        # Install Docker on the prep machine if not already installed.
-        if ! command -v docker >/dev/null 2>&1; then
-            echo "  Docker not found on prep machine — installing..."
-            # container-selinux is a hard dep of docker-ce on RHEL family.
-            if ! rpm -q container-selinux &>/dev/null; then
-                dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
-                    -y install container-selinux 2>/dev/null \
-                    || dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
-                        -y install container-selinux --nobest 2>/dev/null || true
-            fi
-            dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT:-} --setopt=skip_if_unavailable=True \
-                -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
-                || { echo "❌ Failed to install Docker on prep machine"; exit 1; }
-        fi
     fi
 
-    # Make sure the Docker daemon is running so we can pull/save the image.
-    systemctl enable docker >/dev/null 2>&1 || true
-    systemctl start  docker >/dev/null 2>&1 || true
-    sleep 2
-
-    if ! docker info >/dev/null 2>&1; then
-        echo ""
-        echo "❌ Docker daemon failed to start on the prep machine."
-        echo "   Investigate with:"
-        echo "     systemctl status docker"
-        echo "     journalctl -u docker -n 50"
-        exit 1
-    fi
-
-    echo "✓ Prep machine ready (helper tools, Docker repo, Docker daemon running)"
+    echo "✓ Prep machine ready"
     echo ""
 
     # ----------------------------------------------------------------------
@@ -1865,7 +2129,6 @@ EOF
             tar gzip unzip
             openssl
             keepalived
-            docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
         )
 
         # apt-get download into the package dir. We use --download-only with
@@ -1915,9 +2178,7 @@ EOF
             tar gzip unzip
             openssl
             dnf-plugins-core
-            container-selinux
             keepalived
-            docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
         )
 
         # dnf download --resolve pulls each package and ALL of its dependencies
@@ -1942,37 +2203,29 @@ EOF
     echo ""
 
     # ----------------------------------------------------------------------
-    # Step 3/5: Pull and save the Traefik image. Always pulls :latest fresh.
-    # Docker is guaranteed to be running here (Step 1 bootstrapped it).
+    # Step 3/5: Fetch and checksum-verify the Traefik release for the
+    # target architecture. Always resolves the latest stable release.
     # ----------------------------------------------------------------------
-    local traefik_image="docker.io/library/traefik:latest"
-    local traefik_digest=""
-    local traefik_version=""
+    local traefik_version traefik_arch_name
 
-    echo "Step 3/5: Pulling and saving Traefik image..."
-    echo "  Image: $traefik_image"
-
-    if ! docker pull "$traefik_image" 2>&1 | tail -5; then
-        echo "❌ ERROR: failed to pull $traefik_image"
-        echo "   Check network/proxy and that Docker Hub is reachable from this host."
-        exit 1
-    fi
-
-    traefik_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$traefik_image" 2>/dev/null || true)
-    traefik_version=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.version"}}' "$traefik_image" 2>/dev/null || true)
-    [ -z "$traefik_version" ] && \
-        traefik_version=$(docker run --rm "$traefik_image" version 2>/dev/null | awk '/^Version:/ {print $2; exit}')
-    [ -z "$traefik_version" ] && traefik_version="unknown"
-
+    echo "Step 3/5: Fetching Traefik release..."
+    traefik_arch_name=$(traefik_arch) || { echo "❌ ERROR: unsupported architecture for Traefik: $target_arch"; exit 1; }
+    traefik_version=$(resolve_traefik_version latest) \
+        || { echo "❌ ERROR: could not resolve the latest Traefik release from GitHub"; exit 1; }
     echo "  Version: $traefik_version"
-    echo "  Digest:  ${traefik_digest:-unknown}"
+    echo "  Arch:    $traefik_arch_name"
 
-    echo "  Saving to images/traefik.tar.gz..."
-    if ! docker save "$traefik_image" | gzip > "$img_dir/traefik.tar.gz"; then
-        echo "❌ ERROR: docker save failed"
+    if ! fetch_traefik_release "$traefik_version" "$bin_dir"; then
+        echo "❌ ERROR: failed to download/verify the Traefik release"
+        echo "   Check network/proxy and that GitHub is reachable from this host."
         exit 1
     fi
-    echo "  ✓ Image saved ($(du -h "$img_dir/traefik.tar.gz" | cut -f1))"
+    # fetch_traefik_release leaves the extracted binary + the downloaded
+    # tarball/checksums in $bin_dir; the install side only needs the
+    # tarball + checksums.txt (it re-extracts itself), so drop the loose
+    # binary here to avoid shipping it twice.
+    rm -f "$bin_dir/traefik"
+    echo "  ✓ Release fetched and checksum-verified ($(du -h "$bin_dir"/*.tar.gz | cut -f1))"
     echo ""
 
     # ----------------------------------------------------------------------
@@ -1983,7 +2236,7 @@ EOF
 # Clinical Reverse Proxy offline bundle manifest
 # Generated $(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
-BUNDLE_VERSION="1"
+BUNDLE_VERSION="2"
 BUILDER_VERSION="${VERSION}"
 OS_FAMILY="${OS_FAMILY}"
 OS_TYPE="${OS_TYPE}"
@@ -1993,10 +2246,9 @@ OS_PRETTY="${OS_PRETTY}"
 ARCH="${target_arch}"
 PACKAGE_EXT="${PACKAGE_EXT}"
 PACKAGE_COUNT="${pkg_count:-0}"
-TRAEFIK_IMAGE="${traefik_image}"
 TRAEFIK_VERSION="${traefik_version:-}"
-TRAEFIK_DIGEST="${traefik_digest:-}"
-HAS_IMAGE_TARBALL="$( [ -f "$img_dir/traefik.tar.gz" ] && echo yes || echo no )"
+TRAEFIK_ARCH="${traefik_arch_name:-}"
+HAS_TRAEFIK_BINARY="$( ls "$bin_dir"/*.tar.gz >/dev/null 2>&1 && echo yes || echo no )"
 BUILD_DATE="$(date +%Y-%m-%d)"
 BUILD_HOST="$(hostname)"
 MANIFEST
@@ -2101,6 +2353,8 @@ MANIFEST
 
 OFFLINE_BUNDLE_ROOT=""
 OFFLINE_TRAEFIK_LOADED="false"
+OFFLINE_TRAEFIK_VERSION=""
+OFFLINE_TRAEFIK_BIN=""
 
 install_traefik_stack_offline() {
     echo ""
@@ -2152,11 +2406,13 @@ install_traefik_stack_offline() {
     log "Package directory: $pkg_dir"
     log "Bundle root:       $bundle_root"
 
-    # OS compatibility check (hard-fails unless --force-os-mismatch).
-    local bundle_image=""
-    bundle_image=$(verify_bundle_compatibility "$bundle_root") || \
-        exit_on_error "Bundle is not compatible with this OS"
-    [ -n "$bundle_image" ] && log "Bundle Traefik image: $bundle_image"
+    # OS/arch compatibility check (hard-fails unless --force-os-mismatch;
+    # the Traefik architecture check inside is never overridable — a
+    # mismatched binary simply won't execute).
+    local bundle_traefik_version=""
+    bundle_traefik_version=$(verify_bundle_compatibility "$bundle_root") || \
+        exit_on_error "Bundle is not compatible with this OS/architecture"
+    [ -n "$bundle_traefik_version" ] && log "Bundle Traefik version: $bundle_traefik_version"
 
     # ----------------------------------------------------------------------
     # Install all packages from the bundle.
@@ -2231,7 +2487,6 @@ install_traefik_stack_offline() {
     fi
 
     # Verify required packages landed. Keepalived is only needed for HA.
-    command -v docker >/dev/null 2>&1 || exit_on_error "Docker did not install from bundle"
     if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ]; then
         command -v keepalived >/dev/null 2>&1 || exit_on_error "Keepalived did not install from bundle"
     else
@@ -2239,33 +2494,31 @@ install_traefik_stack_offline() {
     fi
     log "✓ Required packages installed from bundle"
 
-    # Make sure Docker is up so we can load the image into it.
-    systemctl enable docker >/dev/null 2>&1 || true
-    systemctl start  docker >/dev/null 2>&1 || true
-
-    if ! docker info >/dev/null 2>&1; then
-        echo "❌ Docker daemon is not responding after install."
-        echo "   Try: systemctl status docker  ;  journalctl -u docker -n 50"
-        exit_on_error "Docker daemon failed to start after offline install"
-    fi
-    log "✓ Docker daemon is running"
-
     # ----------------------------------------------------------------------
-    # Load the Traefik image from the bundle (if present).
+    # Stage the Traefik release from the bundle for install_traefik_binary
+    # (called later in the main flow). The bundle's bin/ dir carries the
+    # release tarball + its checksums.txt; extract+verify it here so a
+    # corrupted/tampered bundle is caught before anything is installed.
     # ----------------------------------------------------------------------
-    local image_tarball="${bundle_root}/images/traefik.tar.gz"
-    if [ -f "$image_tarball" ]; then
+    local bin_dir="${bundle_root}/bin"
+    local archive
+    archive=$(ls "$bin_dir"/traefik_*_linux_*.tar.gz 2>/dev/null | head -1)
+    if [ -n "$archive" ] && [ -f "$bin_dir/checksums.txt" ]; then
         echo ""
-        echo "Loading Traefik image from bundle..."
-        echo "  Source: $image_tarball"
-        if gunzip -c "$image_tarball" | docker load 2>&1 | tee -a "$LOGFILE"; then
-            OFFLINE_TRAEFIK_LOADED="true"
-            log "✓ Traefik image loaded from bundle"
-        else
-            exit_on_error "Failed to load Traefik image from bundle"
+        echo "Verifying Traefik release from bundle..."
+        (cd "$bin_dir" && awk -v name="$(basename "$archive")" '$2 == name' checksums.txt > selected.txt)
+        if [ "$(wc -l < "$bin_dir/selected.txt")" -ne 1 ]; then
+            exit_on_error "Could not find a unique checksum for $(basename "$archive") in the bundle"
         fi
+        (cd "$bin_dir" && sha256sum -c selected.txt) || exit_on_error "Traefik release checksum verification failed"
+        tar -xzf "$archive" -C "$bin_dir" traefik || exit_on_error "Failed to extract Traefik release from bundle"
+        chmod 0755 "$bin_dir/traefik"
+        OFFLINE_TRAEFIK_LOADED="true"
+        OFFLINE_TRAEFIK_VERSION="$bundle_traefik_version"
+        OFFLINE_TRAEFIK_BIN="$bin_dir/traefik"
+        log "✓ Traefik $bundle_traefik_version verified and extracted from bundle"
     else
-        echo "⚠️  Bundle has no Traefik image — image will need to be loaded manually."
+        echo "⚠️  Bundle has no Traefik release — it will need to be installed manually."
     fi
 
     echo ""
@@ -2617,7 +2870,7 @@ check_single_node() {
     local node_ip="$3"
     
     local REPO_CHECK_FAILED=0
-    DOCKER_AUTH_BLOCKED=false
+    GITHUB_BLOCKED=false
     local FAILED_REPOS=()
     
     # Configure proxy for connectivity checks
@@ -2653,68 +2906,45 @@ check_single_node() {
         fi
     }
     
-    # Check 1: Docker Package Repository
-    echo -n "  Docker packages (download.docker.com)... "
-    DOWNLOAD_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://download.docker.com 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$DOWNLOAD_TEST" | grep -q "200\|301\|302\|403"; then
+    # Check 1: GitHub API (release metadata lookup)
+    echo -n "  GitHub API (api.github.com)... "
+    GH_API_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://api.github.com 2>/dev/null || echo 'FAILED'")
+
+    if echo "$GH_API_TEST" | grep -q "200\|301\|302\|403"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker packages (download.docker.com)")
-    fi
-    
-    # Check 2: Docker Hub Registry API
-    echo -n "  Docker Hub registry (registry-1.docker.io)... "
-    REGISTRY_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://registry-1.docker.io/v2/ 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$REGISTRY_TEST" | grep -q "200\|301\|401"; then
-        echo "✓ Reachable"
-    else
-        echo "❌ FAILED"
-        REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker Hub registry (registry-1.docker.io)")
+        GITHUB_BLOCKED=true
+        FAILED_REPOS+=("GitHub API (api.github.com)")
     fi
 
-    # Check 2b: Docker Auth Service (required for image pulls)
-    echo -n "  Docker auth (auth.docker.io)... "
-    AUTH_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://auth.docker.io/token 2>/dev/null || echo 'FAILED'")
+    # Check 2: GitHub release download (the tarball itself)
+    echo -n "  GitHub releases (github.com)... "
+    GH_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://github.com 2>/dev/null || echo 'FAILED'")
 
-    if echo "$AUTH_TEST" | grep -q "200\|400\|401"; then
-        echo "✓ Reachable"
-        DOCKER_AUTH_BLOCKED=false
-    else
-        echo "❌ FAILED (image pulls will fail — auth endpoint blocked)"
-        REPO_CHECK_FAILED=1
-        DOCKER_AUTH_BLOCKED=true
-        FAILED_REPOS+=("Docker auth (auth.docker.io)")
-    fi
-    
-    # Check 3: Docker Hub Main Domain
-    echo -n "  Docker Hub (docker.io)... "
-    DOCKERIO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://docker.io 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$DOCKERIO_TEST" | grep -q "200\|301\|302"; then
+    if echo "$GH_TEST" | grep -q "200\|301\|302"; then
         echo "✓ Reachable"
     else
         echo "❌ FAILED"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker Hub (docker.io)")
+        GITHUB_BLOCKED=true
+        FAILED_REPOS+=("GitHub releases (github.com)")
     fi
-    
-    # Check 4: Docker Image Storage (Cloudflare R2)
-    echo -n "  Docker image storage (docker-images-prod...cloudflarestorage.com)... "
-    R2_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com 2>/dev/null || echo 'FAILED'")
-    
-    if echo "$R2_TEST" | grep -q "200\|301\|302\|400\|403\|404"; then
+
+    # Check 3: GitHub release asset CDN (where the tarball is actually served from)
+    echo -n "  GitHub release assets (objects.githubusercontent.com)... "
+    GH_ASSET_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} https://objects.githubusercontent.com 2>/dev/null || echo 'FAILED'")
+
+    if echo "$GH_ASSET_TEST" | grep -q "200\|301\|302\|400\|403\|404"; then
         echo "✓ Reachable"
     else
-        echo "❌ FAILED (image downloads will fail)"
+        echo "❌ FAILED (release downloads will fail)"
         REPO_CHECK_FAILED=1
-        FAILED_REPOS+=("Docker image storage (docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com)")
+        GITHUB_BLOCKED=true
+        FAILED_REPOS+=("GitHub release assets (objects.githubusercontent.com)")
     fi
-    
+
     # Check 5: Standard package repositories
     echo -n "  Standard package repositories... "
     
@@ -2774,7 +3004,7 @@ check_single_node() {
     if [ "$check_type" = "remote" ]; then
         # Check DNS resolution
         echo -n "  DNS resolution... "
-        DNS_TEST=$(run_check "getent hosts registry-1.docker.io >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
+        DNS_TEST=$(run_check "getent hosts github.com >/dev/null 2>&1 && echo 'OK' || echo 'FAILED'")
         
         if echo "$DNS_TEST" | grep -q "OK"; then
             echo "✓ Working"
@@ -2786,7 +3016,7 @@ check_single_node() {
         
         # Check outbound HTTPS
         echo -n "  Outbound HTTPS (port 443)... "
-        HTTPS_TEST=$(run_check "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/registry-1.docker.io/443' 2>/dev/null && echo 'OK' || echo 'FAILED'")
+        HTTPS_TEST=$(run_check "timeout 5 bash -c 'cat < /dev/null > /dev/tcp/github.com/443' 2>/dev/null && echo 'OK' || echo 'FAILED'")
         
         if echo "$HTTPS_TEST" | grep -q "OK"; then
             echo "✓ Open"
@@ -2812,7 +3042,7 @@ check_single_node() {
         if [ "$check_type" = "local" ]; then
             echo ""
             echo "  Possible causes:"
-            echo "    1. Firewall blocking Docker Hub"
+            echo "    1. Firewall blocking GitHub"
             echo "    2. Network connectivity issues"
             echo "    3. Proxy misconfiguration"
             echo "    4. DNS resolution problems"
@@ -2828,15 +3058,14 @@ check_single_node() {
                 echo "  Proxy: Not configured"
             fi
             echo ""
-            
-            echo "  Required Docker endpoints:"
-            echo "    - download.docker.com"
-            echo "    - registry-1.docker.io"
-            echo "    - docker.io"
-            echo "    - docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
+
+            echo "  Required GitHub endpoints (to fetch the Traefik binary):"
+            echo "    - api.github.com"
+            echo "    - github.com"
+            echo "    - objects.githubusercontent.com"
             echo ""
-            
-            if ! prompt_yn "  Continue anyway? Docker pulls will likely fail." "n"; then
+
+            if ! prompt_yn "  Continue anyway? Fetching Traefik will likely fail." "n"; then
                 echo "  Installation cancelled."
                 cleanup
                 exit 1
@@ -2951,7 +3180,7 @@ _early_net_ok() {
     if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
         return 0
     fi
-    timeout 5 bash -c 'exec 3<>/dev/tcp/download.docker.com/443' 2>/dev/null && return 0
+    timeout 5 bash -c 'exec 3<>/dev/tcp/github.com/443' 2>/dev/null && return 0
     timeout 5 bash -c 'exec 3<>/dev/tcp/deb.debian.org/80' 2>/dev/null && return 0
     return 1
 }
@@ -3216,7 +3445,7 @@ EOFBANNER
 ║                                                 ║
 ║        ▶  ONLINE INSTALLATION MODE  ◀           ║
 ║                                                 ║
-║   Source: package repos + Docker Hub            ║
+║   Source: package repos + GitHub (Traefik)      ║
 ║                                                 ║
 ╚═════════════════════════════════════════════════╝
 EOFBANNER
@@ -3375,11 +3604,21 @@ echo ""
 echo ":: Cleaning orphaned node: $(hostname)"
 echo "──────────────────────────────────────────────────"
 
-# Stop and remove Traefik container
-echo -n "Stopping Traefik container... "
-docker stop traefik 2>/dev/null || true
-docker rm traefik 2>/dev/null || true
+# Stop/disable the native Traefik service and remove the binary + unit
+echo -n "Stopping Traefik service... "
+systemctl stop traefik.service 2>/dev/null || true
+systemctl disable traefik.service 2>/dev/null || true
+rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
+rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
+rm -f /usr/local/bin/traefik
+systemctl daemon-reload 2>/dev/null || true
 echo "✓"
+
+# Leftover from a pre-migration Docker-based install, if any
+if command -v docker &>/dev/null; then
+    docker stop traefik 2>/dev/null || true
+    docker rm traefik 2>/dev/null || true
+fi
 
 # Remove Traefik files
 echo -n "Removing /opt/indica/traefik... "
@@ -3500,7 +3739,7 @@ if [[ "$1" == "--clean" ]]; then
                     UNINSTALL_KEEPALIVED_REMOTE=true
                 fi
                 
-                if prompt_yn "Uninstall Docker on backup nodes?" "n"; then
+                if prompt_yn "Uninstall Docker on backup nodes? (only relevant if a node still has a pre-migration Docker-based install)" "n"; then
                     echo ""
                     echo "⚠️  WARNING: This will remove Docker and ALL containers/images on backup nodes!"
                     if prompt_yn "Are you absolutely sure?" "n"; then
@@ -3535,7 +3774,7 @@ if [[ "$1" == "--clean" ]]; then
     echo ""
     echo ""
     echo "  ┌─ What will be removed ────────────────────────────────────────"
-    echo "  │  - Traefik Docker container and all configuration"
+    echo "  │  - Traefik service, binary, and all configuration"
     echo "  │  - SSL certificates and keys"
     echo "  │  - Keepalived service and configuration"
     echo "  │  - Deployment configuration file"
@@ -3593,51 +3832,47 @@ set -e
 
 echo "Starting cleanup on $(hostname)..."
 
-# Check if we can access docker
-DOCKER_ACCESSIBLE=true
-if ! docker ps &>/dev/null 2>&1; then
-    if sg docker -c "docker ps" &>/dev/null 2>&1; then
-        DOCKER_ACCESSIBLE="sg"
-    else
-        DOCKER_ACCESSIBLE=false
-    fi
-fi
-
-cleanup_docker_cmd() {
-    if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
-        docker "$@"
-    elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
-        sg docker -c "docker $*"
-    else
-        return 1
-    fi
-}
-
-# Stop and remove Traefik
+# Stop/disable the native Traefik service and remove the binary + unit.
 echo -n "Stopping Traefik... "
-if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
-    cleanup_docker_cmd stop traefik 2>/dev/null || true
-    echo "✓ Removed"
-else
-    echo "Not running"
-fi
+systemctl stop traefik.service 2>/dev/null || true
+echo "✓ Stopped"
 
-echo -n "Removing Traefik container... "
-if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
-    cleanup_docker_cmd rm traefik 2>/dev/null || true
-    echo "✓ Removed"
-else
-    echo "Not found"
-fi
+echo -n "Removing Traefik service..."
+systemctl disable traefik.service 2>/dev/null || true
+rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
+rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
+rm -f /usr/local/bin/traefik
+systemctl daemon-reload 2>/dev/null || true
+echo "✓ Removed"
 
-# Remove Docker network
-#echo -n "Removing Docker network 'proxynet'... "
-#if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
-#    cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-#    echo "✓ Removed"
-#else
-#    echo "Not found"
-#fi
+# Leftover from a pre-migration Docker-based install, if any.
+if command -v docker &>/dev/null; then
+    DOCKER_ACCESSIBLE=true
+    if ! docker ps &>/dev/null 2>&1; then
+        if sg docker -c "docker ps" &>/dev/null 2>&1; then
+            DOCKER_ACCESSIBLE="sg"
+        else
+            DOCKER_ACCESSIBLE=false
+        fi
+    fi
+    cleanup_docker_cmd() {
+        if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
+            docker "$@"
+        elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
+            sg docker -c "docker $*"
+        else
+            return 1
+        fi
+    }
+    echo -n "Removing legacy Traefik container (if any)... "
+    if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
+        cleanup_docker_cmd stop traefik 2>/dev/null || true
+        cleanup_docker_cmd rm traefik 2>/dev/null || true
+        echo "✓ Removed"
+    else
+        echo "Not found"
+    fi
+fi
 
 # Remove Traefik directories
 echo -n "Removing Traefik directories... "
@@ -3775,7 +4010,7 @@ REMOTECLEANUP
             else
                 echo "⚠️  Cleanup on $node_name may be incomplete — one or more remote steps failed"
                 echo "   Traefik/Keepalived could still be running there. Verify manually:"
-                echo "     ssh ${CURRENT_USER}@${node_ip} 'docker ps; systemctl status keepalived'"
+                echo "     ssh ${CURRENT_USER}@${node_ip} 'systemctl status traefik keepalived'"
             fi
             
         else
@@ -3789,67 +4024,23 @@ REMOTECLEANUP
             echo ""
             echo ""
             
-            # Check if we can access docker
-            DOCKER_ACCESSIBLE=true
-            if ! docker ps &>/dev/null; then
-                if sg docker -c "docker ps" &>/dev/null 2>&1; then
-                    DOCKER_ACCESSIBLE="sg"
-                else
-                    DOCKER_ACCESSIBLE=false
-                fi
-            fi
-            
-            cleanup_docker_cmd() {
-                if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
-                    docker "$@"
-                elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
-                    sg docker -c "docker $*"
-                else
-                    return 1
-                fi
-            }
-            
-            # Stop and remove Traefik container
-            echo -n "Stopping Traefik container... "
-            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
-                cleanup_docker_cmd stop traefik 2>/dev/null || true
-                echo "✓ Stopped"
-            else
-                echo "Not running or Docker not accessible"
-            fi
-            
-            echo -n "Removing Traefik container... "
-            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
-                cleanup_docker_cmd rm traefik 2>/dev/null || true
+            # Stop/disable the native Traefik service and remove the binary + unit.
+            echo -n "Stopping Traefik service... "
+            systemctl stop traefik.service 2>/dev/null || true
+            echo "✓ Stopped"
+
+            echo -n "Removing Traefik service... "
+            uninstall_traefik_native "no"
+            echo "✓ Removed"
+
+            # Leftover from a pre-migration Docker-based install, if any.
+            if command -v docker &>/dev/null && docker ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
+                echo -n "Removing legacy Traefik container... "
+                docker stop traefik 2>/dev/null || sg docker -c "docker stop traefik" 2>/dev/null || true
+                docker rm traefik 2>/dev/null || sg docker -c "docker rm traefik" 2>/dev/null || true
                 echo "✓ Removed"
-            else
-                echo "Not found or Docker not accessible"
             fi
-            
-            # Remove Docker network
-            # echo -n "Removing Docker network 'proxynet'... "
-            # if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd network inspect proxynet >/dev/null 2>&1; then
-            #     cleanup_docker_cmd network rm proxynet 2>/dev/null || true
-            #     echo "✓ Removed"
-            # else
-            #     echo "Not found or Docker not accessible"
-            # fi
-            
-            # Remove Traefik image (optional)
-            if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd images 2>/dev/null | grep -q traefik; then
-                echo ""
-                if prompt_yn "Remove Traefik Docker image?" "n"; then
-                    echo -n "Removing Traefik images... "
-                    IMAGE_IDS=$(cleanup_docker_cmd images | grep traefik | awk '{print $3}')
-                    if [ -n "$IMAGE_IDS" ]; then
-                        for img_id in $IMAGE_IDS; do
-                            cleanup_docker_cmd rmi -f "$img_id" 2>/dev/null || true
-                        done
-                    fi
-                    echo "✓ Removed"
-                fi
-            fi
-            
+
             # Remove Traefik directories
             echo -n "Removing Traefik directories... "
             if [ -d "/opt/indica/traefik" ]; then
@@ -4240,45 +4431,32 @@ _extend_restart_traefik_all_nodes() {
 
     # Local node
     echo -n "  Local node... "
-    if [[ ! -f "/opt/indica/traefik/docker-compose.yaml" ]]; then
-        echo "✗ docker-compose.yaml not found"
+    if [[ ! -x "$TRAEFIK_BIN" ]]; then
+        echo "✗ Traefik binary not found"
         echo ""
-        if prompt_yn "  Recreate docker-compose.yaml?" "y"; then
-            recreate_docker_compose
-            # Re-add CA mount if CA cert is present
-            if [[ -f "/opt/indica/traefik/certs/customca.crt" ]]; then
-                sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' \
-                    /opt/indica/traefik/docker-compose.yaml 2>/dev/null || true
-            fi
+        if prompt_yn "  Reinstall Traefik now?" "y"; then
+            install_traefik_binary "${TRAEFIK_VERSION:-latest}" "${TRAEFIK_UPGRADE:-0}" || {
+                echo "  Reinstall failed."
+                return 1
+            }
+            echo "✓ healthy"
+            # install_traefik_binary already restarted + health-checked it.
         else
-            echo "  Cannot restart Traefik without docker-compose.yaml"
+            echo "  Cannot restart Traefik without the binary installed"
             return 1
         fi
-    fi
-    docker_cmd compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate 2>&1 || {
-        echo "✗ FAILED"
-        echo ""
-        echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo "  !! WARNING — Traefik failed to restart locally            !!"
-        echo "  !! Your previous config snapshot can be found in:         !!"
-        echo "  !!   ${TRAEFIK_ROOT}/backups/                             !!"
-        echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        return 1
-    }
-
-    # Health check local with retry
-    local _healthy=false
-    for _i in $(seq 1 10); do
-        if curl -fs http://localhost:8800/ping >/dev/null 2>&1; then
-            _healthy=true; break
-        fi
-        sleep 1
-    done
-
-    if [[ "$_healthy" == true ]]; then
-        echo "✓ healthy"
     else
-        echo "⚠️  started but health check not responding — check: docker logs traefik"
+        if ! traefik_restart; then
+            echo "✗ FAILED"
+            echo ""
+            echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "  !! WARNING — Traefik failed to restart locally            !!"
+            echo "  !! Your previous config snapshot can be found in:         !!"
+            echo "  !!   ${TRAEFIK_ROOT}/backups/                             !!"
+            echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            return 1
+        fi
+        echo "✓ healthy"
     fi
 
     # Backup nodes
@@ -4290,18 +4468,12 @@ _extend_restart_traefik_all_nodes() {
             local _restart_result _restart_ok=false
             if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
                 if _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1); then
-                    _restart_ok=true
-                elif _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1); then
+                    "sudo systemctl restart traefik.service 2>&1" 2>&1); then
                     _restart_ok=true
                 fi
             else
                 if _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && docker compose up -d --force-recreate 2>&1" 2>&1); then
-                    _restart_ok=true
-                elif _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "cd /opt/indica/traefik && sg docker -c 'docker compose up -d --force-recreate' 2>&1" 2>&1); then
+                    "sudo systemctl restart traefik.service 2>&1" 2>&1); then
                     _restart_ok=true
                 fi
             fi
@@ -4353,9 +4525,9 @@ extend_update_ssl() {
     echo "Paste the new SSL private key:"
     SSL_KEY_CONTENT=$(prompt_ssl_input "key")
 
-    # Guard: Docker auto-creates missing bind-mount sources as directories,
-    # so a prior compose recreate before these files existed can leave
-    # cert.crt / server.key as directories instead of files.
+    # Guard: a pre-migration Docker install auto-created missing bind-mount
+    # sources as directories, so a node migrated from that layout can still
+    # have cert.crt / server.key as directories instead of files.
     for _f in "${_cert_file}" "${_key_file}"; do
         if [[ -d "${_f}" ]]; then
             echo "  ⚠️  ${_f} exists as a directory — removing so the certificate can be written"
@@ -4409,45 +4581,6 @@ extend_update_ssl() {
 # Extend Mode — Option 2: Update CA Certificate
 # ==========================================
 
-# Recreate docker-compose.yaml from template if missing or corrupt
-recreate_docker_compose() {
-    local _compose="/opt/indica/traefik/docker-compose.yaml"
-    local _use_ca="${1:-no}"  # pass "yes" to include customca volume mount
-
-    echo -n "  Recreating docker-compose.yaml... "
-    mkdir -p /opt/indica/traefik
-
-    cat > "$_compose" <<EOF
-services:
-  traefik:
-    image: docker.io/library/traefik:latest
-    container_name: traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - label=type:container_runtime_t
-    cap_add:
-      - NET_BIND_SERVICE
-    network_mode: "host"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./config/traefik.yml:/traefik.yml:ro
-      - ./config/dynamic:/dynamic:ro
-      - ./certs/cert.crt:/certs/cert.crt:ro
-      - ./certs/server.key:/certs/server.key:ro
-      - ./logs:/var/log
-EOF
-
-    if [[ "$_use_ca" == "yes" ]]; then
-        echo "      - ./certs/customca.crt:/certs/customca.crt:ro" >> "$_compose"
-    fi
-
-    chmod 640 "$_compose"
-    chown root:root "$_compose"
-    echo "✓"
-}
-
 extend_update_ca() {
     echo ""
     echo ""
@@ -4469,9 +4602,10 @@ extend_update_ca() {
     if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
         mkdir -p "$(dirname "$_ca_file")"
 
-        # Guard: a previous run may have left this path as a directory
-        # (e.g. Docker created it as a bind-mount target before the file
-        # existed). Remove it so we can write the cert as a plain file.
+        # Guard: a previous run (or a pre-migration Docker install, which
+        # auto-created missing bind-mount sources as directories) may have
+        # left this path as a directory. Remove it so we can write the
+        # cert as a plain file.
         if [[ -d "${_ca_file}" ]]; then
             echo "  ⚠️  ${_ca_file} exists as a directory — removing so the certificate can be written"
             rm -rf "${_ca_file}"
@@ -4480,30 +4614,6 @@ extend_update_ca() {
         echo "$CUSTOM_CA_CERT_CONTENT" > "${_ca_file}"
         chmod 644 "${_ca_file}"
         echo "✓ CA certificate written locally"
-
-        # Add volume mount to docker-compose.yaml if not already present
-        local _compose="/opt/indica/traefik/docker-compose.yaml"
-        if [[ -f "$_compose" ]]; then
-            if ! grep -q "customca.crt" "$_compose"; then
-                sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' "$_compose"
-                if grep -q "customca.crt" "$_compose"; then
-                    echo "✓ Custom CA volume mount added to docker-compose.yaml"
-                else
-                    echo "⚠️  Could not add volume mount automatically — add manually:"
-                    echo "     - ./certs/customca.crt:/certs/customca.crt:ro"
-                fi
-            else
-                echo "✓ Custom CA volume mount already present in docker-compose.yaml"
-            fi
-        else
-            echo "⚠️  docker-compose.yaml not found"
-            echo ""
-            if prompt_yn "  docker-compose.yaml is missing. Recreate it now?" "y"; then
-                recreate_docker_compose "yes"
-            else
-                echo "  ⚠️  Cannot restart Traefik without docker-compose.yaml"
-            fi
-        fi
 
         # Add serversTransport to clinical_conf.yml if not already present
         local _clinical_conf="/opt/indica/traefik/config/dynamic/clinical_conf.yml"
@@ -4556,20 +4666,6 @@ CACONF
                 else
                     ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                         "chmod 644 /opt/indica/traefik/certs/customca.crt" 2>/dev/null || true
-                fi
-                # Also update docker-compose.yaml on backup node if mount not present
-                if [[ -f "$_compose" ]]; then
-                    local _remote_has_mount
-                    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                        _remote_has_mount=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                            "grep -q customca.crt /opt/indica/traefik/docker-compose.yaml 2>/dev/null && echo yes || echo no" 2>/dev/null)
-                    else
-                        _remote_has_mount=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                            "grep -q customca.crt /opt/indica/traefik/docker-compose.yaml 2>/dev/null && echo yes || echo no" 2>/dev/null)
-                    fi
-                    if [[ "$_remote_has_mount" != "yes" ]]; then
-                        copy_to_remote_root "$_compose" "$ip" "/opt/indica/traefik/docker-compose.yaml"
-                    fi
                 fi
                 # Push updated clinical_conf.yml if serversTransport was added
                 if [[ -f "$_clinical_conf" ]] && grep -q "serversTransports" "$_clinical_conf"; then
@@ -5080,7 +5176,7 @@ PREREQSCRIPT
             groupadd -r keepalived_script
         fi
         if ! id "keepalived_script" &>/dev/null; then
-            useradd -r -s /sbin/nologin -G keepalived_script -g docker -M keepalived_script
+            useradd -r -s /sbin/nologin -g keepalived_script -M keepalived_script
         fi
 
         # Write health check script
@@ -5093,7 +5189,7 @@ else
 fi
 HEALTHCHECK
         chmod +x /bin/indica_service_check.sh
-        chown keepalived_script:docker /bin/indica_service_check.sh
+        chown keepalived_script:keepalived_script /bin/indica_service_check.sh
 
         local KEEPALIVED_CONF="/etc/keepalived/keepalived.conf"
 
@@ -5107,6 +5203,8 @@ vrrp_script check_traefik {
   script "/bin/indica_service_check.sh"
   interval 2
   weight 50
+  fall 2
+  rise 2
 }
 vrrp_instance ${VRRP} {
   state MASTER
@@ -5145,7 +5243,6 @@ EOF
 
     # Ensure path vars are set (they are in main flow; may not be in extend mode)
     TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DYNAMIC_DIR:-/opt/indica/traefik/config/dynamic}"
-    DISABLE_DOCKER_REPO="${DISABLE_DOCKER_REPO:-no}"
 
     # Save config so the deployment config file on the remote is up-to-date
     snapshot_config "NODE_ADD" "Backup node(s) added"
@@ -7164,16 +7261,14 @@ extend_edit_hl7() {
 # Relies on globals: BACKUP_NODES, BACKUP_IPS, BACKUP_INTERFACES,
 #   CONFIG_FILE, SCRIPTS_DIR, SSH_OPTS, SUDO_PASS,
 #   TRAEFIK_DYNAMIC_DIR (falls back to hardcoded path),
-#   DISABLE_DOCKER_REPO (falls back to "no"),
 #   proxy/SSL variables, HL7 variables, VRRP, VRID, VIRTUAL_IP, AUTH_PASS
 # ==========================================
 
 deploy_to_backup_nodes() {
     local start_idx="${1:-0}"
 
-    # Ensure path and flag vars have sane defaults when called from extend mode
+    # Ensure path vars have sane defaults when called from extend mode
     TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DYNAMIC_DIR:-/opt/indica/traefik/config/dynamic}"
-    DISABLE_DOCKER_REPO="${DISABLE_DOCKER_REPO:-no}"
 
     # If we're in offline mode, push the bundle archive to every backup node
     # before we start writing per-node install scripts. The remote install
@@ -7206,10 +7301,27 @@ deploy_to_backup_nodes() {
 
         log "Creating installation script for $node..."
 
-write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh" <<'REMOTEINSTALL'
+{
+    # Embed the native-install library as literal source (declare -f prints
+    # a function's exact text, so this is safe inside a script that will
+    # run as its own standalone process on the backup node — no sourcing,
+    # no dependency on this master script being present over there). This
+    # is what keeps the Traefik install/rollback logic defined ONCE instead
+    # of duplicated by hand into every remote heredoc.
+    declare -f traefik_arch resolve_traefik_version fetch_traefik_release \
+        ensure_traefik_user write_traefik_unit write_traefik_static_config \
+        fix_traefik_perms install_traefik_binary traefik_restart \
+        traefik_health_wait traefik_is_active uninstall_traefik_native
+    declare -p TRAEFIK_BIN TRAEFIK_ROOT TRAEFIK_UNIT TRAEFIK_DROPIN_DIR \
+        TRAEFIK_DROPIN TRAEFIK_VERSION_FILE TRAEFIK_HEALTH_URL
+    cat <<'REMOTEINSTALL'
 #!/bin/bash
 set -e
 set -x
+
+# Minimal standalone logger — this script runs on its own over SSH, with
+# none of the master script's LOGFILE plumbing available.
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
 # Belt-and-braces: also clean up the staged /tmp files (deployment.config
 # carries the plaintext TLS private key + Keepalived AUTH_PASS) on ANY exit
@@ -7234,8 +7346,11 @@ rollback_on_failure() {
     echo "❌ Installation failed after the existing Traefik install was backed up."
     echo "   Attempting to restore the previous install from: ${_ROLLBACK_BACKUP_DIR}"
 
-    docker stop traefik 2>/dev/null || true
-    docker rm traefik 2>/dev/null || true
+    systemctl stop traefik.service 2>/dev/null || true
+    if command -v docker &>/dev/null; then
+        docker stop traefik 2>/dev/null || true
+        docker rm traefik 2>/dev/null || true
+    fi
 
     # Clear out whatever the failed new install partially wrote, but never
     # touch backups/ itself — that's where the restore source lives.
@@ -7245,15 +7360,15 @@ rollback_on_failure() {
     find "${_ROLLBACK_BACKUP_DIR}" -mindepth 1 -maxdepth 1 \
         -exec mv {} /opt/indica/traefik/ \; 2>/dev/null || true
 
-    if [[ -f /opt/indica/traefik/docker-compose.yaml ]]; then
-        if (cd /opt/indica/traefik && docker compose up -d 2>&1); then
+    if [[ -x "$TRAEFIK_BIN" && -f /opt/indica/traefik/config/traefik.yml ]]; then
+        if systemctl restart traefik.service 2>&1; then
             echo "✓ Previous Traefik install restored and restarted"
         else
-            echo "⚠️  Restored the previous files but the old Traefik container failed to start."
-            echo "   Manual intervention needed: cd /opt/indica/traefik && docker compose up -d"
+            echo "⚠️  Restored the previous files but Traefik failed to start."
+            echo "   Manual intervention needed: systemctl status traefik; journalctl -u traefik"
         fi
     else
-        echo "⚠️  No docker-compose.yaml found after restore — manual intervention needed."
+        echo "⚠️  No Traefik binary/config found after restore — manual intervention needed."
     fi
 }
 trap 'rollback_on_failure' ERR
@@ -7272,7 +7387,9 @@ echo ""
 # Migrate /home/haloap/traefik → /opt/indica/traefik if needed
 if [[ -d "/home/haloap/traefik" && ! -d "/opt/indica/traefik" ]]; then
     echo ":: Migrating legacy /home/haloap/traefik → /opt/indica/traefik"
-    (cd /home/haloap/traefik && docker compose down 2>/dev/null) || true
+    if command -v docker &>/dev/null; then
+        (cd /home/haloap/traefik && docker compose down 2>/dev/null) || true
+    fi
     mkdir -p /opt/indica
     mv /home/haloap/traefik /opt/indica/traefik
     sed -i 's|/home/haloap|/opt/indica|g' /opt/indica/traefik/deployment.config 2>/dev/null || true
@@ -7299,9 +7416,13 @@ if [[ -d "/opt/indica/traefik" ]]; then
     # From this point on, if installation fails, rollback_on_failure (ERR
     # trap) will try to restore what was just moved out of the way.
     _ROLLBACK_BACKUP_DIR="${_backup_dir}"
-    # Stop existing container
-    docker stop traefik 2>/dev/null || true
-    docker rm traefik 2>/dev/null || true
+    # Stop any existing native service, and any leftover pre-migration
+    # Docker container, before reinstalling.
+    systemctl stop traefik.service 2>/dev/null || true
+    if command -v docker &>/dev/null; then
+        docker stop traefik 2>/dev/null || true
+        docker rm traefik 2>/dev/null || true
+    fi
 fi
 
 # Proxy configuration
@@ -7579,7 +7700,7 @@ PYEXTRACT
             ;;
     esac
 
-    # Locate the wrapper directory (it contains manifest.txt + packages/ + images/)
+    # Locate the wrapper directory (it contains manifest.txt + packages/ + bin/)
     _BUNDLE_ROOT=""
     if [ -f "$_OFFLINE_EXTRACT_DIR/manifest.txt" ]; then
         _BUNDLE_ROOT="$_OFFLINE_EXTRACT_DIR"
@@ -7597,20 +7718,27 @@ PYEXTRACT
         exit 1
     fi
     _PKG_DIR="$_BUNDLE_ROOT/packages"
-    _IMG_TARBALL="$_BUNDLE_ROOT/images/traefik.tar.gz"
+    _BIN_DIR="$_BUNDLE_ROOT/bin"
     [ -d "$_PKG_DIR" ] || { echo "❌ packages/ missing inside bundle"; exit 1; }
 
-    # Hard-fail on OS mismatch (mirrors verify_bundle_compatibility on master)
+    # Hard-fail on OS mismatch (mirrors verify_bundle_compatibility on master).
+    # The Traefik-architecture check is never overridable: a mismatched
+    # binary simply will not execute.
     if [ -f "$_BUNDLE_ROOT/manifest.txt" ]; then
         _b_codename=$(grep -E '^OS_CODENAME=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
             | cut -d= -f2- | tr -d '"')
         _b_arch=$(grep -E '^ARCH=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"')
+        _b_traefik_arch=$(grep -E '^TRAEFIK_ARCH=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"')
+        _b_traefik_version=$(grep -E '^TRAEFIK_VERSION=' "$_BUNDLE_ROOT/manifest.txt" 2>/dev/null \
             | cut -d= -f2- | tr -d '"')
         _t_codename=""
         if [ -f /etc/os-release ]; then
             _t_codename=$( . /etc/os-release; echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-${VERSION_ID%%.*}}}")
         fi
         _t_arch=$(uname -m)
+        _t_traefik_arch=$(traefik_arch) || true
         if [ -n "$_b_codename" ] && [ -n "$_t_codename" ] && [ "$_b_codename" != "$_t_codename" ]; then
             echo "❌ Bundle/target OS codename mismatch: bundle=$_b_codename target=$_t_codename"
             echo "   This was deployed from a master that did not set --force-os-mismatch."
@@ -7618,6 +7746,10 @@ PYEXTRACT
         fi
         if [ -n "$_b_arch" ] && [ "$_b_arch" != "$_t_arch" ]; then
             echo "❌ Bundle/target architecture mismatch: bundle=$_b_arch target=$_t_arch"
+            exit 1
+        fi
+        if [ -n "$_b_traefik_arch" ] && [ -n "$_t_traefik_arch" ] && [ "$_b_traefik_arch" != "$_t_traefik_arch" ]; then
+            echo "❌ Bundle Traefik architecture mismatch: bundle=$_b_traefik_arch target=$_t_traefik_arch"
             exit 1
         fi
     fi
@@ -7661,30 +7793,26 @@ PYEXTRACT
         exit 1
     fi
 
-    command -v docker     >/dev/null 2>&1 || { echo "❌ Docker missing after offline install"; exit 1; }
     command -v keepalived >/dev/null 2>&1 || { echo "❌ Keepalived missing after offline install"; exit 1; }
+    echo "✓ Keepalived installed from bundle"
 
-    # Make sure Docker is running so we can load the image
-    systemctl enable docker >/dev/null 2>&1 || true
-    systemctl start  docker >/dev/null 2>&1 || true
-    sleep 2
-    if ! docker info >/dev/null 2>&1; then
-        echo "❌ Docker daemon is not responding after offline install"
-        exit 1
-    fi
-    echo "✓ Docker + Keepalived installed from bundle"
-
-    if [ -f "$_IMG_TARBALL" ]; then
-        echo "Loading Traefik image from bundle..."
-        if gunzip -c "$_IMG_TARBALL" | docker load; then
-            OFFLINE_TRAEFIK_LOADED="yes"
-            echo "✓ Traefik image loaded"
-        else
-            echo "❌ Failed to load Traefik image from bundle"
+    _BIN_ARCHIVE=$(ls "$_BIN_DIR"/traefik_*_linux_*.tar.gz 2>/dev/null | head -1)
+    if [ -n "$_BIN_ARCHIVE" ] && [ -f "$_BIN_DIR/checksums.txt" ]; then
+        echo "Verifying Traefik release from bundle..."
+        ( cd "$_BIN_DIR" && awk -v name="$(basename "$_BIN_ARCHIVE")" '$2 == name' checksums.txt > selected.txt )
+        if [ "$(wc -l < "$_BIN_DIR/selected.txt")" -ne 1 ]; then
+            echo "❌ Could not find a unique checksum for $(basename "$_BIN_ARCHIVE") in the bundle"
             exit 1
         fi
+        ( cd "$_BIN_DIR" && sha256sum -c selected.txt ) || { echo "❌ Traefik release checksum verification failed"; exit 1; }
+        tar -xzf "$_BIN_ARCHIVE" -C "$_BIN_DIR" traefik || { echo "❌ Failed to extract Traefik release from bundle"; exit 1; }
+        chmod 0755 "$_BIN_DIR/traefik"
+        OFFLINE_TRAEFIK_LOADED="yes"
+        OFFLINE_TRAEFIK_VERSION="${_b_traefik_version:-}"
+        OFFLINE_TRAEFIK_BIN="$_BIN_DIR/traefik"
+        echo "✓ Traefik ${_b_traefik_version} verified and extracted from bundle"
     else
-        echo "⚠️  Bundle has no Traefik image — pull will be attempted later (likely to fail offline)"
+        echo "⚠️  Bundle has no Traefik release — install will be attempted online later (likely to fail offline)"
     fi
 
     OFFLINE_INSTALL_DONE="yes"
@@ -7697,144 +7825,23 @@ PYEXTRACT
     echo ""
 fi
 
-# Install prerequisites
+# Install prerequisites — no Docker, no repo/GPG setup. install_traefik_binary
+# (called below) fetches/verifies/installs the Traefik release itself.
 if [ "$OFFLINE_INSTALL_DONE" = "yes" ]; then
-    echo "Skipping online prereq/Docker install — already installed from offline bundle"
+    echo "Skipping online prereq install — already installed from offline bundle"
 else
 echo "Installing prerequisites..."
 if command -v apt-get &>/dev/null; then
     sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
-    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq apt-transport-https ca-certificates curl gnupg lsb-release wget nano
+    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq ca-certificates curl tar jq wget nano
 elif command -v dnf &>/dev/null; then
-    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq; then
-        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl dnf-plugins-core gnupg2 wget nano iproute python3 jq --nobest
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl tar jq wget nano iproute python3; then
+        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl tar jq wget nano iproute python3 --nobest
     fi
 fi
+echo "✓ Prerequisites installed"
 
-# Install container-selinux for RHEL/CentOS
-if command -v dnf &>/dev/null && ! rpm -q container-selinux &>/dev/null; then
-    echo "Installing container-selinux..."
-    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux; then
-        if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y container-selinux --nobest; then
-            echo "Trying Rocky Linux repos..."
-            if curl $PROXY_CURL_OPTS $CURL_SSL_OPT -o /tmp/rocky-repos.rpm \
-                https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>/dev/null; then
-                rpm -ivh /tmp/rocky-repos.rpm 2>/dev/null || true
-                dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos install -y container-selinux 2>/dev/null || true
-                rm -f /tmp/rocky-repos.rpm
-            fi
-        fi
-    fi
-    if rpm -q container-selinux &>/dev/null; then
-        echo "✓ container-selinux installed"
-    else
-        echo "⚠️  WARNING: container-selinux not installed (Docker may fail)"
-    fi
-fi
-
-# Install Docker
-echo "Installing Docker..."
-if command -v apt-get &>/dev/null; then
-    echo "Adding Docker repository..."
-    install -m 0755 -d /etc/apt/keyrings
-    rm -f /etc/apt/keyrings/docker.gpg
-    curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
-        https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]')/gpg | \
-        gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -is | tr '[:upper:]' '[:lower:]') $(lsb_release -cs) stable" | \
-        tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
-    echo "Installing Docker packages..."
-    sudo -E apt-get $APT_PROXY_OPT_PROXY install -y docker-ce docker-ce-cli containerd.io
-elif command -v dnf &>/dev/null; then
-    if [ ! -f /etc/yum.repos.d/docker-ce.repo ]; then
-        echo "Downloading Docker repository..."
-        if curl $PROXY_CURL_OPTS $CURL_SSL_OPT -fsSL \
-            https://download.docker.com/linux/centos/docker-ce.repo \
-            -o /tmp/docker-ce.repo; then
-            mv /tmp/docker-ce.repo /etc/yum.repos.d/docker-ce.repo
-            echo "✓ Docker repository added"
-        else
-            echo "ERROR: Failed to download Docker repository"
-            exit 1
-        fi
-    fi
-    echo "Installing Docker packages..."
-    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io; then
-        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y docker-ce docker-ce-cli containerd.io --nobest
-    fi
-else
-    echo "ERROR: No supported package manager found (apt or dnf)"
-    exit 1
-fi
-
-echo "✓ Docker installed successfully"
-
-fi  # end OFFLINE_INSTALL_DONE != yes (prereqs + Docker install)
-
-if ! command -v docker &>/dev/null; then
-    echo "ERROR: Docker installation failed - docker command not found"
-    exit 1
-fi
-docker --version
-
-# Configure Docker proxy if needed
-if [ -n "$PROXY" ]; then
-    echo "Configuring Docker daemon to use proxy..."
-    mkdir -p /etc/docker
-    if [ -f "/etc/docker/daemon.json" ]; then
-        cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
-    fi
-    tee /etc/docker/daemon.json > /dev/null <<DOCKEREOF
-{
-  "proxies": {
-    "http-proxy": "$PROXY",
-    "https-proxy": "$PROXY",
-    "no-proxy": "localhost,127.0.0.1"
-  }
-}
-DOCKEREOF
-    echo "✓ Docker proxy configured in daemon.json"
-fi
-
-echo "Starting Docker..."
-systemctl enable docker
-systemctl stop docker 2>/dev/null || true
-sleep 2
-systemctl start docker
-sleep 3
-
-if ! systemctl is-active --quiet docker; then
-    echo "ERROR: Docker failed to start"
-    exit 1
-fi
-echo "✓ Docker is running"
-
-if ! groups "$CURRENT_USER" | grep -q docker; then
-    usermod -aG docker "$CURRENT_USER"
-fi
-
-# Disable Docker repository based on master's configuration
-DISABLE_DOCKER_REPO="__DISABLE_DOCKER_REPO__"
-if [ "$DISABLE_DOCKER_REPO" = "yes" ]; then
-    echo "Disabling Docker repositories (as configured on master node)..."
-    if command -v apt-get &>/dev/null; then
-        if [ -f /etc/apt/sources.list.d/docker.list ]; then
-            mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled 2>/dev/null || true
-            mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled 2>/dev/null || true
-            echo "✓ Docker repository disabled"
-        fi
-    elif command -v dnf &>/dev/null; then
-        if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
-            dnf config-manager --set-disabled docker-ce-stable 2>/dev/null || \
-                sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/docker-ce.repo
-            echo "✓ Docker repository disabled"
-        fi
-    fi
-else
-    echo "Docker repository kept enabled (as configured on master node)"
-fi
+fi  # end OFFLINE_INSTALL_DONE != yes (prereqs install)
 
 # Create Traefik directories
 mkdir -p /opt/indica/traefik/{certs,config,logs}
@@ -7844,10 +7851,9 @@ chown -R root:root /opt/indica
 TRAEFIK_CONFIG_FILE="/opt/indica/traefik/config/traefik.yml"
 TRAEFIK_DYNAMIC_DIR="/opt/indica/traefik/config/dynamic"
 TRAEFIK_DYNAMIC_FILE="${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
-DOCKER_COMPOSE_FILE="/opt/indica/traefik/docker-compose.yaml"
 
 # Guard against incorrectly typed paths
-for _p in "$TRAEFIK_CONFIG_FILE" "$TRAEFIK_DYNAMIC_FILE" "$DOCKER_COMPOSE_FILE" \
+for _p in "$TRAEFIK_CONFIG_FILE" "$TRAEFIK_DYNAMIC_FILE" \
           "/opt/indica/traefik/config/clinical_conf.yml"; do
     if [[ -d "$_p" ]]; then
         rm -rf "$_p" || { echo "Failed to remove directory $_p"; exit 1; }
@@ -7879,115 +7885,14 @@ if [ "$USE_CUSTOM_CA" = "yes" ] && [ -n "$CUSTOM_CA_CERT_CONTENT" ]; then
     echo "✓ Custom CA certificate written"
 fi
 
-# Create docker-compose.yaml
-cat > /opt/indica/traefik/docker-compose.yaml <<'DOCKERCOMPOSE'
-services:
-  traefik:
-    image: docker.io/library/traefik:latest
-    container_name: traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - label=type:container_runtime_t
-    cap_add:
-      - NET_BIND_SERVICE
-    network_mode: "host"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./config/traefik.yml:/traefik.yml:ro
-      - ./config/dynamic:/dynamic:ro
-      - ./certs/cert.crt:/certs/cert.crt:ro
-      - ./certs/server.key:/certs/server.key:ro
-      - ./logs:/var/log
-DOCKERCOMPOSE
-
-if [ "$USE_CUSTOM_CA" = "yes" ] && [ -n "$CUSTOM_CA_CERT_CONTENT" ]; then
-    sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' /opt/indica/traefik/docker-compose.yaml
-    echo "✓ Custom CA volume mount added to docker-compose.yaml"
-fi
-
-# Create traefik.yml
-cat > /opt/indica/traefik/config/traefik.yml <<'TRAEFIKCONF'
-entryPoints:
-  http:
-    address: ':80'
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-    http:
-      redirections:
-        entryPoint:
-          to: 'https'
-          scheme: 'https'
-      encodedCharacters:
-        allowEncodedBackSlash: true
-        allowEncodedSemicolon: true
-        allowEncodedPercent: true
-        allowEncodedHash: true
-  https:
-    address: ':443'
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-    http:
-      encodedCharacters:
-        allowEncodedBackSlash: true
-        allowEncodedSemicolon: true
-        allowEncodedPercent: true
-        allowEncodedHash: true
-  ping:
-    address: ':8800'
-TRAEFIKCONF
-
-# Append HL7 entrypoints if integration is enabled
-HL7_ENABLED_FLAG="HL7_ENABLED_PLACEHOLDER"
-HL7_LISTEN_PORTS_VAL="HL7_PORTS_PLACEHOLDER"
-HL7_PORT_COMMENTS_VAL="HL7_COMMENTS_PLACEHOLDER"
-if [ "$HL7_ENABLED_FLAG" = "yes" ]; then
-    _idx=0
-    IFS='|' read -ra _b_ports    <<< "$HL7_LISTEN_PORTS_VAL"
-    IFS='|' read -ra _b_comments <<< "$HL7_PORT_COMMENTS_VAL"
-    for _b_port in "${_b_ports[@]}"; do
-        _b_ep_name="hl7"
-        [ "$_idx" -gt 0 ] && _b_ep_name="hl7-${_b_port}"
-        _b_comment="${_b_comments[$_idx]:-}"
-        _b_addr="    address: ':${_b_port}'"
-        [ -n "$_b_comment" ] && _b_addr="${_b_addr} # ${_b_comment}"
-        cat >> /opt/indica/traefik/config/traefik.yml <<HLEOF
-  ${_b_ep_name}:
-${_b_addr}
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-HLEOF
-        _idx=$(( _idx + 1 ))
-    done
-fi
-
-cat >> /opt/indica/traefik/config/traefik.yml <<'TRAEFIKCONF2'
-ping:
-  entryPoint: 'ping'
-
-#log:
-#  level: DEBUG
-#  filePath: "/var/log/traefik.log"
-
-#accessLog:
-#  filePath: "/var/log/access.log"
-#  bufferingSize: 100
-
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    exposedByDefault: false
-  file:
-    directory: /dynamic
-    watch: true
-TRAEFIKCONF2
+# Create traefik.yml (shared template — see write_traefik_static_config,
+# embedded at the top of this script). Reads HL7_ENABLED/HL7_LISTEN_PORTS/
+# HL7_PORT_COMMENTS as globals, so set those from the master-filled
+# placeholders first.
+HL7_ENABLED="HL7_ENABLED_PLACEHOLDER"
+HL7_LISTEN_PORTS="HL7_PORTS_PLACEHOLDER"
+HL7_PORT_COMMENTS="HL7_COMMENTS_PLACEHOLDER"
+write_traefik_static_config
 
 # Copy dynamic config files from /tmp
 if [ -f "/tmp/clinical_conf.yml" ]; then
@@ -8006,34 +7911,20 @@ fi
 
 chown -R root:root /opt/indica
 
-echo "Starting Traefik..."
-# Decide the pull flag based on actual reachability, not just "is an image
-# already cached locally". A backup node that has been deployed to before
-# always has a cached traefik:latest, so a presence-only check would skip
-# pulling forever and traefik:latest would never get refreshed even with a
-# working internet connection. Mirror the master node's behaviour: try to
-# reach Docker Hub first, and only fall back to the local image if that
-# genuinely fails (or we're in a bundle-loaded offline install).
-_PULL_FLAG="--pull always"
+echo "Installing Traefik..."
+# Mirrors the master node's pinned version (filled in by deploy_to_backup_nodes
+# below) rather than each node independently resolving "latest" — keeps the
+# whole fleet on one Traefik version.
+TRAEFIK_VERSION_TARGET="TRAEFIK_VERSION_PLACEHOLDER"
+TRAEFIK_UPGRADE_FLAG="TRAEFIK_UPGRADE_PLACEHOLDER"
 if [ "$OFFLINE_TRAEFIK_LOADED" = "yes" ]; then
-    echo "Offline install — using image loaded from bundle"
-    _PULL_FLAG="--pull never"
-elif docker pull docker.io/library/traefik:latest >/dev/null 2>&1; then
-    echo "✓ Pulled latest Traefik image"
-    _PULL_FLAG="--pull never"
+    echo "Offline install — installing Traefik ${OFFLINE_TRAEFIK_VERSION} from the bundle"
+    install_traefik_binary "$OFFLINE_TRAEFIK_VERSION" "$TRAEFIK_UPGRADE_FLAG" "$OFFLINE_TRAEFIK_BIN" \
+        || { echo "❌ Failed to install Traefik from the offline bundle"; exit 1; }
 else
-    echo "⚠️  Could not reach Docker Hub to pull a fresh Traefik image"
-    if docker image inspect docker.io/library/traefik:latest >/dev/null 2>&1 || \
-       docker image inspect traefik:latest >/dev/null 2>&1; then
-        echo "  Falling back to existing local image"
-        _PULL_FLAG="--pull never"
-    else
-        echo "❌ No local Traefik image available and Docker Hub unreachable"
-        exit 1
-    fi
+    install_traefik_binary "$TRAEFIK_VERSION_TARGET" "$TRAEFIK_UPGRADE_FLAG" \
+        || { echo "❌ Failed to install Traefik (check network/GitHub reachability)"; exit 1; }
 fi
-docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate $_PULL_FLAG
-sleep 5
 
 # Install Keepalived
 if [ "$OFFLINE_INSTALL_DONE" = "yes" ]; then
@@ -8054,7 +7945,7 @@ if ! getent group keepalived_script > /dev/null 2>&1; then
     groupadd -r keepalived_script
 fi
 if ! id "keepalived_script" &>/dev/null; then
-    useradd -r -s /sbin/nologin -G keepalived_script -g docker -M keepalived_script
+    useradd -r -s /sbin/nologin -g keepalived_script -M keepalived_script
 fi
 
 tee /bin/indica_service_check.sh > /dev/null <<'HEALTHCHECK'
@@ -8066,7 +7957,7 @@ else
 fi
 HEALTHCHECK
 chmod +x /bin/indica_service_check.sh
-chown keepalived_script:docker /bin/indica_service_check.sh
+chown keepalived_script:keepalived_script /bin/indica_service_check.sh
 
 # Auto-detect / apply network interface
 BACKUP_NODE_IP="BACKUP_NODE_IP_PLACEHOLDER"
@@ -8098,6 +7989,8 @@ vrrp_script check_traefik {
   script "/bin/indica_service_check.sh"
   interval 2
   weight 50
+  fall 2
+  rise 2
 }
 vrrp_instance $VRRP {
   state BACKUP
@@ -8132,6 +8025,7 @@ echo "✓ Installation complete on backup node"
 echo "✓ Traefik: Running"
 echo "✓ Keepalived: Running (BACKUP, priority BACKUP_PRIORITY_PLACEHOLDER)"
 REMOTEINSTALL
+} | write_local_file "$SCRIPTS_DIR/install_backup_${node}.sh"
 
         # ---- Substitute all placeholders ----
 
@@ -8169,7 +8063,14 @@ REMOTEINSTALL
         sed -i "s|__APT_SSL_OPT__|${APT_SSL_OPT}|g"                            "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__DNF_SSL_OPT__|${DNF_SSL_OPT}|g"                            "$SCRIPTS_DIR/install_backup_${node}.sh"
         sed -i "s|__WGET_SSL_OPT__|${WGET_SSL_OPT}|g"                          "$SCRIPTS_DIR/install_backup_${node}.sh"
-        sed -i "s|__DISABLE_DOCKER_REPO__|${DISABLE_DOCKER_REPO}|g"            "$SCRIPTS_DIR/install_backup_${node}.sh"
+
+        # Pin the backup node to the SAME Traefik version this master is
+        # running (if already pinned), rather than independently resolving
+        # "latest" on each node — keeps the fleet on one version.
+        local _deploy_traefik_version="latest"
+        [[ -s "$TRAEFIK_VERSION_FILE" ]] && _deploy_traefik_version=$(head -n1 "$TRAEFIK_VERSION_FILE")
+        sed -i "s|TRAEFIK_VERSION_PLACEHOLDER|${_deploy_traefik_version}|g"    "$SCRIPTS_DIR/install_backup_${node}.sh"
+        sed -i "s|TRAEFIK_UPGRADE_PLACEHOLDER|${TRAEFIK_UPGRADE:-0}|g"         "$SCRIPTS_DIR/install_backup_${node}.sh"
 
         # Offline mode: tell the backup-node script whether to install from a
         # local archive, and where to find it. OFFLINE_PACKAGE_SOURCE_REMOTE
@@ -8245,21 +8146,21 @@ PYEOF
         echo ""
         echo "Verifying deployment on $node..."
 
-        local _verify_docker _verify_kv
+        local _verify_traefik _verify_kv
         if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-            _verify_docker=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
+            _verify_traefik=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                "systemctl is-active traefik.service" 2>/dev/null || echo "inactive")
             _verify_kv=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                 "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
         else
-            _verify_docker=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                "docker ps --filter name=traefik --format '{{.Names}}'" 2>/dev/null || echo "")
+            _verify_traefik=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
+                "systemctl is-active traefik.service" 2>/dev/null || echo "inactive")
             _verify_kv=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
                 "systemctl is-active keepalived" 2>/dev/null || echo "inactive")
         fi
 
-        if echo "$_verify_docker" | grep -q "traefik"; then
-            echo "✓ Traefik container is running on $node"
+        if [ "$_verify_traefik" = "active" ]; then
+            echo "✓ Traefik is running on $node"
         else
             echo "⚠️  Warning: Could not verify Traefik on $node"
         fi
@@ -8426,39 +8327,37 @@ set -e
 
 echo "Starting cleanup on $(hostname)..."
 
-DOCKER_ACCESSIBLE=true
-if ! docker ps &>/dev/null 2>&1; then
-    if sg docker -c "docker ps" &>/dev/null 2>&1; then
-        DOCKER_ACCESSIBLE="sg"
-    else
-        DOCKER_ACCESSIBLE=false
+echo -n "Stopping Traefik service... "
+systemctl stop traefik.service 2>/dev/null || true
+echo "✓"
+
+echo -n "Removing Traefik service... "
+systemctl disable traefik.service 2>/dev/null || true
+rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
+rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
+rm -f /usr/local/bin/traefik
+systemctl daemon-reload 2>/dev/null || true
+echo "✓"
+
+# Leftover from a pre-migration Docker-based install, if any.
+if command -v docker &>/dev/null; then
+    DOCKER_ACCESSIBLE=true
+    if ! docker ps &>/dev/null 2>&1; then
+        if sg docker -c "docker ps" &>/dev/null 2>&1; then
+            DOCKER_ACCESSIBLE="sg"
+        else
+            DOCKER_ACCESSIBLE=false
+        fi
     fi
-fi
-
-cleanup_docker_cmd() {
-    if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
-        docker "$@"
-    elif [ "$DOCKER_ACCESSIBLE" = "sg" ]; then
-        sg docker -c "docker $*"
-    else
-        return 1
+    if [ "$DOCKER_ACCESSIBLE" != "false" ]; then
+        if [ "$DOCKER_ACCESSIBLE" = "true" ]; then
+            docker stop traefik 2>/dev/null || true
+            docker rm traefik 2>/dev/null || true
+        else
+            sg docker -c "docker stop traefik" 2>/dev/null || true
+            sg docker -c "docker rm traefik" 2>/dev/null || true
+        fi
     fi
-}
-
-echo -n "Stopping Traefik... "
-if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -q -f name=traefik 2>/dev/null | grep -q .; then
-    cleanup_docker_cmd stop traefik 2>/dev/null || true
-    echo "✓"
-else
-    echo "Not running"
-fi
-
-echo -n "Removing Traefik container... "
-if [ "$DOCKER_ACCESSIBLE" != "false" ] && cleanup_docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
-    cleanup_docker_cmd rm traefik 2>/dev/null || true
-    echo "✓"
-else
-    echo "Not found"
 fi
 
 echo -n "Removing Traefik directories... "
@@ -8753,7 +8652,13 @@ extend_replace_node() {
         write_local_file "$SCRIPTS_DIR/cleanup_replace_${_old_node}.sh" <<'REPLACECLEANUP'
 #!/bin/bash
 echo "Stopping Traefik..."
-if docker ps -q -f name=traefik 2>/dev/null | grep -q .; then
+systemctl stop traefik.service 2>/dev/null || true
+systemctl disable traefik.service 2>/dev/null || true
+rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
+rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
+rm -f /usr/local/bin/traefik
+systemctl daemon-reload 2>/dev/null || true
+if command -v docker &>/dev/null && docker ps -q -f name=traefik 2>/dev/null | grep -q .; then
     docker stop traefik 2>/dev/null || true
     docker rm traefik 2>/dev/null || true
 fi
@@ -9099,10 +9004,7 @@ show_status() {
     echo "  Traefik:"
     echo ""
     local _traefik_status="✗ Not running"
-    if docker ps --filter name=traefik --filter status=running \
-        --format '{{.Names}}' 2>/dev/null | grep -q traefik || \
-       sg docker -c "docker ps --filter name=traefik --filter status=running \
-        --format '{{.Names}}'" 2>/dev/null | grep -q traefik; then
+    if systemctl is-active --quiet traefik.service 2>/dev/null; then
         if curl -fs --max-time 3 http://localhost:8800/ping >/dev/null 2>&1; then
             _traefik_status="✓ Running (healthy)"
         else
@@ -9119,14 +9021,9 @@ show_status() {
             if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
                 -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
                 "echo ok" >/dev/null 2>&1; then
-                local _bt
-                _bt=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
+                if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=5 \
                     -o StrictHostKeyChecking=accept-new -l "$CURRENT_USER" "$_bip" \
-                    "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
-                     sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
-                     sudo docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null" \
-                    2>/dev/null) || true
-                if echo "$_bt" | grep -q traefik; then
+                    "systemctl is-active --quiet traefik.service" 2>/dev/null; then
                     _bstatus="✓ Running"
                 else
                     _bstatus="✗ Traefik not running"
@@ -9391,8 +9288,7 @@ prompt_use_existing_config() {
 
         # Traefik health check (local)
         local _peek_traefik_status="Not running"
-        if docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null | grep -q traefik || \
-           sg docker -c "docker ps --filter name=traefik --filter status=running --format '{{.Names}}'" 2>/dev/null | grep -q traefik; then
+        if systemctl is-active --quiet traefik.service 2>/dev/null; then
             if curl -fs --max-time 3 http://localhost:8800/ping >/dev/null 2>&1; then
                 _peek_traefik_status="Traefik running  ✓"
             else
@@ -9421,15 +9317,10 @@ prompt_use_existing_config() {
                         -o StrictHostKeyChecking=accept-new \
                         -l "$CURRENT_USER" "$_bip" \
                         "echo ok" >/dev/null 2>&1; then
-                        local _btraefik
-                        _btraefik=$(ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=3 \
+                        if ssh $_ssh_key -o BatchMode=yes -o ConnectTimeout=3 \
                             -o StrictHostKeyChecking=accept-new \
                             -l "$CURRENT_USER" "$_bip" \
-                            "docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null || \
-                             sg docker -c \"docker ps --filter name=traefik --filter status=running --format '{{.Names}}'\" 2>/dev/null || \
-                             sudo docker ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null" \
-                            2>/dev/null) || true
-                        if echo "$_btraefik" | grep -q traefik; then
+                            "systemctl is-active --quiet traefik.service" 2>/dev/null; then
                             _bstatus="Traefik running  ✓"
                         else
                             _bstatus="✗ Traefik not running"
@@ -9552,12 +9443,6 @@ prompt_use_existing_config() {
 
                     # Check SSH key health — detect rotation silently
                     check_ssh_key_rotation
-                fi
-
-                if ! docker ps &>/dev/null 2>&1; then
-                    if sg docker -c "docker ps" &>/dev/null 2>&1; then
-                        USE_DOCKER_GROUP=true
-                    fi
                 fi
 
                 handle_extend_mode
@@ -10981,7 +10866,6 @@ prompt_diag_config() {
 
 extend_edit_diag() {
     local TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DYNAMIC_DIR:-/opt/indica/traefik/config/dynamic}"
-    local _compose_dir="/opt/indica/traefik"
     local _traefik_yml="/opt/indica/traefik/config/traefik.yml"
 
     # Remove the legacy traefik_is_admin plugin block from traefik.yml if
@@ -11271,12 +11155,10 @@ extend_edit_diag() {
 
         # Restart Traefik
         echo -n "  Restarting Traefik... "
-        if docker_cmd compose -f "${_compose_dir}/docker-compose.yaml" \
-            up -d --force-recreate >/dev/null 2>&1; then
+        if traefik_restart >/dev/null 2>&1; then
             echo "✓"
         else
-            sg docker -c "docker compose -f '${_compose_dir}/docker-compose.yaml' \
-                up -d --force-recreate" >/dev/null 2>&1 && echo "✓" || echo "✗ restart failed"
+            echo "✗ restart failed"
         fi
 
         snapshot_config "DIAG_MONITOR" "Diagnostics monitor configuration changed"
@@ -13160,7 +13042,7 @@ if determine_install_mode; then
 fi
 
 # Up-front mode banner — make it unambiguous which path we're taking before
-# we touch packages, the Docker daemon, or the network.
+# we touch packages or the network.
 echo ""
 if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
     _bundle_name=$(basename "$OFFLINE_PACKAGE_SOURCE" 2>/dev/null)
@@ -13170,10 +13052,10 @@ if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
     echo "  Bundle:   ${_bundle_name}${_bundle_size}"
     echo "  Source:   ${OFFLINE_PACKAGE_SOURCE}"
     echo "  Packages: will be installed via dpkg/dnf from the bundle"
-    echo "  Image:    Traefik will be loaded from images/traefik.tar.gz"
+    echo "  Traefik:  will be installed from the bundle's release tarball"
     log "Starting offline install — bundle: $OFFLINE_PACKAGE_SOURCE"
 else
-    echo "▶ Starting ONLINE install (package repos + Docker Hub)"
+    echo "▶ Starting ONLINE install (package repos + GitHub)"
     log "Starting online install"
 fi
 echo ""
@@ -13181,7 +13063,7 @@ echo ""
 if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
     log "Offline install mode — skipping repository connectivity check"
     REPO_CONNECTIVITY_OK=true
-    DOCKER_AUTH_BLOCKED=false
+    GITHUB_BLOCKED=false
     echo "Repository connectivity check skipped (offline mode)."
 else
     # Guarded via if/else (not a bare call + $?) so a genuine connectivity
@@ -13256,7 +13138,7 @@ fi
 echo ""
 echo "Installation Plan:"
 echo "  1. Install prerequisites (curl, wget, ipcalc, etc.)"
-echo "  2. Install Docker CE"
+echo "  2. Install Traefik (native binary)"
 echo "  3. Configure SSL certificates"
 echo "  4. Configure backend service URLs and ports"
 if [[ "$DEPLOYMENT_TYPE" == "full" ]]; then
@@ -13299,8 +13181,8 @@ log "User confirmed proceeding with installation"
 
 ######################################################
 ### Offline branch — when --offline / auto-detected, install everything from
-### the bundle here (packages + Traefik image), then skip the online prereq /
-### Docker / image-pull blocks below.
+### the bundle here (packages + Traefik release), then skip the online
+### prereq / Traefik-install blocks below.
 
 if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
     install_traefik_stack_offline
@@ -13365,325 +13247,12 @@ fi  # end INSTALL_MODE_OFFLINE != true (Prerequisites)
 ######################################################
 
 ######################################################
-### START Docker Dependency Pre-installation
-######################################################
-
-if [ "$INSTALL_MODE_OFFLINE" != "true" ]; then
-
-if [[ "$PKG_MANAGER" == "dnf" ]]; then
-    if ! rpm -q container-selinux &>/dev/null; then
-        log "Installing container-selinux..."
-        
-        # Try from configured repos (respects proxy strategy)
-        if dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install container-selinux 2>&1 | tee -a "$LOGFILE"; then
-            log "✓ container-selinux installed"
-            
-        elif dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True -y install container-selinux --nobest 2>&1 | tee -a "$LOGFILE"; then
-            log "✓ container-selinux installed (older version)"
-            
-        else
-            # Fallback to Rocky Linux
-            log "Trying Rocky Linux repos..."
-            
-            if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -o /tmp/rocky-repos.rpm \
-                https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/r/rocky-repos-9.5-2.el9.noarch.rpm 2>&1 | tee -a "$LOGFILE"; then
-                
-                rpm -ivh /tmp/rocky-repos.rpm 2>&1 | tee -a "$LOGFILE" || true
-                rm -f /tmp/rocky-repos.rpm
-                
-                # Try installing from Rocky
-                dnf ${DNF_SSL_OPT} ${DNF_PROXY_OPT} --setopt=skip_if_unavailable=True --enablerepo=rocky-baseos -y install container-selinux 2>&1 | tee -a "$LOGFILE" || true
-            fi
-        fi
-        
-        if ! rpm -q container-selinux &>/dev/null; then
-            exit_on_error "Failed to install container-selinux"
-        fi
-    fi
-fi
-
-fi  # end INSTALL_MODE_OFFLINE != true (Docker Dependency)
-
-### END Docker Dependency Pre-installation
-######################################################
-
-######################################################
-### START Docker Installation
-
-echo ""
-echo ""
-echo ""
-echo ":: Installing Docker"
-echo "──────────────────────────────────────────────────"
-echo ""
-echo ""
-echo ""
-
-if [ "$INSTALL_MODE_OFFLINE" = "true" ]; then
-    log "Skipping online Docker install — already installed from offline bundle"
-else
-
-# OS-specific Docker installation
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    log "Installing Docker via apt..."
-    # Add Docker's official GPG key
-    install -m 0755 -d /etc/apt/keyrings
-    
-    # Download GPG key (respects proxy strategy via curl)
-    if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -fsSL \
-        https://download.docker.com/linux/$OS_ID/gpg | \
-        gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>&1 | tee -a "$LOGFILE"; then
-        log "✓ Docker GPG key added"
-    else
-        exit_on_error "Failed to download Docker GPG key"
-    fi
-    
-    chmod a+r /etc/apt/keyrings/docker.gpg
-
-    # Add repository
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/$OS_ID $OS_VERSION stable" | \
-    tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    # Update package lists (respects proxy strategy)
-    apt-get ${APT_PROXY_OPT_PROXY} ${APT_SSL_OPT} update || exit_on_error "Failed to update package lists"
-    
-    # Install Docker packages
-    bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
-        export http_proxy='${http_proxy:-}'; \
-        export https_proxy='${https_proxy:-}'; \
-        export no_proxy='${no_proxy:-}'; \
-        PKG_MANAGER=$PKG_MANAGER \
-        APT_SSL_OPT='$APT_SSL_OPT' \
-        APT_PROXY_OPT_PROXY='$APT_PROXY_OPT_PROXY' \
-        PROXY_STRATEGY='$PROXY_STRATEGY' \
-        LOGFILE='$LOGFILE' \
-        install_packages docker-ce docker-ce-cli containerd.io"
-
-elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-    log "Installing Docker via dnf..."
-    
-    # Download Docker repository file using curl (external resource - uses proxy)
-    log "Downloading Docker repository configuration..."
-    
-    if curl ${PROXY_CURL_OPTS} ${CURL_SSL_OPT} -fsSL \
-        https://download.docker.com/linux/centos/docker-ce.repo \
-        -o /tmp/docker-ce.repo 2>&1 | tee -a "$LOGFILE"; then
-        
-        mv /tmp/docker-ce.repo /etc/yum.repos.d/docker-ce.repo
-        log "✓ Docker repository added"
-    else
-        exit_on_error "Failed to download Docker repository"
-    fi
-    
-    # Install Docker packages (DNF respects proxy strategy)
-    log "Installing Docker packages..."
-    bash -c "$(declare -f install_packages exit_on_error log url_encode_password); \
-        export http_proxy='${http_proxy:-}'; \
-        export https_proxy='${https_proxy:-}'; \
-        export no_proxy='${no_proxy:-}'; \
-        PKG_MANAGER=$PKG_MANAGER \
-        DNF_SSL_OPT='$DNF_SSL_OPT' \
-        DNF_PROXY_OPT='$DNF_PROXY_OPT' \
-        PROXY_STRATEGY='$PROXY_STRATEGY' \
-        LOGFILE='$LOGFILE' \
-        install_packages docker-ce docker-ce-cli containerd.io"
-fi
-
-fi  # end INSTALL_MODE_OFFLINE != true (Docker Installation)
-
-# Verify Docker installation
-docker --version || exit_on_error "Docker installation failed"
-log "✓ Docker installed successfully: $(docker --version)"
-
-# Configure Docker daemon to use proxy (if configured)
-
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    log "Configuring Docker daemon to use proxy..."
-    mkdir -p /etc/docker
-    
-    # Backup existing daemon.json if it exists
-    if [ -f "/etc/docker/daemon.json" ]; then
-        cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
-        log "Backed up existing daemon.json"
-    fi
-    
-    if [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASSWORD}" ]; then
-        ENCODED_PASS=$(url_encode_password "${PROXY_PASSWORD}")
-        PROXY_URL="http://${PROXY_USER}:${ENCODED_PASS}@${PROXY_HOST}:${PROXY_PORT}"
-    else
-        PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
-    fi
-    
-    # Create daemon.json with proxy configuration
-    tee /etc/docker/daemon.json > /dev/null <<EOF
-{
-  "proxies": {
-    "http-proxy": "${PROXY_URL}",
-    "https-proxy": "${PROXY_URL}",
-    "no-proxy": "localhost,127.0.0.1"
-  }
-}
-EOF
-    
-    log "✓ Docker proxy configuration created in daemon.json"
-fi
-
-# Start Docker (no need for daemon-reload with daemon.json)
-log "Starting and enabling Docker..."
-systemctl enable docker || exit_on_error "Failed to enable Docker"
-systemctl stop docker 2>/dev/null || true
-sleep 2
-systemctl start docker || exit_on_error "Failed to start Docker"
-sleep 3
-
-# Verify Docker is running
-echo -n "Verifying Docker service... "
-if systemctl is-active --quiet docker; then
-    echo "✓ Running"
-else
-    exit_on_error "Docker service is not running"
-fi
-
-# Verify proxy is working
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    log "Verifying Docker proxy configuration..."
-    if docker info 2>/dev/null | grep -qi proxy; then
-        log "✓ Docker proxy configured"
-    else
-        log "⚠️  Warning: Docker proxy may not be active"
-    fi
-fi
-
-# Add current user to docker group
-log "Adding user $CURRENT_USER to docker group..."
-if ! id -nG "$CURRENT_USER" | grep -qw docker; then
-    usermod -aG docker "$CURRENT_USER" || exit_on_error "Failed to add user to docker group"
-    log "✓ User added to docker group"
-    echo ""
-    echo "Note: User $CURRENT_USER has been added to the 'docker' group."
-    echo "      For future sessions, you'll need to log out and back in."
-    echo "      For this script, we'll use the docker group context."
-    echo ""
-else
-    log "✓ User $CURRENT_USER already in docker group"
-fi
-
-# Verify Docker socket is accessible
-echo -n "Verifying Docker socket access... "
-# Try with current permissions first
-if docker ps &>/dev/null; then
-    echo "✓ Accessible"
-elif sudo -u "$CURRENT_USER" sg docker -c "docker ps" &>/dev/null; then
-    echo "✓ Accessible (via docker group)"
-    log "Note: Using docker group context for remainder of script"
-    # Set a flag to use sg docker for docker commands
-    USE_DOCKER_GROUP=true
-else
-    exit_on_error "Cannot access Docker socket even after adding user to docker group"
-fi
-
-log "✓ Docker verification complete"
-
-### END Docker Installation
-######################################################
-
-######################################################
-### START Docker Repository Management
-######################################################
-
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    echo ""
-    echo ""
-    echo ""
-    echo ":: Docker Repository Management"
-    echo "──────────────────────────────────────────────────"
-    echo ""
-    echo ""
-    echo ""
-    echo "Docker has been installed successfully: $(docker --version)"
-    echo ""
-    echo "You are using a proxy configuration. External Docker repositories may cause"
-    echo "future system update failures (apt update / dnf update) due to:"
-    echo "  • Proxy authentication issues"
-    echo "  • SSL inspection/certificate problems"
-    echo "  • Network connectivity issues"
-    echo ""
-    echo "Options:"
-    echo ""
-    echo "  [1] Disable Docker repository (RECOMMENDED)"
-    echo "      ✓ Prevents 'apt update' / 'dnf update' failures"
-    echo "      ✓ Docker version stays stable"
-    echo "      ✓ Can be re-enabled when needed for updates"
-    echo "      ✓ Docker pulls still work (daemon.json handles proxy)"
-    echo ""
-    echo "  [2] Keep Docker repository enabled"
-    echo "      ✓ Allows automatic Docker package updates"
-    echo "      ✗ May cause 'apt update' / 'dnf update' to fail"
-    echo "      ✗ Requires working proxy for all system updates"
-    echo ""
-    
-    if prompt_yn "Disable Docker repository?" "y"; then
-        DISABLE_DOCKER_REPO="yes"
-        log "Disabling Docker repository..."
-        
-        if [[ "$PKG_MANAGER" == "apt" ]]; then
-            # Debian/Ubuntu - disable Docker repository
-            if [ -f /etc/apt/sources.list.d/docker.list ]; then
-                mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled
-                log "✓ Docker repository disabled"
-                log "  Moved to: /etc/apt/sources.list.d/docker.list.disabled"
-            fi
-            
-            # Also disable Docker GPG key (prevents apt update warnings)
-            if [ -f /etc/apt/keyrings/docker.gpg ]; then
-                mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled 2>/dev/null || true
-            fi
-            
-            echo ""
-            echo "✓ Docker repository disabled"
-            echo ""
-            echo "To re-enable Docker repository for updates:"
-            echo "  sudo mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list"
-            echo "  sudo mv /etc/apt/keyrings/docker.gpg.disabled /etc/apt/keyrings/docker.gpg"
-            echo "  sudo -E apt-get update"
-            
-        elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-            # RHEL/CentOS/Rocky/AlmaLinux - disable Docker repository
-            if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
-                if command -v dnf &>/dev/null && dnf config-manager --help &>/dev/null 2>&1; then
-                    dnf config-manager --set-disabled docker-ce-stable 2>/dev/null
-                else
-                    sed -i 's/enabled=1/enabled=0/g' /etc/yum.repos.d/docker-ce.repo
-                fi
-                log "✓ Docker repository disabled"
-            fi
-            
-            echo ""
-            echo "✓ Docker repository disabled"
-            echo ""
-            echo "To re-enable Docker repository for updates:"
-            echo "  sudo dnf config-manager --set-enabled docker-ce-stable"
-            echo "  sudo -E dnf update"
-        fi
-        
-        echo ""
-        log "Docker version locked at: $(docker --version)"
-        
-    else
-        log "Docker repository kept enabled"
-        echo ""
-        echo "⚠️  Note: Future 'apt update' or 'dnf update' commands may fail if"
-        echo "   the proxy configuration or SSL certificates cause issues with"
-        echo "   external Docker repositories."
-        echo ""
-    fi
-    
-else
-    log "No proxy configured - Docker repository remains enabled for automatic updates"
-fi
-
-### END Docker Repository Management
+### Docker Dependency / Docker Installation / Docker Repository Management
+### — removed. Traefik runs as a native binary now; there is no container
+### runtime to install, no daemon proxy config, no docker-group dance, and
+### no repo-disable toggle. The binary itself is fetched and installed
+### further down (see "Installing Traefik") via install_traefik_binary(),
+### which creates its own dedicated "traefik" system user.
 ######################################################
 
 ######################################################
@@ -13832,19 +13401,21 @@ check_key_cert_match "$CERT_FILE" "$KEY_FILE"
 ######################################################
 
 ######################################################
-### START TRAEFIK Docker Container Configuration
+### START Native Traefik Configuration
 
 echo ""
 echo ""
 echo ""
-echo ":: Deploying Traefik Docker Container"
+echo ":: Deploying Native Traefik"
 echo "──────────────────────────────────────────────────"
 echo ""
 echo ""
 echo ""
 
-# Create Docker & Traefik directories with proper ownership
-log "Creating Docker and Traefik directories..."
+# Create Traefik directories with proper ownership (fix_traefik_perms,
+# called from install_traefik_binary below, chowns config/certs/logs to
+# the dedicated traefik user once the binary is in place)
+log "Creating Traefik directories..."
 mkdir -p /opt/indica/traefik/{certs,config,logs}
 mkdir -p /opt/indica/traefik/config/dynamic
 chown -R root:root /opt/indica 2>/dev/null || true
@@ -13865,50 +13436,6 @@ if [[ ! -w "/opt/indica/traefik" ]]; then
     log "Warning: /opt/indica/traefik not writable, attempting to fix ownership..."
     chown -R root:root /opt/indica || exit_on_error "Failed to set ownership on /opt/indica"
 fi
-
-# Create a Docker network for Traefik
-#log "Creating Docker network 'proxynet'..."
-#if ! docker_cmd network inspect proxynet > /dev/null 2>&1; then
-#    docker_cmd network create proxynet || exit_on_error "Failed to create Docker network"
-#fi
-
-# Create the docker-compose.yaml file for Traefik
-log "Creating docker-compose.yaml file..."
-DOCKER_COMPOSE_FILE="/opt/indica/traefik/docker-compose.yaml"
-
-# Ensure docker-compose.yaml is not a directory
-if [[ -d "$DOCKER_COMPOSE_FILE" ]]; then
-    log "Removing incorrectly created directory: $DOCKER_COMPOSE_FILE"
-    rm -rf "$DOCKER_COMPOSE_FILE" || exit_on_error "Failed to remove directory"
-fi
-
-backup_file "$DOCKER_COMPOSE_FILE"
-
-tee "$DOCKER_COMPOSE_FILE" > /dev/null <<EOF
-services:
-  traefik:
-    image: docker.io/library/traefik:latest
-    container_name: traefik
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - label=type:container_runtime_t
-    cap_add:
-      - NET_BIND_SERVICE
-    network_mode: "host"
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./config/traefik.yml:/traefik.yml:ro
-      - ./config/dynamic:/dynamic:ro
-      - ./certs/cert.crt:/certs/cert.crt:ro
-      - ./certs/server.key:/certs/server.key:ro
-      - ./logs:/var/log
-EOF
-
- # Set docker-compose.yaml permissions
-log "Setting permissions on $DOCKER_COMPOSE_FILE"
-chmod 640 "$DOCKER_COMPOSE_FILE"
 
 # Create a basic traefik.yml configuration file
 log "Creating traefik.yml configuration file..."
@@ -14010,85 +13537,12 @@ fi
 
 # Write traefik.yml now that HL7_ENABLED is definitively set
 log "Writing traefik.yml configuration file..."
-tee "$TRAEFIK_CONFIG_FILE" > /dev/null <<EOF
-entryPoints:
-  http:
-    address: ':80'
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-    http:
-      redirections:
-        entryPoint:
-          to: 'https'
-          scheme: 'https'
-      encodedCharacters:
-        allowEncodedBackSlash: true   # \  (UNC paths)
-        allowEncodedSemicolon: true   # ;
-        allowEncodedPercent: true     # %
-        allowEncodedHash: true        # #
-  https:
-    address: ':443'
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-    http:
-      encodedCharacters:
-        allowEncodedBackSlash: true   # \  (UNC paths)
-        allowEncodedSemicolon: true   # ;
-        allowEncodedPercent: true     # %
-        allowEncodedHash: true        # #
-  ping:
-    address: ':8800'
-EOF
+write_traefik_static_config
 
-# Append HL7 entrypoints now that HL7_ENABLED is confirmed from user input
-if [[ "$HL7_ENABLED" == "yes" ]]; then
-    _ep_idx=0
-    IFS='|' read -ra _ep_ports    <<< "$HL7_LISTEN_PORTS"
-    IFS='|' read -ra _ep_comments <<< "$HL7_PORT_COMMENTS"
-    for _ep_port in "${_ep_ports[@]}"; do
-        _ep_name="hl7"
-        [[ $_ep_idx -gt 0 ]] && _ep_name="hl7-${_ep_port}"
-        _ep_comment="${_ep_comments[$_ep_idx]:-}"
-        _ep_addr_line="    address: ':${_ep_port}'"
-        [[ -n "$_ep_comment" ]] && _ep_addr_line="${_ep_addr_line} # ${_ep_comment}"
-        cat >> "$TRAEFIK_CONFIG_FILE" <<EOF
-  ${_ep_name}:
-${_ep_addr_line}
-    transport:
-      respondingTimeouts:
-        readTimeout: 0
-        idleTimeout: 0
-EOF
-        (( ++_ep_idx ))
-    done
-fi
-
-cat >> "$TRAEFIK_CONFIG_FILE" <<EOF
-ping:
-  entryPoint: 'ping'
-
-#log:
-#  level: DEBUG
-#  filePath: "/var/log/traefik.log"
-
-#accessLog:
-#  filePath: "/var/log/access.log"
-#  bufferingSize: 100
-
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    exposedByDefault: false
-  file:
-    directory: /dynamic
-    watch: true
-EOF
-
-# Write custom CA certificate and update docker-compose volume mount if configured
+# Write custom CA certificate if configured. No compose file to patch
+# natively — the certificate just needs to exist on disk; wiring it into
+# the dynamic config as serversTransports.internalCA happens separately
+# (generate_clinical_conf / extend_update_ca already handle that).
 if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
     log "Writing custom CA certificate to $CERT_DIR/customca.crt..."
     # Guard: remove if it was incorrectly created as a directory in a previous run
@@ -14099,173 +13553,82 @@ if [[ "$USE_CUSTOM_CA" == "yes" && -n "$CUSTOM_CA_CERT_CONTENT" ]]; then
     echo "$CUSTOM_CA_CERT_CONTENT" | tee "$CERT_DIR/customca.crt" > /dev/null || exit_on_error "Failed to write custom CA certificate"
     chmod 644 "$CERT_DIR/customca.crt" || exit_on_error "Failed to set permissions on custom CA certificate"
     log "Custom CA certificate written successfully"
-
-    log "Adding custom CA volume mount to docker-compose.yaml..."
-    # Insert customca volume mount after server.key line
-    sed -i '/      - \.\/certs\/server\.key:\/certs\/server\.key:ro/a\      - ./certs/customca.crt:/certs/customca.crt:ro' "$DOCKER_COMPOSE_FILE"
 fi
 
-# Check if the container named 'traefik' exists (whether running or stopped)
-if docker_cmd ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
-    # Stop the 'traefik' container if it's running
-    log "Stopping existing Traefik container"
-    docker_cmd stop traefik 2>/dev/null || true
-
-    # Remove the 'traefik' container (even if stopped)
-    log "Deleting existing Traefik Container"
-    docker_cmd rm traefik || true
-fi
-
-
-# Enhanced retry logic for pulling Traefik image
-log "Attempting to pull Traefik image from known sources..."
-
-try_pull() {
-    local image=$1
-    log "Trying to pull $image..."
-    if docker_cmd pull "$image"; then
-        sed -i "s|image:.*|image: $image|" "$DOCKER_COMPOSE_FILE"
-        log "Successfully pulled $image"
-        return 0
-    else
-        log "Failed to pull $image"
-        return 1
+# Migrate an existing Docker-based Traefik install to native, if one is
+# present. This fires whenever /opt/indica/traefik/docker-compose.yaml
+# exists — whether from a previous run of the old Docker-based version of
+# this script, or from the legacy /home/haloap migration above (which
+# recovers an old docker-compose.yaml and starts it before we get here).
+# The old container is stopped so its port bindings (:80/:443/:8800) are
+# free for the native systemd service; Docker Engine itself is left
+# installed (use --clean to remove it).
+if [[ -f "/opt/indica/traefik/docker-compose.yaml" ]]; then
+    log "Existing Docker-based Traefik install detected — migrating to native"
+    if command -v docker > /dev/null 2>&1; then
+        if docker ps -a -q -f name=traefik 2>/dev/null | grep -q .; then
+            docker stop traefik 2>/dev/null || sg docker -c "docker stop traefik" 2>/dev/null || true
+            docker rm traefik 2>/dev/null || sg docker -c "docker rm traefik" 2>/dev/null || true
+        fi
     fi
-}
+    mv "/opt/indica/traefik/docker-compose.yaml" \
+        "/opt/indica/traefik/docker-compose.yaml.migrated.$(date +'%Y%m%d%H%M%S')"
+    log "✓ Old container stopped and docker-compose.yaml archived"
+fi
 
-# Check if image already exists locally (pre-loaded on restricted networks)
-_traefik_image_local=false
+# Install (or, on a rerun, confirm) the native Traefik binary + systemd
+# service. install_traefik_binary() pins the version on first install and
+# keeps it on reruns unless TRAEFIK_UPGRADE=1 is set; it rolls back to the
+# previous binary/unit automatically if the health check fails.
+log "Installing Traefik..."
 
-# In offline mode the image has just been loaded from the bundle by
-# install_traefik_stack_offline. Treat it exactly like a pre-loaded local
-# image so the existing path below skips the pull and switches docker
-# compose to --pull never.
 if [ "$INSTALL_MODE_OFFLINE" = "true" ] && [ "$OFFLINE_TRAEFIK_LOADED" = "true" ]; then
-    _traefik_image_local=true
-    log "Offline mode — Traefik image was loaded from bundle, skipping pull"
-fi
-
-if [ "$_traefik_image_local" = false ] && \
-   docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "traefik"; then
-    _existing_image=$(docker_cmd images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep traefik | head -1)
-    log "Found existing local Traefik image: ${_existing_image}"
-
-    if [[ "$REPO_CONNECTIVITY_OK" == false || "$DOCKER_AUTH_BLOCKED" == true ]]; then
-        # Restricted network or auth blocked — offer local image as it may be the only option
-        echo ""
-        echo "  Found existing local Traefik image: ${_existing_image}"
-        if [[ "$DOCKER_AUTH_BLOCKED" == true ]]; then
-            echo "  ⚠️  Docker auth (auth.docker.io) is blocked — image pulls will fail."
-        else
-            echo "  ⚠️  Repository connectivity checks failed — internet access may be restricted."
-        fi
-        if prompt_yn "  Use existing local image instead of pulling?" "y"; then
-            sed -i "s|image:.*|image: ${_existing_image}|" "$DOCKER_COMPOSE_FILE"
-            _traefik_image_local=true
-            log "Using local image: ${_existing_image}"
-        fi
+    log "Offline mode — installing Traefik ${OFFLINE_TRAEFIK_VERSION} from the bundle"
+    install_traefik_binary "$OFFLINE_TRAEFIK_VERSION" "${TRAEFIK_UPGRADE:-0}" "$OFFLINE_TRAEFIK_BIN" \
+        || exit_on_error "Failed to install Traefik from the offline bundle"
+elif install_traefik_binary "${TRAEFIK_VERSION:-latest}" "${TRAEFIK_UPGRADE:-0}"; then
+    :
+elif [[ -x "$TRAEFIK_BIN" ]] && { [[ "$REPO_CONNECTIVITY_OK" == false ]] || [[ "$GITHUB_BLOCKED" == true ]]; }; then
+    # Restricted network — offer to keep whatever is already installed,
+    # same fallback UX the old Docker-Hub-pull path offered for a
+    # pre-loaded local image.
+    echo ""
+    echo "  ⚠️  Could not reach GitHub to fetch a Traefik release."
+    if prompt_yn "  Keep the currently installed Traefik and just (re)start it?" "y"; then
+        write_traefik_unit
+        fix_traefik_perms
+        systemctl enable traefik.service > /dev/null
+        traefik_restart || exit_on_error "Traefik did not come back healthy"
     else
-        # Full connectivity — always pull latest, ignore local cache
-        log "Repository connectivity OK — will pull latest image from Docker Hub"
+        exit_on_error "Failed to install Traefik"
     fi
-fi
-
-if [[ "$_traefik_image_local" == false ]]; then
-    # Pull Traefik from Docker Hub
-    log "Pulling Traefik image from Docker Hub..."
-    if ! try_pull "docker.io/library/traefik:latest"; then
-        echo ""
-        echo ""
-        echo ""
-        echo ":: ERROR: Cannot Pull Traefik Image"
-        echo "──────────────────────────────────────────────────"
-        echo ""
-        echo ""
-        echo "Docker Hub is not accessible from this server."
-        echo ""
-        echo "This typically means the firewall is blocking one or more of these endpoints:"
-        echo "  - registry-1.docker.io  (registry API)"
-        echo "  - auth.docker.io        (authentication)"
-        echo "  - production.cloudflare.docker.com (image layers)"
-        echo ""
-        echo "Options:"
-        echo ""
-        echo "  1. Load a pre-exported image:"
-        echo "       gunzip -c traefik.tar.gz | docker load"
-        echo "       Then re-run this script — it will detect the local image."
-        echo ""
-        echo "  2. Export from an internet-connected machine:"
-        echo "       docker pull docker.io/library/traefik:latest"
-        echo "       docker save docker.io/library/traefik:latest | gzip > traefik.tar.gz"
-        echo "       # Transfer traefik.tar.gz to this server, then load as above."
-        echo ""
-        echo "  3. Ask your network admin to whitelist Docker Hub endpoints."
-        echo "=========================================="
-        exit_on_error "Failed to pull Traefik from Docker Hub"
-    fi
-fi
-
-# Navigate to the Traefik directory and start the Docker Compose setup
-log "Starting Traefik with Docker Compose..."
-
-# Use --pull never if we're using a pre-loaded local image — avoids trying
-# to reach Docker Hub on restricted networks
-_compose_pull_flag="--pull always"
-if [[ "$_traefik_image_local" == true ]]; then
-    _compose_pull_flag="--pull never"
-    log "Using local image — skipping pull"
-fi
-
-if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
-    sg docker -c "docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate ${_compose_pull_flag}" \
-        || exit_on_error "Failed to start Traefik with Docker Compose"
 else
-    docker compose -f /opt/indica/traefik/docker-compose.yaml up -d --force-recreate ${_compose_pull_flag} \
-        || exit_on_error "Failed to start Traefik with Docker Compose"
+    echo ""
+    echo ""
+    echo ""
+    echo ":: ERROR: Cannot Install Traefik"
+    echo "──────────────────────────────────────────────────"
+    echo ""
+    echo "GitHub is not accessible from this server, and no existing Traefik"
+    echo "install was found to fall back to."
+    echo ""
+    echo "This typically means the firewall is blocking one or more of these endpoints:"
+    echo "  - api.github.com                (release metadata)"
+    echo "  - github.com                    (release download)"
+    echo "  - objects.githubusercontent.com (release asset CDN)"
+    echo ""
+    echo "Options:"
+    echo "  1. Ask your network admin to whitelist the GitHub endpoints above."
+    echo "  2. Use --prepare-offline on an internet-connected machine of the"
+    echo "     same OS family, then --offline (or auto-detect) here."
+    echo "=========================================="
+    exit_on_error "Failed to install Traefik"
 fi
-
-# Verify Traefik container is running
-echo ""
-echo "Verifying Traefik deployment..."
-echo -n "Waiting for Traefik container to start... "
-for i in {1..30}; do
-    if docker_cmd ps --filter name=traefik --filter status=running --format '{{.Names}}' 2>/dev/null | grep -q traefik; then
-        echo "✓ Running"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo "❌ FAILED"
-        echo ""
-        echo "ERROR: Traefik container failed to start"
-        echo ""
-        echo "Troubleshooting:"
-        echo "  docker ps -a | grep traefik"
-        echo "  docker logs traefik"
-        exit 1
-    fi
-    sleep 1
-done
-
-# Verify Traefik health endpoint
-echo -n "Verifying Traefik health endpoint... "
-sleep 3  # Give Traefik a moment to fully initialize
-for i in {1..10}; do
-    if curl -fs http://localhost:8800/ping > /dev/null 2>&1; then
-        echo "✓ Healthy"
-        break
-    fi
-    if [ $i -eq 10 ]; then
-        echo "⚠️  Warning: Health check endpoint not responding"
-        echo "   Traefik may still be initializing. Check logs if issues persist:"
-        echo "   docker logs traefik"
-    fi
-    sleep 1
-done
 
 log "✓ Traefik deployed successfully"
 echo ""
 
-### END TRAEFIK Docker Container Configuration
+### END Native Traefik Configuration
 ######################################################
 
 ######################################################
@@ -14329,7 +13692,7 @@ fi
 # Adding Keepalived user and add to Keepalived group
 log "Adding Keepalived user to Keepalived group..."
 if ! id "keepalived_script" &>/dev/null; then
-    useradd -r -s /sbin/nologin -G keepalived_script -g docker -M keepalived_script || exit_on_error "Failed to create keepalived_script user"
+    useradd -r -s /sbin/nologin -g keepalived_script -M keepalived_script || exit_on_error "Failed to create keepalived_script user"
     echo "User 'keepalived_script' created."
 else
     echo "User 'keepalived_script' already exists."
@@ -14349,7 +13712,7 @@ else
 fi
 EOF
 chmod +x $TRAEFIK_CHECK_SCRIPT || exit_on_error "Failed to make Traefik health check script executable"
-chown keepalived_script:docker $TRAEFIK_CHECK_SCRIPT || exit_on_error "Failed to set permissions for Traefik health check script"
+chown keepalived_script:keepalived_script $TRAEFIK_CHECK_SCRIPT || exit_on_error "Failed to set permissions for Traefik health check script"
 
 # Determine node role and priority
 if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
@@ -14537,6 +13900,8 @@ vrrp_script check_traefik {
   script "/bin/indica_service_check.sh"
   interval 2
   weight 50
+  fall 2
+  rise 2
 }
 vrrp_instance $VRRP {
   state $STATE
@@ -14622,7 +13987,6 @@ fi
 ######################################################
 ### START Final restart of services
 
-systemctl restart docker
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
     systemctl restart keepalived
 fi
@@ -14647,8 +14011,7 @@ echo ""
 echo ""
 echo "Deployment Summary:"
 echo "  - Type: $DEPLOYMENT_TYPE"
-echo "  - Docker: Installed and running"
-echo "  - Traefik: Deployed and running"
+echo "  - Traefik: Deployed and running$( [[ -s "$TRAEFIK_VERSION_FILE" ]] && echo " (version $(head -n1 "$TRAEFIK_VERSION_FILE"))" )"
 
 if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "  - HA Mode: Multi-node (1 master + ${#BACKUP_NODES[@]} backup nodes)"
@@ -14671,7 +14034,7 @@ echo ""
 echo "Configuration Files:"
 echo "  - Config: $CONFIG_FILE"
 echo "  - Installation Log: $LOGFILE"
-echo "  - Docker Compose: $DOCKER_COMPOSE_FILE"
+echo "  - Traefik Binary: $TRAEFIK_BIN"
 echo "  - Traefik Config: $TRAEFIK_CONFIG_FILE"
 echo "  - Dynamic Config Dir: $TRAEFIK_DYNAMIC_DIR"
 echo "    - clinical_conf.yml: ${TRAEFIK_DYNAMIC_DIR}/clinical_conf.yml"
@@ -14690,21 +14053,12 @@ if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
     else
         echo "  - Proxy: ${PROXY_HOST}:${PROXY_PORT}"
     fi
-    echo "  - Docker Proxy Config: /etc/docker/daemon.json"
 fi
 
 
 echo ""
 echo "Services Status:"
-echo "  - Docker: $(systemctl is-active docker)"
-
-# Get Traefik status using docker_cmd
-TRAEFIK_STATUS=$(docker_cmd ps --filter name=traefik --format '{{.Status}}' 2>/dev/null | cut -d' ' -f1)
-if [ -n "$TRAEFIK_STATUS" ]; then
-    echo "  - Traefik: $TRAEFIK_STATUS"
-else
-    echo "  - Traefik: Unknown (check with: docker ps)"
-fi
+echo "  - Traefik: $(systemctl is-active traefik.service)"
 
 if [[ "$INSTALL_KEEPALIVED" == "yes" || "$INSTALL_KEEPALIVED" == "y" ]]; then
     echo "  - Keepalived: $(systemctl is-active keepalived)"
@@ -14734,11 +14088,11 @@ fi
 
 echo ""
 echo "Verification Commands:"
-echo "  Check Docker status:"
-echo "    docker ps"
+echo "  Check Traefik status:"
+echo "    systemctl status traefik"
 echo ""
 echo "  Check Traefik logs:"
-echo "    docker logs traefik"
+echo "    journalctl -u traefik -f"
 echo ""
 echo "  Check Traefik health:"
 echo "    curl http://localhost:8800/ping"
@@ -14784,9 +14138,9 @@ if [ "$MULTI_NODE_DEPLOYMENT" = "yes" ]; then
     echo "    # Check Traefik on all nodes"
     for i in "${!BACKUP_NODES[@]}"; do
         if [ $i -eq 0 ]; then
-            echo "    ssh $MASTER_HOSTNAME 'docker ps | grep traefik'"
+            echo "    ssh $MASTER_HOSTNAME 'systemctl status traefik'"
         fi
-        echo "    ssh ${BACKUP_NODES[$i]} 'docker ps | grep traefik'"
+        echo "    ssh ${BACKUP_NODES[$i]} 'systemctl status traefik'"
     done
     echo ""
     echo "    # Check Keepalived status on all nodes"
@@ -14810,60 +14164,15 @@ echo "  View installation log:"
 echo "    cat $LOGFILE"
 echo ""
 
-if [ "${USE_DOCKER_GROUP:-false}" = "true" ]; then
-    echo "⚠️  IMPORTANT: Docker Group Membership"
-    echo "  You were added to the 'docker' group during installation."
-    echo "  For the group membership to take full effect, you must:"
-    echo "    1. Log out of your current session"
-    echo "    2. Log back in"
-    echo ""
-    echo "  Until you do this, you'll need to use 'sudo' or 'sg docker -c'"
-    echo "  prefix for docker commands in new terminal sessions."
-    echo ""
-fi
-
 echo "=========================================="
 echo ""
 echo ""
-echo ""
-echo ":: Repository Configuration"
-echo "──────────────────────────────────────────────────"
-echo ""
-echo ""
 
-if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
-    if [[ "$DISABLE_DOCKER_REPO" =~ ^[Yy] ]]; then
-        echo "Docker Repository: DISABLED"
-        echo "  Current version: $(docker --version)"
-        echo "  This prevents proxy/SSL issues during system updates"
-        echo ""
-        
-        if [[ "$PKG_MANAGER" == "apt" ]]; then
-            echo "To update Docker in the future:"
-            echo "  1. sudo mv /etc/apt/sources.list.d/docker.list.disabled /etc/apt/sources.list.d/docker.list"
-            echo "  2. sudo mv /etc/apt/keyrings/docker.gpg.disabled /etc/apt/keyrings/docker.gpg"
-            echo "  3. export http_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            echo "     export https_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            echo "  4. sudo -E apt-get update && sudo -E apt-get upgrade docker-ce"
-            echo "  5. sudo mv /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.list.disabled"
-            echo "     sudo mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg.disabled"
-        elif [[ "$PKG_MANAGER" == "dnf" ]]; then
-            echo "To update Docker in the future:"
-            echo "  1. sudo dnf config-manager --set-enabled docker-ce-stable"
-            echo "  2. export http_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            echo "     export https_proxy=http://${PROXY_HOST}:${PROXY_PORT}"
-            echo "  3. sudo -E dnf upgrade docker-ce docker-ce-cli containerd.io"
-            echo "  4. sudo dnf config-manager --set-disabled docker-ce-stable"
-        fi
-    else
-        echo "Docker Repository: ENABLED"
-        echo "  Docker updates available via normal system updates"
-        echo "  ⚠️  Note: System updates may fail if proxy/SSL issues occur"
-    fi
-else
-    echo "Docker Repository: ENABLED"
-    echo "  No proxy configured - automatic updates available"
-fi
+# To upgrade Traefik later: TRAEFIK_UPGRADE=1 ./clinical_reverse_proxy.sh
+# (or TRAEFIK_VERSION=vX.Y.Z TRAEFIK_UPGRADE=1 to pin a specific release).
+echo "Traefik is pinned to $( [[ -s "$TRAEFIK_VERSION_FILE" ]] && head -n1 "$TRAEFIK_VERSION_FILE" || echo "unknown" ) and will stay"
+echo "on that version across restarts/extends. To upgrade, re-run with:"
+echo "  sudo TRAEFIK_UPGRADE=1 ./$(basename "$0")"
 
 # Cleanup temporary scripts directory
 cleanup
