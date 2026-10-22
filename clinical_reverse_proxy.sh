@@ -1114,14 +1114,18 @@ CONFEOF
 # previous service if anything fails after changes begin — same shape as
 # the existing REMOTEINSTALL rollback_on_failure trap, scoped to just the
 # binary/unit instead of the whole /opt/indica/traefik tree.
+#
+# Deliberately does NOT use `trap ... ERR`: bash's ERR trap does not cross
+# shell-function-call boundaries unless `set -o errtrace` is in effect
+# (confirmed: a trap set here would not fire for a failure inside
+# write_traefik_unit/fix_traefik_perms, which this function calls), and
+# this script never sets errtrace. Every risky step is instead chained
+# with && and checked explicitly via $? — the same guarded style already
+# used elsewhere in this script to avoid tripping set -e on a sub-command
+# of a list — so rollback fires reliably regardless of errtrace.
 install_traefik_binary() {
     local _requested="${1:-latest}" _force="${2:-0}" _staged_bin="${3:-}" _version _tmp
     local _had_binary=0 _had_dropin=0 _was_active=0
-    # Save whatever ERR trap (if any) the caller already had registered —
-    # e.g. the REMOTEINSTALL script's own whole-tree rollback_on_failure —
-    # so this function restores it exactly instead of clobbering it.
-    local _prev_err_trap
-    _prev_err_trap=$(trap -p ERR)
 
     if [[ -n "$_staged_bin" ]]; then
         [[ "$_requested" != "latest" ]] || { log "A pinned version is required when installing from a staged binary"; return 1; }
@@ -1148,12 +1152,7 @@ install_traefik_binary() {
     [[ -e "$TRAEFIK_DROPIN" ]] && { _had_dropin=1; cp -a "$TRAEFIK_DROPIN" "$TRAEFIK_DROPIN.prev"; }
     systemctl is-active --quiet traefik.service && _was_active=1
 
-    # Self-disarming handler: restores whatever ERR trap was previously
-    # registered (none, or the caller's own) before it does anything else,
-    # so a leftover registration can never fire again later for an
-    # unrelated failure, and the caller's own trap isn't lost.
     traefik_install_rollback() {
-        eval "${_prev_err_trap:-trap - ERR}"
         log "Traefik install failed; rolling back to the previous binary."
         systemctl stop traefik.service 2>/dev/null || true
         if [[ $_had_binary -eq 1 ]]; then mv -f "$TRAEFIK_BIN.prev" "$TRAEFIK_BIN"; else rm -f "$TRAEFIK_BIN"; fi
@@ -1161,14 +1160,23 @@ install_traefik_binary() {
         systemctl daemon-reload 2>/dev/null || true
         [[ $_was_active -eq 1 ]] && systemctl restart traefik.service 2>/dev/null || true
     }
-    trap traefik_install_rollback ERR
 
-    install -m 0755 -o root -g root "$_tmp/traefik" "$TRAEFIK_BIN.new"
-    mv -f "$TRAEFIK_BIN.new" "$TRAEFIK_BIN"
-    write_traefik_unit
-    fix_traefik_perms
-    systemctl enable traefik.service > /dev/null
-    systemctl restart traefik.service
+    # The whole chain is the condition of this `if`, not a bare statement —
+    # required so a failure in the LAST command (systemctl restart) is
+    # also exempted from set -e instead of killing the script before the
+    # rollback below ever runs (a bare `cmd1 && cmd2; if [[ $? ...` would
+    # look equivalent but isn't: set -e still fires on a trailing failure
+    # in an unparenthesized list).
+    if ! { install -m 0755 -o root -g root "$_tmp/traefik" "$TRAEFIK_BIN.new" \
+        && mv -f "$TRAEFIK_BIN.new" "$TRAEFIK_BIN" \
+        && write_traefik_unit \
+        && fix_traefik_perms \
+        && systemctl enable traefik.service > /dev/null \
+        && systemctl restart traefik.service; }; then
+        traefik_install_rollback
+        rm -rf "$_tmp"
+        return 1
+    fi
 
     if ! traefik_health_wait 15; then
         traefik_install_rollback
@@ -1176,7 +1184,6 @@ install_traefik_binary() {
         return 1
     fi
 
-    eval "${_prev_err_trap:-trap - ERR}"
     rm -f "$TRAEFIK_BIN.prev" "$TRAEFIK_DROPIN.prev"
     rm -rf "$_tmp"
     printf '%s\n' "$_version" > "$TRAEFIK_VERSION_FILE"
