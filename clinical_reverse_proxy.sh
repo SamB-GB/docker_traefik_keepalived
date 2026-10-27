@@ -1192,8 +1192,12 @@ install_traefik_binary() {
     return 0
 }
 
-# Restart the native service and confirm it comes back healthy.
+# Restart the native service and confirm it comes back healthy. Re-applies
+# ownership first: files written since install (cert updates, regenerated
+# dynamic config, copy_to_remote_root pushes) land as root:root and/or 0600,
+# which the unprivileged traefik user cannot read.
 traefik_restart() {
+    fix_traefik_perms
     systemctl restart traefik.service
     traefik_health_wait 15
 }
@@ -1288,11 +1292,14 @@ audit_log() {
     _entry="[${_ts}] [$(printf '%-14s' "$_op")] ${CURRENT_USER:-unknown} — ${_desc}"
 
     # Ensure audit log directory exists
+    # Not a recursive chown of $TRAEFIK_ROOT: that strips the root:traefik
+    # group off config/ and certs/ and the unprivileged traefik user can no
+    # longer read its own config on the next restart.
     mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
-    chown -R root:root "${TRAEFIK_ROOT}" 2>/dev/null || true
 
     echo "$_entry" >> "$AUDIT_LOG" 2>/dev/null || \
         bash -c "echo '$_entry' >> '$AUDIT_LOG'" 2>/dev/null || true
+    chown root:root "$AUDIT_LOG" 2>/dev/null || true
 }
 
 
@@ -4472,12 +4479,17 @@ _extend_restart_traefik_all_nodes() {
     # run_remote_sudo (pipes $SUDO_PASS over sudo -S), not a bare ssh
     # "sudo ..." with no way to supply a password non-interactively.
     local _any_backup_failed=false
+    # Pushed files arrive root:root (copy_to_remote_root) and the key 0600,
+    # so re-apply traefik ownership remotely before restarting — embedded
+    # via declare -f like the REMOTEINSTALL payload.
+    local _remote_restart_cmd
+    _remote_restart_cmd="$(declare -p TRAEFIK_ROOT); $(declare -f fix_traefik_perms); fix_traefik_perms; systemctl restart traefik.service"
     if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ] && [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
         for i in "${!BACKUP_NODES[@]}"; do
             local node="${BACKUP_NODES[$i]}"
             local ip="${BACKUP_IPS[$i]}"
             echo -n "  ${node} (${ip})... "
-            if run_remote_sudo "$ip" "systemctl restart traefik.service" >/dev/null 2>&1; then
+            if run_remote_sudo "$ip" "$_remote_restart_cmd" >/dev/null 2>&1; then
                 # Quick remote health check (unprivileged — plain ssh is fine)
                 local _remote_healthy=false
                 for _i in $(seq 1 5); do
@@ -4579,7 +4591,7 @@ extend_update_ssl() {
     CERT_FILE="${_cert_file}"
     KEY_FILE="${_key_file}"
 
-    _extend_restart_traefik_all_nodes
+    _extend_restart_traefik_all_nodes || true
     echo -n "  Saving configuration... "
     snapshot_config "SSL_UPDATE" "SSL certificate updated"
     save_config
@@ -4689,7 +4701,7 @@ CACONF
             done
         fi
 
-        _extend_restart_traefik_all_nodes
+        _extend_restart_traefik_all_nodes || true
         echo -n "  Saving configuration... "
         [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
         snapshot_config "CA_UPDATE" "CA certificate updated"
@@ -6182,7 +6194,7 @@ extend_edit_components() {
         done
     fi
 
-    _extend_restart_traefik_all_nodes
+    _extend_restart_traefik_all_nodes || true
     snapshot_config "COMPONENT" "Component server configuration changed"
     echo -n "  Saving configuration... "
     [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
@@ -6646,7 +6658,7 @@ extend_edit_hl7() {
         fi
 
         snapshot_config "HL7" "HL7 configuration changed"
-        _extend_restart_traefik_all_nodes
+        _extend_restart_traefik_all_nodes || true
         echo -n "  Saving configuration... "
         [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
         [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
@@ -7205,7 +7217,7 @@ extend_edit_hl7() {
                 fi
  snapshot_config "HL7" "HL7 configuration changed"
 
-                _extend_restart_traefik_all_nodes
+                _extend_restart_traefik_all_nodes || true
                 echo -n "  Saving configuration... "
                 [[ -f "$CERT_FILE" ]] || CERT_FILE="/opt/indica/traefik/certs/cert.crt"
                 [[ -f "$KEY_FILE" ]] || KEY_FILE="/opt/indica/traefik/certs/server.key"
