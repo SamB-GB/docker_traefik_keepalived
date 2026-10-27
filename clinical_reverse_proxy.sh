@@ -4634,7 +4634,7 @@ extend_update_ca() {
   serversTransports:
     internalCA:
       rootcas:
-        - /certs/customca.crt
+        - /opt/indica/traefik/certs/customca.crt
 CACONF
                 echo "✓ serversTransports block added to clinical_conf.yml"
             fi
@@ -10634,8 +10634,8 @@ EOF
 
     # DIAG_URL is always https, so an internal-CA-signed diagnostics host fails
     # verification without this. internalCA itself is defined in clinical_conf.yml
-    # — Traefik merges every file under /dynamic into one configuration, so
-    # referencing it across files resolves; defining it twice would not.
+    # — Traefik merges every file under config/dynamic into one configuration,
+    # so referencing it across files resolves; defining it twice would not.
     if [[ "$USE_CUSTOM_CA" == "yes" ]]; then
         echo "        serversTransport: internalCA" >> "$diag_file"
     fi
@@ -11223,8 +11223,8 @@ tls:
   stores:
     default:
       defaultCertificate:
-        certFile: "/certs/cert.crt"
-        keyFile: "/certs/server.key"
+        certFile: "/opt/indica/traefik/certs/cert.crt"
+        keyFile: "/opt/indica/traefik/certs/server.key"
   options:
     default:
       minVersion: VersionTLS12
@@ -11240,7 +11240,7 @@ EOF
   serversTransports:
     internalCA:
       rootcas:
-        - /certs/customca.crt
+        - /opt/indica/traefik/certs/customca.crt
 EOF
         fi
 
@@ -11443,8 +11443,8 @@ tls:
   stores:
     default:
       defaultCertificate:
-        certFile: "/certs/cert.crt"
-        keyFile: "/certs/server.key"
+        certFile: "/opt/indica/traefik/certs/cert.crt"
+        keyFile: "/opt/indica/traefik/certs/server.key"
   options:
     default:
       minVersion: VersionTLS12
@@ -11460,7 +11460,7 @@ EOF
   serversTransports:
     internalCA:
       rootcas:
-        - /certs/customca.crt
+        - /opt/indica/traefik/certs/customca.crt
 EOF
         fi
 
