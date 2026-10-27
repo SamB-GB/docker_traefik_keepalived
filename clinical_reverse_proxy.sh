@@ -4466,26 +4466,19 @@ _extend_restart_traefik_all_nodes() {
         echo "✓ healthy"
     fi
 
-    # Backup nodes
+    # Backup nodes. systemctl restart is privileged — unlike the old
+    # docker-compose restart, which needed no sudo because the invoking
+    # user was in the local `docker` group — so this has to go through
+    # run_remote_sudo (pipes $SUDO_PASS over sudo -S), not a bare ssh
+    # "sudo ..." with no way to supply a password non-interactively.
+    local _any_backup_failed=false
     if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ] && [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
         for i in "${!BACKUP_NODES[@]}"; do
             local node="${BACKUP_NODES[$i]}"
             local ip="${BACKUP_IPS[$i]}"
             echo -n "  ${node} (${ip})... "
-            local _restart_result _restart_ok=false
-            if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                if _restart_result=$(sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "sudo systemctl restart traefik.service 2>&1" 2>&1); then
-                    _restart_ok=true
-                fi
-            else
-                if _restart_result=$(ssh $SSH_OPTS -l "$CURRENT_USER" "$ip" \
-                    "sudo systemctl restart traefik.service 2>&1" 2>&1); then
-                    _restart_ok=true
-                fi
-            fi
-            if [[ "$_restart_ok" == true ]]; then
-                # Quick remote health check
+            if run_remote_sudo "$ip" "systemctl restart traefik.service" >/dev/null 2>&1; then
+                # Quick remote health check (unprivileged — plain ssh is fine)
                 local _remote_healthy=false
                 for _i in $(seq 1 5); do
                     local _ping
@@ -4499,13 +4492,23 @@ _extend_restart_traefik_all_nodes() {
                     if echo "$_ping" | grep -q ok; then _remote_healthy=true; break; fi
                     sleep 1
                 done
-                [[ "$_remote_healthy" == true ]] && echo "✓ healthy" || echo "✓ started (health pending)"
+                if [[ "$_remote_healthy" == true ]]; then
+                    echo "✓ healthy"
+                else
+                    echo "✓ started (health pending)"
+                    _any_backup_failed=true
+                fi
             else
                 echo "⚠️  restart may have failed on ${node}"
+                _any_backup_failed=true
             fi
         done
     fi
 
+    if [[ "$_any_backup_failed" == true ]]; then
+        echo "  ⚠️  Traefik restarted, but one or more backup nodes need checking"
+        return 1
+    fi
     echo "  ✓ Traefik restarted on all nodes"
 }
 
