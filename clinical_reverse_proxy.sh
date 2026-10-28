@@ -7204,13 +7204,8 @@ extend_edit_hl7() {
                         local _ip="${BACKUP_IPS[$i]}"
                         echo -n "    ${_node} (${_ip})... "
                         ensure_SCRIPTS_DIR "${_ip}" || true
-                        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                            sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_ip" \
-                                "rm -f '${_dynamic_dir}/hl7.yml'" 2>/dev/null || true
-                        else
-                            ssh $SSH_OPTS -l "$CURRENT_USER" "$_ip" \
-                                "rm -f '${_dynamic_dir}/hl7.yml'" 2>/dev/null || true
-                        fi
+                        # dynamic dir is root:traefik 0750 — removal needs sudo
+                        run_remote_sudo "$_ip" "rm -f '${_dynamic_dir}/hl7.yml'" >/dev/null 2>&1 || true
                         copy_to_remote_root "${_traefik_cfg}" "${_ip}" "${_traefik_cfg}"
                         echo "✓"
                     done
@@ -11152,36 +11147,20 @@ extend_edit_diag() {
                 local _bn="${BACKUP_NODES[$i]}"
                 local _bip="${BACKUP_IPS[$i]}"
                 echo -n "  Pushing to ${_bn}... "
+                # Ownership/mode is fixed by the restart below; the dynamic dir
+                # is root:traefik 0750, so removal needs sudo.
                 if [[ "$DIAG_ENABLED" == "yes" && -f "$_diag_file" ]]; then
-                    copy_to_remote "$_diag_file" "$_bip" \
-                        "/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" || true
-                    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                        sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                            "chmod 640 /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" 2>/dev/null || true
-                    else
-                        ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                            "chmod 640 /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" 2>/dev/null || true
-                    fi
+                    copy_to_remote_root "$_diag_file" "$_bip" \
+                        "/opt/indica/traefik/config/dynamic/diagnostics_monitor.yml"
                 else
-                    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-                        sudo -u "$SUDO_USER" ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                            "rm -f /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" 2>/dev/null || true
-                    else
-                        ssh $SSH_OPTS -l "$CURRENT_USER" "$_bip" \
-                            "rm -f /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" 2>/dev/null || true
-                    fi
+                    run_remote_sudo "$_bip" \
+                        "rm -f /opt/indica/traefik/config/dynamic/diagnostics_monitor.yml" >/dev/null 2>&1 || true
                 fi
                 echo "✓"
             done
         fi
 
-        # Restart Traefik
-        echo -n "  Restarting Traefik... "
-        if traefik_restart >/dev/null 2>&1; then
-            echo "✓"
-        else
-            echo "✗ restart failed"
-        fi
+        _extend_restart_traefik_all_nodes || true
 
         snapshot_config "DIAG_MONITOR" "Diagnostics monitor configuration changed"
         save_config
