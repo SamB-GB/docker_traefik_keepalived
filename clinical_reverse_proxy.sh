@@ -1212,6 +1212,8 @@ uninstall_traefik_native() {
     rm -f "$TRAEFIK_UNIT" "$TRAEFIK_DROPIN"
     rmdir "$TRAEFIK_DROPIN_DIR" 2>/dev/null || true
     rm -f "$TRAEFIK_BIN"
+    id traefik &>/dev/null && userdel traefik 2>/dev/null || true
+    getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
     if [[ "$_remove_config" == "yes" ]]; then
         rm -rf "$TRAEFIK_ROOT"
@@ -3625,6 +3627,8 @@ systemctl disable traefik.service 2>/dev/null || true
 rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
 rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
+id traefik &>/dev/null && userdel traefik 2>/dev/null || true
+getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 echo "✓"
 
@@ -3856,6 +3860,8 @@ systemctl disable traefik.service 2>/dev/null || true
 rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
 rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
+id traefik &>/dev/null && userdel traefik 2>/dev/null || true
+getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 echo "✓ Removed"
 
@@ -8353,6 +8359,8 @@ systemctl disable traefik.service 2>/dev/null || true
 rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
 rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
+id traefik &>/dev/null && userdel traefik 2>/dev/null || true
+getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 echo "✓"
 
@@ -8674,6 +8682,8 @@ systemctl disable traefik.service 2>/dev/null || true
 rm -f /etc/systemd/system/traefik.service /etc/systemd/system/traefik.service.d/10-hardening.conf
 rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
+id traefik &>/dev/null && userdel traefik 2>/dev/null || true
+getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 if command -v docker &>/dev/null && docker ps -q -f name=traefik 2>/dev/null | grep -q .; then
     docker stop traefik 2>/dev/null || true
