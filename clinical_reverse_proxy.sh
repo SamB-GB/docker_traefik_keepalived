@@ -1027,6 +1027,66 @@ fix_traefik_perms() {
     find "$TRAEFIK_ROOT/config" "$TRAEFIK_ROOT/certs" -type f -exec chmod 0640 {} + 2>/dev/null || true
 }
 
+# Open Traefik's listen ports in firewalld (RHEL default). Docker used to get
+# past firewalld with its own iptables rules for published ports; a native
+# service gets no such exception. Ports come from traefik.yml so HL7 edits
+# stay in sync (8800 is skipped: the ping endpoint is only probed on
+# localhost). Also opens VRRP once keepalived is installed, otherwise peers
+# can't hear each other and every node claims the VIP. Everything lives in
+# one firewalld service so cleanup is a single delete. Reloads only when
+# something changed. No-op where firewalld isn't running (e.g. Debian).
+TRAEFIK_FW_SERVICE="indica-traefik"
+sync_traefik_firewall() {
+    systemctl is-active --quiet firewalld 2>/dev/null || return 0
+    local _svc="$TRAEFIK_FW_SERVICE" _p _z _have _want="" _changed=0
+    # shellcheck disable=SC2013
+    for _p in $(grep -oE "^ +address: *'?:[0-9]+" "$TRAEFIK_ROOT/config/traefik.yml" 2>/dev/null \
+                | grep -oE '[0-9]+$' | sort -un); do
+        [[ "$_p" == 8800 ]] || _want="$_want $_p/tcp"
+    done
+    if ! firewall-cmd --permanent --info-service="$_svc" >/dev/null 2>&1; then
+        firewall-cmd --permanent --new-service="$_svc" >/dev/null || return 1
+        _changed=1
+    fi
+    _have=$(firewall-cmd --permanent --service="$_svc" --get-ports)
+    for _p in $_have; do
+        [[ " $_want " == *" $_p "* ]] && continue
+        firewall-cmd --permanent --service="$_svc" --remove-port="$_p" >/dev/null || return 1
+        _changed=1
+    done
+    for _p in $_want; do
+        [[ " $_have " == *" $_p "* ]] && continue
+        firewall-cmd --permanent --service="$_svc" --add-port="$_p" >/dev/null || return 1
+        _changed=1
+    done
+    if command -v keepalived >/dev/null 2>&1 && \
+       ! firewall-cmd --permanent --service="$_svc" --query-protocol=vrrp >/dev/null 2>&1; then
+        firewall-cmd --permanent --service="$_svc" --add-protocol=vrrp >/dev/null || return 1
+        _changed=1
+    fi
+    # Default zone plus any zone an interface is bound to ("public (default)"
+    # on newer firewalld, hence $1).
+    for _z in $( { firewall-cmd --get-default-zone
+                   firewall-cmd --get-active-zones | awk '/^[^[:space:]]/ {print $1}'; } | sort -u); do
+        firewall-cmd --permanent --zone="$_z" --query-service="$_svc" >/dev/null 2>&1 && continue
+        firewall-cmd --permanent --zone="$_z" --add-service="$_svc" >/dev/null || return 1
+        _changed=1
+    done
+    [[ $_changed -eq 0 ]] || firewall-cmd --reload >/dev/null
+}
+
+# Undo sync_traefik_firewall.
+remove_traefik_firewall() {
+    systemctl is-active --quiet firewalld 2>/dev/null || return 0
+    firewall-cmd --permanent --info-service="$TRAEFIK_FW_SERVICE" >/dev/null 2>&1 || return 0
+    local _z
+    for _z in $(firewall-cmd --permanent --get-zones); do
+        firewall-cmd --permanent --zone="$_z" --remove-service="$TRAEFIK_FW_SERVICE" >/dev/null 2>&1 || true
+    done
+    firewall-cmd --permanent --delete-service="$TRAEFIK_FW_SERVICE" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+}
+
 # Write $TRAEFIK_ROOT/config/traefik.yml (the static config). Shared by the
 # local install flow and the REMOTEINSTALL heredoc so the template only
 # exists once. Reads HL7_ENABLED/HL7_LISTEN_PORTS/HL7_PORT_COMMENTS as
@@ -1152,6 +1212,8 @@ install_traefik_binary() {
     [[ -e "$TRAEFIK_DROPIN" ]] && { _had_dropin=1; cp -a "$TRAEFIK_DROPIN" "$TRAEFIK_DROPIN.prev"; }
     systemctl is-active --quiet traefik.service && _was_active=1
 
+    sync_traefik_firewall || log "Warning: could not open Traefik's ports in firewalld"
+
     traefik_install_rollback() {
         log "Traefik install failed; rolling back to the previous binary."
         systemctl stop traefik.service 2>/dev/null || true
@@ -1198,6 +1260,7 @@ install_traefik_binary() {
 # which the unprivileged traefik user cannot read.
 traefik_restart() {
     fix_traefik_perms
+    sync_traefik_firewall || log "Warning: could not update Traefik's ports in firewalld"
     systemctl restart traefik.service
     traefik_health_wait 15
 }
@@ -1214,6 +1277,7 @@ uninstall_traefik_native() {
     rm -f "$TRAEFIK_BIN"
     id traefik &>/dev/null && userdel traefik 2>/dev/null || true
     getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
+    remove_traefik_firewall
     systemctl daemon-reload 2>/dev/null || true
     if [[ "$_remove_config" == "yes" ]]; then
         rm -rf "$TRAEFIK_ROOT"
@@ -2108,7 +2172,7 @@ EOF
     elif [ "$OS_FAMILY" = "rhel" ]; then
         local _prep_missing=""
         for _pkg in ca-certificates curl wget; do
-            rpm -q "$_pkg" &>/dev/null || _prep_missing="$_prep_missing $_pkg"
+            rpm -q "$_pkg" &>/dev/null || rpm -q "$_pkg-minimal" &>/dev/null || _prep_missing="$_prep_missing $_pkg"
         done
         if [ -n "$_prep_missing" ]; then
             echo "  Installing prep prerequisites:$_prep_missing"
@@ -2480,6 +2544,8 @@ install_traefik_stack_offline() {
             case "$_rpm" in *.i686.rpm) continue ;; esac
             _rpm_name=$(rpm -qp --qf '%{NAME}' "$_rpm" 2>/dev/null) || continue
             rpm -q "$_rpm_name" >/dev/null 2>&1 && continue
+            # Skip curl/libcurl where RHEL 9's conflicting curl-minimal/libcurl-minimal is installed
+            rpm -q "${_rpm_name}-minimal" >/dev/null 2>&1 && continue
             if [ "${MULTI_NODE_DEPLOYMENT:-no}" != "yes" ]; then
                 case "$_rpm_name" in keepalived) continue ;; esac
             fi
@@ -2818,7 +2884,7 @@ if command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     missing=""
     for p in curl wget ca-certificates; do
-        rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"
+        rpm -q "$p" >/dev/null 2>&1 || rpm -q "$p-minimal" >/dev/null 2>&1 || missing="$missing $p"
     done
     if [ -n "$missing" ]; then
         echo "  Installing:$missing"
@@ -3240,7 +3306,7 @@ if command -v apt-get &>/dev/null; then
 elif command -v dnf &>/dev/null; then
     _early_missing=""
     for _pkg in ca-certificates curl wget gnupg2; do
-        if ! rpm -q "$_pkg" &>/dev/null; then
+        if ! rpm -q "$_pkg" &>/dev/null && ! rpm -q "$_pkg-minimal" &>/dev/null; then
             _early_missing="$_early_missing $_pkg"
         fi
     done
@@ -3629,6 +3695,15 @@ rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
 id traefik &>/dev/null && userdel traefik 2>/dev/null || true
 getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
+# Remove the firewalld service the install added (sync_traefik_firewall)
+if systemctl is-active --quiet firewalld 2>/dev/null && \
+   firewall-cmd --permanent --info-service=indica-traefik >/dev/null 2>&1; then
+    for _z in $(firewall-cmd --permanent --get-zones); do
+        firewall-cmd --permanent --zone="$_z" --remove-service=indica-traefik >/dev/null 2>&1 || true
+    done
+    firewall-cmd --permanent --delete-service=indica-traefik >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 systemctl daemon-reload 2>/dev/null || true
 echo "✓"
 
@@ -3862,6 +3937,15 @@ rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
 id traefik &>/dev/null && userdel traefik 2>/dev/null || true
 getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
+# Remove the firewalld service the install added (sync_traefik_firewall)
+if systemctl is-active --quiet firewalld 2>/dev/null && \
+   firewall-cmd --permanent --info-service=indica-traefik >/dev/null 2>&1; then
+    for _z in $(firewall-cmd --permanent --get-zones); do
+        firewall-cmd --permanent --zone="$_z" --remove-service=indica-traefik >/dev/null 2>&1 || true
+    done
+    firewall-cmd --permanent --delete-service=indica-traefik >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 systemctl daemon-reload 2>/dev/null || true
 echo "✓ Removed"
 
@@ -4489,7 +4573,7 @@ _extend_restart_traefik_all_nodes() {
     # so re-apply traefik ownership remotely before restarting — embedded
     # via declare -f like the REMOTEINSTALL payload.
     local _remote_restart_cmd
-    _remote_restart_cmd="$(declare -p TRAEFIK_ROOT); $(declare -f fix_traefik_perms); fix_traefik_perms; systemctl restart traefik.service"
+    _remote_restart_cmd="$(declare -p TRAEFIK_ROOT TRAEFIK_FW_SERVICE); $(declare -f fix_traefik_perms sync_traefik_firewall); fix_traefik_perms; sync_traefik_firewall || true; systemctl restart traefik.service"
     if [ "${MULTI_NODE_DEPLOYMENT:-no}" = "yes" ] && [ "${#BACKUP_NODES[@]}" -gt 0 ]; then
         for i in "${!BACKUP_NODES[@]}"; do
             local node="${BACKUP_NODES[$i]}"
@@ -5074,7 +5158,7 @@ if command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     missing=""
     for p in curl wget ca-certificates; do
-        rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"
+        rpm -q "$p" >/dev/null 2>&1 || rpm -q "$p-minimal" >/dev/null 2>&1 || missing="$missing $p"
     done
     if [ -n "$missing" ]; then
         echo "  Installing:$missing"
@@ -5252,6 +5336,9 @@ vrrp_instance ${VRRP} {
 }
 EOF
         chmod 640 "$KEEPALIVED_CONF"
+
+        # Opens VRRP now that keepalived is installed
+        sync_traefik_firewall || log "Warning: could not open VRRP in firewalld"
 
         systemctl enable keepalived
         systemctl start keepalived
@@ -7334,9 +7421,10 @@ deploy_to_backup_nodes() {
     declare -f traefik_arch resolve_traefik_version fetch_traefik_release \
         ensure_traefik_user write_traefik_unit write_traefik_static_config \
         fix_traefik_perms install_traefik_binary traefik_restart \
-        traefik_health_wait traefik_is_active uninstall_traefik_native
+        traefik_health_wait traefik_is_active uninstall_traefik_native \
+        sync_traefik_firewall remove_traefik_firewall
     declare -p TRAEFIK_BIN TRAEFIK_ROOT TRAEFIK_UNIT TRAEFIK_DROPIN_DIR \
-        TRAEFIK_DROPIN TRAEFIK_VERSION_FILE TRAEFIK_HEALTH_URL
+        TRAEFIK_DROPIN TRAEFIK_VERSION_FILE TRAEFIK_HEALTH_URL TRAEFIK_FW_SERVICE
     cat <<'REMOTEINSTALL'
 #!/bin/bash
 set -e
@@ -7384,6 +7472,7 @@ rollback_on_failure() {
         -exec mv {} /opt/indica/traefik/ \; 2>/dev/null || true
 
     if [[ -x "$TRAEFIK_BIN" && -f /opt/indica/traefik/config/traefik.yml ]]; then
+        sync_traefik_firewall || true
         if systemctl restart traefik.service 2>&1; then
             echo "✓ Previous Traefik install restored and restarted"
         else
@@ -7796,6 +7885,7 @@ PYEXTRACT
             case "$_rpm" in *.i686.rpm) continue ;; esac
             _rpm_name=$(rpm -qp --qf '%{NAME}' "$_rpm" 2>/dev/null) || continue
             rpm -q "$_rpm_name" >/dev/null 2>&1 && continue
+            rpm -q "${_rpm_name}-minimal" >/dev/null 2>&1 && continue
             _rpms_to_install+=("$_rpm")
         done
         if [ ${#_rpms_to_install[@]} -gt 0 ]; then
@@ -7858,8 +7948,11 @@ if command -v apt-get &>/dev/null; then
     sudo -E apt-get $APT_PROXY_OPT_PROXY update -qq
     sudo -E apt-get $APT_PROXY_OPT_PROXY install -y -qq ca-certificates curl tar jq wget nano
 elif command -v dnf &>/dev/null; then
-    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl tar jq wget nano iproute python3; then
-        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y ca-certificates curl tar jq wget nano iproute python3 --nobest
+    # curl-minimal (RHEL 9 default) conflicts with curl; its curl command is enough
+    _dnf_pkgs="ca-certificates curl tar jq wget nano iproute python3"
+    rpm -q curl-minimal &>/dev/null && _dnf_pkgs="${_dnf_pkgs/ curl / }"
+    if ! sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y $_dnf_pkgs; then
+        sudo -E dnf $DNF_PROXY_OPT $DNF_SSL_OPT --setopt=skip_if_unavailable=True install -y $_dnf_pkgs --nobest
     fi
 fi
 echo "✓ Prerequisites installed"
@@ -8034,6 +8127,9 @@ vrrp_instance $VRRP {
 KEEPALIVEDCONF
 
 chmod 640 /etc/keepalived/keepalived.conf
+
+# Opens VRRP now that keepalived is installed
+sync_traefik_firewall || echo "⚠️  Could not open VRRP in firewalld"
 
 echo "Starting Keepalived..."
 systemctl enable keepalived
@@ -8361,6 +8457,15 @@ rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
 id traefik &>/dev/null && userdel traefik 2>/dev/null || true
 getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
+# Remove the firewalld service the install added (sync_traefik_firewall)
+if systemctl is-active --quiet firewalld 2>/dev/null && \
+   firewall-cmd --permanent --info-service=indica-traefik >/dev/null 2>&1; then
+    for _z in $(firewall-cmd --permanent --get-zones); do
+        firewall-cmd --permanent --zone="$_z" --remove-service=indica-traefik >/dev/null 2>&1 || true
+    done
+    firewall-cmd --permanent --delete-service=indica-traefik >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 systemctl daemon-reload 2>/dev/null || true
 echo "✓"
 
@@ -8684,6 +8789,15 @@ rmdir /etc/systemd/system/traefik.service.d 2>/dev/null || true
 rm -f /usr/local/bin/traefik
 id traefik &>/dev/null && userdel traefik 2>/dev/null || true
 getent group traefik >/dev/null 2>&1 && groupdel traefik 2>/dev/null || true
+# Remove the firewalld service the install added (sync_traefik_firewall)
+if systemctl is-active --quiet firewalld 2>/dev/null && \
+   firewall-cmd --permanent --info-service=indica-traefik >/dev/null 2>&1; then
+    for _z in $(firewall-cmd --permanent --get-zones); do
+        firewall-cmd --permanent --zone="$_z" --remove-service=indica-traefik >/dev/null 2>&1 || true
+    done
+    firewall-cmd --permanent --delete-service=indica-traefik >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 systemctl daemon-reload 2>/dev/null || true
 if command -v docker &>/dev/null && docker ps -q -f name=traefik 2>/dev/null | grep -q .; then
     docker stop traefik 2>/dev/null || true
@@ -9730,6 +9844,18 @@ install_packages() {
             exit_on_error "Failed to install: ${packages[*]}"
 
     elif command -v dnf &>/dev/null; then
+        # RHEL 9 ships curl-minimal, which conflicts with curl and which dnf
+        # won't replace without --allowerasing. Its curl command is all this
+        # script needs, so skip any package whose -minimal variant is present.
+        local _p _pkgs=()
+        for _p in "${packages[@]}"; do
+            rpm -q "${_p}-minimal" &>/dev/null || _pkgs+=("$_p")
+        done
+        packages=("${_pkgs[@]}")
+        if [ ${#packages[@]} -eq 0 ]; then
+            log "✓ Packages already installed"
+            return 0
+        fi
         log "Installing via DNF (strategy: ${PROXY_STRATEGY}, dnf_proxy_opt: ${DNF_PROXY_OPT:+set}${DNF_PROXY_OPT:-none})..."
         sudo -E bash -c 'echo "[dnf env] http_proxy=${http_proxy:-<unset>} HTTPS_PROXY=${HTTPS_PROXY:-<unset>} no_proxy=${no_proxy:-<unset>}"' >> "$LOGFILE" 2>/dev/null || true
         # DNF uses environment proxy (http_proxy/https_proxy/no_proxy) automatically
@@ -13937,6 +14063,9 @@ EOF
   chmod 640 $KEEPALIVED_CONF
 
   # Restart Keepalived to apply the configuration
+  # Opens VRRP now that keepalived is installed
+  sync_traefik_firewall || log "Warning: could not open VRRP in firewalld"
+
   log "Starting and enabling KeepAlived..."
   systemctl enable keepalived || exit_on_error "Failed to enable Keepalived"
   systemctl start keepalived || exit_on_error "Failed to start Keepalived"
