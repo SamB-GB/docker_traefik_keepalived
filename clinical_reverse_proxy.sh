@@ -3038,7 +3038,8 @@ check_single_node() {
     fi
     
     REPO_TEST_PASSED=0
-    
+    REPO_FAIL_HINT=""
+
     case "$DETECTED_OS" in
         ubuntu)
             REPO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} http://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || echo 'FAILED'")
@@ -3053,9 +3054,24 @@ check_single_node() {
             fi
             ;;
         centos|rhel|rocky|almalinux)
-            REPO_TEST=$(run_check "timeout 10 curl -s ${CURL_SSL_OPT} -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} http://mirror.centos.org 2>/dev/null || echo 'FAILED'")
-            if echo "$REPO_TEST" | grep -q "200\|301\|302"; then
-                REPO_TEST_PASSED=1
+            # No single mirror fits this family (mirror.centos.org is gone, and
+            # RHEL/Rocky/Alma never used it), so probe the host the node's own
+            # repos point at: cdn.redhat.com, a Satellite, the Rocky/Alma
+            # mirror lists... Any HTTP status counts as reachable, since
+            # cdn.redhat.com answers 403 without the entitlement certificate.
+            # -k because cdn.redhat.com is signed by Red Hat's own CA (dnf
+            # reads it from /etc/rhsm/ca), not one in the system trust store;
+            # this only tests reachability, nothing is downloaded.
+            REPO_HOST=$(run_check "grep -hE '^(baseurl|mirrorlist|metalink)' /etc/yum.repos.d/*.repo 2>/dev/null | grep -oE 'https?://[^/\$]+' | head -1")
+            if [ -z "$REPO_HOST" ]; then
+                REPO_FAIL_HINT="no repositories configured; is the system registered?"
+            else
+                REPO_TEST=$(run_check "timeout 10 curl -sk -o /dev/null -w '%{http_code}' ${PROXY_CURL_OPT} ${REPO_HOST}/ 2>/dev/null || echo 'FAILED'")
+                if echo "$REPO_TEST" | grep -qE '^[1-5][0-9]{2}$'; then
+                    REPO_TEST_PASSED=1
+                else
+                    REPO_FAIL_HINT="${REPO_HOST#*://} unreachable"
+                fi
             fi
             ;;
         *)
@@ -3077,7 +3093,7 @@ check_single_node() {
             echo "✓ Reachable"
         fi
     elif [ $REPO_TEST_PASSED -eq 0 ]; then
-        echo "❌ FAILED"
+        echo "❌ FAILED${REPO_FAIL_HINT:+ ($REPO_FAIL_HINT)}"
         REPO_CHECK_FAILED=1
         FAILED_REPOS+=("Standard package repositories ($DETECTED_OS)")
     fi
